@@ -10,6 +10,7 @@
 #include <memory>
 
 extern bool qwen3tts_allowgpu;
+extern int qwen3tts_threads;
 
 namespace qwen3_tts {
 

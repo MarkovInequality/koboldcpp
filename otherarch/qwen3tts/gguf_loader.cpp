@@ -1,4 +1,5 @@
 #include "gguf_loader.h"
+#include "ggml-cpu.h"
 
 #include <cstdio>
 #include <cstring>
@@ -59,6 +60,9 @@ ggml_backend_t init_preferred_backend(const char * component_name, std::string *
     }
 
     if (backend) {
+        if (ggml_backend_is_cpu(backend) && qwen3tts_threads > 0) {
+            ggml_backend_cpu_set_n_threads(backend, qwen3tts_threads);
+        }
         shared.backend = backend;
         shared.ref_count = 1;
     }

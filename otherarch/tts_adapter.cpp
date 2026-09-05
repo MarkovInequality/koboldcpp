@@ -511,6 +511,7 @@ static std::string detectedarch = "";
 static bool is_qwen3tts_file = false;
 static qwen3_tts::Qwen3TTS qwen3tts_runner;
 extern bool qwen3tts_allowgpu;
+extern int qwen3tts_threads;
 
 int total_tts_gens = 0;
 static std::string tts_executable_path = "";
@@ -572,6 +573,7 @@ bool ttstype_load_model(const tts_load_model_inputs inputs)
     else if(is_qwen3tts_file)
     {
         qwen3tts_allowgpu = (inputs.gpulayers>0?true:false);
+        qwen3tts_threads = (inputs.threads>0?inputs.threads:4);
         if (!qwen3tts_runner.load_models(modelfile_ttc,modelfile_cts)) {
             printf("\nQwen3TTS Load Error: %s\n", qwen3tts_runner.get_error().c_str());
             return false;
@@ -1175,6 +1177,11 @@ static tts_generation_outputs ttstype_generate_qwen3tts(const tts_generation_inp
         qwen3_tts::tts_result result;
         std::string prompt = inputs.prompt;
         qwen3_tts::tts_params qwen3tts_params;
+        if(tts_max_len>0)
+        {
+            qwen3tts_params.max_audio_tokens = tts_max_len;
+        }
+        qwen3tts_params.n_threads = qwen3tts_threads;
         std::string custom_reference_audio_str = inputs.reference_audio;
         std::vector<float> custom_reference_audio_pcmf32;
         std::string speaker_instruction = inputs.speaker_instruction;
@@ -1225,6 +1232,15 @@ static tts_generation_outputs ttstype_generate_qwen3tts(const tts_generation_inp
         {
             qwen3tts_params.print_progress = true;
         }
+
+        //without this the server looks frozen during a long or runaway generation
+        qwen3tts_runner.set_progress_callback([](int frame, int maxframes) {
+            if(!tts_is_quiet && (frame % 64 == 0))
+            {
+                printf("\rTTS Generating... (%d / %d audio frames)",frame,maxframes);
+                fflush(stdout);
+            }
+        });
 
         bool has_speaker_enc = qwen3tts_runner.load_speaker_enc();
 

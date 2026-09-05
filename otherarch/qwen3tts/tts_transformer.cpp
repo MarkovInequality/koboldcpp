@@ -1,5 +1,6 @@
 #include "tts_transformer.h"
 #include "gguf_loader.h"
+#include "ggml-cpu.h"
 
 #include <cmath>
 #include <cstring>
@@ -20,6 +21,7 @@
 #endif
 
 bool qwen3tts_allowgpu = false;
+int qwen3tts_threads = 4;
 
 namespace qwen3_tts {
 
@@ -128,6 +130,9 @@ bool TTSTransformer::load_model(const std::string & model_path) {
         if (!state_.backend_cpu) {
             error_msg_ = "Failed to initialize CPU fallback backend for TTSTransformer";
             return false;
+        }
+        if (qwen3tts_threads > 0) {
+            ggml_backend_cpu_set_n_threads(state_.backend_cpu, qwen3tts_threads);
         }
     }
 
