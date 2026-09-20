@@ -64,7 +64,7 @@ bool whispertype_load_model(const whisper_load_model_inputs inputs)
     whisper_is_quiet = inputs.quiet;
 
     std::string modelfile = inputs.model_filename;
-    printf("\nLoading Whisper Model: %s",modelfile.c_str());
+    printf("\nLoading Whisper Model: %s%s",modelfile.c_str(),(inputs.whisper_cpu?" (CPU)":""));
 
     whisperdebugmode = inputs.debugmode;
     if (whisperdebugmode!=1) {
@@ -73,7 +73,7 @@ bool whispertype_load_model(const whisper_load_model_inputs inputs)
 
     // whisper init
     struct whisper_context_params cparams = whisper_context_default_params();
-    cparams.use_gpu    = true;
+    cparams.use_gpu    = !inputs.whisper_cpu;
     cparams.flash_attn = false;
 
     whisper_ctx = whisper_init_from_file_with_params(modelfile.c_str(), cparams);

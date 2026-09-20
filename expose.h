@@ -286,6 +286,7 @@ struct whisper_load_model_inputs
     const char * devices_override = nullptr;
     const bool quiet = false;
     const int debugmode = 0;
+    const bool whisper_cpu = false;
 };
 struct whisper_generation_inputs
 {

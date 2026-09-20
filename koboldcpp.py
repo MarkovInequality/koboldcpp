@@ -517,7 +517,8 @@ class whisper_load_model_inputs(ctypes.Structure):
                 ("kcpp_main_gpu", ctypes.c_int),
                 ("devices_override", ctypes.c_char_p),
                 ("quiet", ctypes.c_bool),
-                ("debugmode", ctypes.c_int)]
+                ("debugmode", ctypes.c_int),
+                ("whisper_cpu", ctypes.c_bool)]
 
 class whisper_generation_inputs(ctypes.Structure):
     _fields_ = [("prompt", ctypes.c_char_p),
@@ -3161,6 +3162,7 @@ def whisper_load_model(model_filename):
     global args
     inputs = whisper_load_model_inputs()
     inputs.model_filename = model_filename.encode("UTF-8")
+    inputs.whisper_cpu = (True if args.whispercpu else False)
     inputs = set_backend_props(inputs)
     ret = handle.whisper_load_model(inputs)
     return ret
@@ -12909,6 +12911,7 @@ if __name__ == '__main__':
 
     whisperparsergroup = parser.add_argument_group('Whisper Transcription Commands')
     whisperparsergroup.add_argument("--whispermodel", metavar=('[filename]'), help="Specify a Whisper .bin model to enable Speech-To-Text transcription.", default="")
+    whisperparsergroup.add_argument("--whispercpu","--no-whisper-offload", help="Force Whisper transcription to always run on CPU.", action='store_true')
 
     ttsparsergroup = parser.add_argument_group('TTS Narration Commands')
     ttsparsergroup.add_argument("--ttsmodel", metavar=('[filename]'), help="Specify the TTS Text-To-Speech GGUF model.", default="")
