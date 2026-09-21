@@ -60,9 +60,11 @@ This makes CPU GEMM, dequant, quantize, Blas, and GGUF byte-size all work identi
 ## Phase 2 — `ggml_get_base_type` helper + backend dispatch
 New helpers in **`ggml/src/ggml.c`** (declared in `ggml/include/ggml.h`):
 ```
-ggml_type ggml_get_base_type(ggml_type t)  // Q4R_0→Q4_0, …, Q5R_K→Q5_K, else identity
-bool      ggml_is_rotated(ggml_type t)     // ggml_get_base_type(t) != t
+ggml_type ggml_get_rotated_type(ggml_type t) // Q4_0→Q4R_0, …, Q5_K→Q5R_K, else identity  (single source of truth for the pairing)
+ggml_type ggml_get_base_type(ggml_type t)    // Q4R_0→Q4_0, …, Q5R_K→Q5_K, else identity  (inverse of ggml_get_rotated_type)
+bool      ggml_is_rotated(ggml_type t)       // ggml_get_base_type(t) != t
 ```
+**DEVIATION (dedup, added in Phase 3):** both `ggml_get_rotated_type` and `ggml_get_base_type` are plain case statements (kept in sync). The rotation-group / divisibility logic is centralized in two quantizer helpers (`llama_hadamard_rot_group`, `llama_hadamard_can_rotate` in `src/llama-quant.cpp`), shared by `llama_hadamard_target_type` and `llama_model_quantize_impl` — no duplicated group math.
 Rotation group for a rotated type = `ggml_blck_size(ggml_get_base_type(t))` (32 or 256).
 
 **Backend dispatch** (route rotated types to the base type's kernel; no kernel duplication):
@@ -78,21 +80,25 @@ Rotation group for a rotated type = `ggml_blck_size(ggml_get_base_type(t))` (32 
 **`include/llama.h:436-452`** — add `bool hadamard;` to `llama_model_quantize_params` (the `--hadamard` convenience flag: auto-convert base Q4/Q5 types to their rotated variants where divisible).
 
 **`tools/quantize/quantize.cpp`:**
-- `QUANT_OPTIONS` (`:33-74`) — add the 6 rotated types.
-- Arg loop (`:409-485`) — add `--hadamard` (sets `params.hadamard`).
-- `usage()` (`:121-180`) — document.
+- ~~`QUANT_OPTIONS` — add the 6 rotated types.~~ **DEVIATION:** did NOT add 6 rotated types / new `llama_ftype`s (that would require new ftype entries + mix logic). Direct per-tensor selection of a rotated variant instead uses the **existing** `--tensor-type name=ggml_type` option — a rotated type is a valid `ggml_type` there, e.g. `--tensor-type 'blk.0..*'=q4r_K` (pattern is a regex). `--hadamard` covers all layers.
+- Arg loop — add `--hadamard` (sets `params.hadamard`).
+- `usage()` — document `--hadamard` (and point at `--tensor-type` for per-tensor rotation).
 
 **`src/llama-quant.cpp`:**
-- `llama_model_quantize_default_params` (`:1351`) — init `hadamard = false`.
-- In `llama_model_quantize_impl` (`:896`), per tensor:
-  - Resolve the target type. If `params.hadamard` and the base type is a Q4/Q5 type with `ne[0] % blck_size(base) == 0`, use the rotated variant (Q4_K → Q4R_K). (Or the user selected the rotated type directly.)
-  - **Between dequantize (`:1295`) and re-quantize (`:1304`)**, if the target is rotated:
-    - Copy the slab into `f32_conv_buf` (the F32+mmap branch at `:1288` is read-only — must not rotate in place).
-    - `llama_hadamard_inplace` per row, per group of `g = blck_size(base_type)`.
-    - **Imatrix:** rotate the per-column imatrix vector (`:1278`) with the same block-Hadamard (it's a 1-D array of length `ne[0]`), keeping it in the rotated space.
-  - **Quantize as the BASE type:** `llama_tensor_quantize_impl(ggml_get_base_type(target), rotated_f32, …)` — so `ggml_quantize_chunk` (`ggml.c:7973`, which has its own type switch) uses the base type's quantizer. Output bytes = base-type layout.
-  - **Store with the ROTATED type:** `gguf_set_tensor_type(…, target)` at `:1316`.
-- Divisibility: only rotate where `ne[0] % g == 0`; otherwise use the plain base type.
+- `#include "llama-hadamard.h"`.
+- New helper `llama_hadamard_target_type(t, ne0)` — returns `ggml_get_rotated_type(t)` **only** when `ne0 % blck_size(base) == 0`; otherwise returns `t` unchanged. (Reuses `ggml_get_rotated_type` for the pairing — **no duplicate switch**; see Phase 2 dedup.)
+- `llama_model_quantize_default_params` — init `hadamard = false`.
+- In `llama_model_quantize_impl`, per tensor:
+  - **Target-type resolution (preliminary pass):** if `params.hadamard`, apply `llama_hadamard_target_type` to the resolved type (Q4_K → Q4R_K where divisible). A rotated type can also arrive directly via `--tensor-type`.
+  - **Resolve quant/store types (outer scope):** `rotated_target = ggml_is_rotated(new_type)`; `rot_group = blck_size(base)`; `rotate = rotated_target && (ne[0] % rot_group == 0)`; `quant_type = rotated_target ? base : new_type`; `store_type = rotate ? new_type : quant_type`. **DEVIATION / safety:** if a rotated target is *not* divisible (only reachable via `--tensor-type`, since `--hadamard` never picks non-divisible), fall back to the base type — `store_type` becomes the base type and no rotation is done (prevents an out-of-bounds in the rotation butterfly).
+  - `quantize = cur_type != store_type` (**DEVIATION:** was `!= new_type`; using `store_type` makes the non-divisible fallback a no-op copy rather than a wasteful/possibly-forbidden requantize).
+  - **Between dequantize and re-quantize**, if `rotate`:
+    - Copy the slab into `f32_conv_buf` (the F32+mmap branch is read-only — must not rotate in place); dequant non-F32 into it.
+    - `llama_hadamard_inplace` per row, per group of `g = rot_group`.
+    - **Imatrix:** copy + rotate the per-column imatrix vector (length `ne[0]` per expert) with the same block-Hadamard, keeping it in the rotated space.
+    - **`bytes_per_row`** now includes the f32-buffer size when rotating an F32 tensor (the copy buffer), so `nrows_slab` stays within `max_buf_size` (quantizer-only; inference never slabs).
+  - **Quantize as the BASE type:** `llama_tensor_quantize_impl(quant_type, …)` — so `ggml_quantize_chunk` (its own type switch) uses the base type's quantizer. Output bytes = base-type layout.
+  - **Store with `store_type`:** `gguf_set_tensor_type(…, store_type)` — the rotated type when actually rotating, else the base type.
 
 ## Phase 4 — Inference (apply activation rotation)
 Rotate the input activation with the existing `fwht` ggml op (available on CPU/CUDA/Metal/Vulkan) — it applies H_N along dim 0 for every row. No new ggml op, no materialized H matrix, no cached H tensor. (`llama_hadamard_inplace` is **not** used here — it stays in the offline quantizer only, so it is not in the inference hot path.)

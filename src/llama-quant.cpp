@@ -2,6 +2,7 @@
 #include "llama-model.h"
 #include "llama-model-loader.h"
 #include "llama-ext.h"
+#include "llama-hadamard.h"
 #include "llama.h"
 
 #include <algorithm>
@@ -872,6 +873,13 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
     }
 }
 
+// True when the input dimension (ne0) is divisible by the rotation group (the base
+// type's block size: 32 for the _0/_1 variants, 256 for the _K variants), so the
+// Hadamard rotation can be applied.
+static bool llama_hadamard_can_rotate(ggml_type t, int64_t ne0) {
+    const int64_t g = ggml_blck_size(t); // rotated types share their base type's block size
+    return ne0 > 0 && ne0 % g == 0;
+}
 
 static void init_quantize_state_counters(quantize_state_impl & qs, std::vector<tensor_metadata> & metadata) {
     for (auto & tm : metadata) {
@@ -1071,6 +1079,10 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
         if (metadata[i].allows_quantization) {
             metadata[i].target_type = llama_tensor_get_type(qs, params, tensor, default_type, metadata[i]);
+            // Hadamard (ConvRot): auto-convert base Q4/Q5 types to their rotated variants
+            if (params->hadamard) {
+                metadata[i].target_type = ggml_get_rotated_type(metadata[i].target_type);
+            }
         } else {
             metadata[i].target_type = tensor->type;
         }
@@ -1182,9 +1194,19 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         const ggml_type cur_type = tensor->type;
         const ggml_type new_type = tm.target_type;
 
+        // Hadamard (ConvRot): a rotated target type is quantized as the base type
+        // (ggml_quantize_chunk has no rotated cases) but stored under the rotated type —
+        // the rotated type index is the marker that tells inference to rotate the input
+        // activation. When the input dim is not divisible by rot_group_size, we can't
+        // rotate, so we fall back to using the base type.
+        const ggml_type base_type      = ggml_get_base_type(new_type); // identity for non-rotated
+        const bool      can_rotate     = ggml_is_rotated(new_type) && llama_hadamard_can_rotate(new_type, tensor->ne[0]);
+        const ggml_type store_type     = can_rotate ? new_type : base_type;
+        const int64_t   rot_group_size = ggml_blck_size(store_type); // rotation group when can_rotate (32 or 256)
+
         // If we've decided to quantize to the same type the tensor is already
         // in then there's nothing to do.
-        bool quantize = cur_type != new_type;
+        bool quantize = cur_type != store_type;
 
         size_t new_size;
 
@@ -1266,16 +1288,33 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 const size_t row_size_dst = ggml_row_size(new_type,     n_per_row);
 
                 // process the rows in slabs, so that the buffers stay below max_buf_size
-                const size_t bytes_per_row = row_size_src + row_size_dst + (tensor->type == GGML_TYPE_F32 ? 0 : n_per_row*sizeof(float));
+                // (the f32 conversion buffer is needed for non-F32 tensors, and also for
+                //  F32 tensors when rotating, since the rotation must not modify the mmap)
+                const size_t bytes_per_row = row_size_src + row_size_dst + ((tensor->type == GGML_TYPE_F32 && !can_rotate) ? 0 : n_per_row*sizeof(float));
                 const int64_t nrows_slab = std::max<int64_t>(1, std::min<int64_t>(nrows, max_buf_size/bytes_per_row));
 
                 static const int64_t min_chunk_size = 32 * 512;
                 const int64_t chunk_size = (n_per_row >= min_chunk_size ? n_per_row : n_per_row * ((min_chunk_size + n_per_row - 1)/n_per_row));
 
+                // rotate the imatrix once (it is a per-column vector, shared across slabs)
+                const float * imatrix_rot = imatrix;
+                std::vector<float> imatrix_rot_buf;
+                if (can_rotate && imatrix) {
+                    imatrix_rot_buf.resize((size_t) n_per_row * tensor->ne[2]);
+                    std::memcpy(imatrix_rot_buf.data(), imatrix, (size_t) n_per_row * tensor->ne[2] * sizeof(float));
+                    for (int64_t e = 0; e < tensor->ne[2]; ++e) {
+                        float * edata = imatrix_rot_buf.data() + e * n_per_row;
+                        for (int64_t c = 0; c < n_per_row; c += rot_group_size) {
+                            llama_hadamard_inplace(edata + c, (int) rot_group_size);
+                        }
+                    }
+                    imatrix_rot = imatrix_rot_buf.data();
+                }
+
                 // quantize each expert separately since they have different importance matrices
                 new_size = 0;
                 for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
-                    const float * imatrix_03 = imatrix ? imatrix + i03 * n_per_row : nullptr;
+                    const float * imatrix_03 = imatrix_rot ? imatrix_rot + i03 * n_per_row : nullptr;
 
                     for (int64_t ir = 0; ir < nrows; ir += nrows_slab) {
                         const int64_t nrows_cur = std::min(nrows_slab, nrows - ir);
@@ -1284,7 +1323,25 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                         const void * src = load_range((i03*nrows + ir)*row_size_src, nrows_cur*row_size_src);
 
                         const float * f32_data;
-                        if (tensor->type == GGML_TYPE_F32) {
+                        if (can_rotate) {
+                            // need a writable f32 buffer to rotate in place
+                            if (f32_conv_buf.size() < (size_t) nelements_cur) {
+                                f32_conv_buf.resize(nelements_cur);
+                            }
+                            if (tensor->type == GGML_TYPE_F32) {
+                                std::memcpy((float *) f32_conv_buf.data(), src, nelements_cur * sizeof(float));
+                            } else {
+                                llama_tensor_dequantize_impl(tensor->type, src, (float *) f32_conv_buf.data(), workers, nelements_cur, nthread);
+                            }
+                            // rotate per row, per group of rot_group_size
+                            for (int64_t row = 0; row < nrows_cur; ++row) {
+                                float * rowdata = (float *) f32_conv_buf.data() + row * n_per_row;
+                                for (int64_t c = 0; c < n_per_row; c += rot_group_size) {
+                                    llama_hadamard_inplace(rowdata + c, (int) rot_group_size);
+                                }
+                            }
+                            f32_data = (const float *) f32_conv_buf.data();
+                        } else if (tensor->type == GGML_TYPE_F32) {
                             f32_data = (const float *) src;
                         } else {
                             if (f32_conv_buf.size() < (size_t) nelements_cur) {
@@ -1301,7 +1358,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                         const int64_t nchunk = (nelements_cur + chunk_size - 1)/chunk_size;
                         const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
 
-                        const size_t size_cur = llama_tensor_quantize_impl(new_type, f32_data, work.data(), chunk_size, nrows_cur, n_per_row, imatrix_03, workers, nthread_use);
+                        const size_t size_cur = llama_tensor_quantize_impl(base_type, f32_data, work.data(), chunk_size, nrows_cur, n_per_row, imatrix_03, workers, nthread_use);
 
                         fout.write((const char *) work.data(), size_cur);
                         new_size += size_cur;
@@ -1313,7 +1370,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             total_size_new += new_size;
 
             // update the gguf metadata as we go
-            gguf_set_tensor_type(ctx_outs[cur_split].get(), metadata[i].name.c_str(), new_type);
+            gguf_set_tensor_type(ctx_outs[cur_split].get(), metadata[i].name.c_str(), store_type);
             GGML_ASSERT(gguf_get_tensor_size(ctx_outs[cur_split].get(), gguf_find_tensor(ctx_outs[cur_split].get(), metadata[i].name.c_str())) == new_size);
 
             // tensor data is already written, add the padding
@@ -1364,7 +1421,8 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,
         /*.prune_layers                =*/ nullptr,
-        /*.max_buf_size                =*/ LLAMA_QUANT_MAX_BUF_SIZE
+        /*.max_buf_size                =*/ LLAMA_QUANT_MAX_BUF_SIZE,
+        /*.hadamard                    =*/ false
     };
 
     return result;

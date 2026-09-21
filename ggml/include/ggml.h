@@ -780,8 +780,9 @@ extern "C" {
     "use ggml_row_size() instead");
 
     GGML_API const char * ggml_type_name(enum ggml_type type);
-    GGML_API enum ggml_type ggml_get_base_type(enum ggml_type type); // Q4R_*->Q4_*, Q5R_*->Q5_*, else identity
-    GGML_API bool            ggml_is_rotated(enum ggml_type type);   // true for Hadamard-rotated variants
+    GGML_API enum ggml_type ggml_get_rotated_type(enum ggml_type type); // Q4_*->Q4R_*, Q5_*->Q5R_* (single source of truth for the pairing), else identity
+    GGML_API enum ggml_type ggml_get_base_type(enum ggml_type type);    // Q4R_*->Q4_*, Q5R_*->Q5_* (inverse of ggml_get_rotated_type), else identity
+    GGML_API bool            ggml_is_rotated(enum ggml_type type);      // true for Hadamard-rotated variants
     GGML_API const char * ggml_op_name  (enum ggml_op   op);
     GGML_API const char * ggml_op_symbol(enum ggml_op   op);
 

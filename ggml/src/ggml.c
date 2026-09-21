@@ -1427,7 +1427,23 @@ bool ggml_is_quantized(enum ggml_type type) {
 }
 
 // Hadamard-rotated variants (Q4R_*/Q5R_*) share their base type's layout and
-// kernels; only the stored values are rotated. Map a rotated type to its base.
+// kernels; only the stored values are rotated. Map a base Q4/Q5 type to its
+// rotated variant (keep in sync with ggml_get_base_type).
+enum ggml_type ggml_get_rotated_type(enum ggml_type type) {
+    assert(type >= 0);
+    assert(type < GGML_TYPE_COUNT);
+    switch (type) {
+        case GGML_TYPE_Q4_0: return GGML_TYPE_Q4R_0;
+        case GGML_TYPE_Q4_1: return GGML_TYPE_Q4R_1;
+        case GGML_TYPE_Q4_K: return GGML_TYPE_Q4R_K;
+        case GGML_TYPE_Q5_0: return GGML_TYPE_Q5R_0;
+        case GGML_TYPE_Q5_1: return GGML_TYPE_Q5R_1;
+        case GGML_TYPE_Q5_K: return GGML_TYPE_Q5R_K;
+        default:             return type; // no rotated variant (or already rotated)
+    }
+}
+
+// Map a rotated type to its base (inverse of ggml_get_rotated_type).
 enum ggml_type ggml_get_base_type(enum ggml_type type) {
     assert(type >= 0);
     assert(type < GGML_TYPE_COUNT);

@@ -119,7 +119,7 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
 
 [[noreturn]]
 static void usage(const char * executable) {
-    printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights]\n", executable);
+    printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--hadamard] [--imatrix] [--include-weights]\n", executable);
     printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--tensor-type-file]\n");
     printf("       [--prune-layers] [--keep-split] [--override-kv] [--dry-run] [--max-buffer-size]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
@@ -132,6 +132,13 @@ static void usage(const char * executable) {
     printf("                                      increases model size but may also increase quality, especially when requantizing\n");
     printf("  --pure\n");
     printf("                                      disable k-quant mixtures and quantize all tensors to the same type\n");
+    printf("  --hadamard\n");
+    printf("                                      rotate Q4/Q5 weights by a block-Hadamard before quantizing (ConvRot).\n");
+    printf("                                      auto-converts base Q4/Q5 types (Q4_0/Q4_1/Q4_K/Q5_0/Q5_1/Q5_K) to their\n");
+    printf("                                      rotated variants (Q4R_*/Q5R_*) where the input dim is divisible by the\n");
+    printf("                                      rotation group (32 for _0/_1, 256 for _K). Improves low-bit quality.\n");
+    printf("                                      To rotate only specific tensors/layers, use --tensor-type with a rotated\n");
+    printf("                                      type, e.g. --tensor-type 'blk.0..*'=q4r_K.\n");
     printf("  --imatrix file_name\n");
     printf("                                      use data in file_name as importance matrix for quant optimizations\n");
     printf("  --include-weights tensor_name\n");
@@ -449,6 +456,8 @@ int llama_quantize(int argc, char ** argv) {
             params.allow_requantize = true;
         } else if (strcmp(argv[arg_idx], "--pure") == 0) {
             params.pure = true;
+        } else if (strcmp(argv[arg_idx], "--hadamard") == 0) {
+            params.hadamard = true;
         } else if (strcmp(argv[arg_idx], "--imatrix") == 0) {
             if (arg_idx < argc-1) {
                 imatrix_file = argv[++arg_idx];
