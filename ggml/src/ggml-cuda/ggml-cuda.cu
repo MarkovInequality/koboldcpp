@@ -4959,7 +4959,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     }
                 }
 #endif // GGML_USE_MUSA
-                switch (a->type) {
+                // Hadamard-rotated variants are supported exactly like their base type.
+                switch (ggml_get_base_type(a->type)) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
                     case GGML_TYPE_Q1_0:

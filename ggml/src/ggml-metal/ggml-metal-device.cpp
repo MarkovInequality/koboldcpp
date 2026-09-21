@@ -762,7 +762,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     char base[256];
     char name[256];
 
-    const ggml_type tsrc0 = op->src[0]->type;
+    // Hadamard-rotated variants reuse their base type's kernel (identical layout),
+    // so the kernel name (built from the type name) must use the base type.
+    const ggml_type tsrc0 = ggml_get_base_type(op->src[0]->type);
     const ggml_type tsrc1 = op->src[1]->type;
 
     const bool bc_inp = op->src[0]->ne[0] % 32 != 0;
@@ -833,7 +835,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
 
     size_t smem = 0; // shared memory
 
-    const ggml_type tsrc0 = op->src[0]->type;
+    // Hadamard-rotated variants reuse their base type's kernel (identical layout).
+    const ggml_type tsrc0 = ggml_get_base_type(op->src[0]->type);
     const ggml_type tsrc1 = op->src[1]->type;
 
     const char * suffix = "";

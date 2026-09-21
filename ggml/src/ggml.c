@@ -1426,6 +1426,26 @@ bool ggml_is_quantized(enum ggml_type type) {
     return type_traits[type].is_quantized;
 }
 
+// Hadamard-rotated variants (Q4R_*/Q5R_*) share their base type's layout and
+// kernels; only the stored values are rotated. Map a rotated type to its base.
+enum ggml_type ggml_get_base_type(enum ggml_type type) {
+    assert(type >= 0);
+    assert(type < GGML_TYPE_COUNT);
+    switch (type) {
+        case GGML_TYPE_Q4R_0: return GGML_TYPE_Q4_0;
+        case GGML_TYPE_Q4R_1: return GGML_TYPE_Q4_1;
+        case GGML_TYPE_Q4R_K: return GGML_TYPE_Q4_K;
+        case GGML_TYPE_Q5R_0: return GGML_TYPE_Q5_0;
+        case GGML_TYPE_Q5R_1: return GGML_TYPE_Q5_1;
+        case GGML_TYPE_Q5R_K: return GGML_TYPE_Q5_K;
+        default:              return type;
+    }
+}
+
+bool ggml_is_rotated(enum ggml_type type) {
+    return ggml_get_base_type(type) != type;
+}
+
 const char * ggml_op_name(enum ggml_op op) {
     return GGML_OP_NAME[op];
 }
