@@ -958,6 +958,56 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 0,
         .is_quantized             = false,
     },
+    // Hadamard-rotated variants: identical layout/quant to the base type, but the
+    // stored weights are Hadamard-rotated. Inference rotates the input activation.
+    [GGML_TYPE_Q4R_0] = {
+        .type_name                = "q4r_0",
+        .blck_size                = QK4_0,
+        .type_size                = sizeof(block_q4_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q4_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q4_0_ref,
+    },
+    [GGML_TYPE_Q4R_1] = {
+        .type_name                = "q4r_1",
+        .blck_size                = QK4_1,
+        .type_size                = sizeof(block_q4_1),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q4_1,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q4_1_ref,
+    },
+    [GGML_TYPE_Q4R_K] = {
+        .type_name                = "q4r_K",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_q4_K),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q4_K,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q4_K_ref,
+    },
+    [GGML_TYPE_Q5R_0] = {
+        .type_name                = "q5r_0",
+        .blck_size                = QK5_0,
+        .type_size                = sizeof(block_q5_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q5_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q5_0_ref,
+    },
+    [GGML_TYPE_Q5R_1] = {
+        .type_name                = "q5r_1",
+        .blck_size                = QK5_1,
+        .type_size                = sizeof(block_q5_1),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q5_1,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q5_1_ref,
+    },
+    [GGML_TYPE_Q5R_K] = {
+        .type_name                = "q5r_K",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_q5_K),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q5_K,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q5_K_ref,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {

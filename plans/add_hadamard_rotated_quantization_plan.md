@@ -95,16 +95,27 @@ Rotation group for a rotated type = `ggml_blck_size(ggml_get_base_type(t))` (32 
 - Divisibility: only rotate where `ne[0] % g == 0`; otherwise use the plain base type.
 
 ## Phase 4 — Inference (apply activation rotation)
-Reuse `llama_mul_mat_hadamard` (`src/llama-impl.h:57-75`) — it does `ggml_mul_mat(H, x)` + `GGML_HINT_SRC0_IS_HADAMARD` (backend FWHT). No new ggml op.
+Rotate the input activation with the existing `fwht` ggml op (available on CPU/CUDA/Metal/Vulkan) — it applies H_N along dim 0 for every row. No new ggml op, no materialized H matrix, no cached H tensor. (`llama_hadamard_inplace` is **not** used here — it stays in the offline quantizer only, so it is not in the inference hot path.)
 
-**H matrix caching** — in the graph context, `ggml_tensor * get_hadamard_input(int group)` creates/caches the `group×group` orthonormal Hadamard input tensor in `ctx0` (filled from host via `llama_gen_hadamard_matrix`). Only 2 distinct groups (32, 256) → 2 matrices.
+**Rotation helper** (in the graph context): for an activation `x` with `ne[0] = D` and group `g = ggml_blck_size(ggml_get_base_type(weight->type))` (g ∈ {32, 256}, both powers of 2):
+```
+x_g    = reshape x to [g, D/g, batch]                          // each group of g -> a row (view, no copy)
+x_rot  = ggml_fwht(ggml_ones(ctx, GGML_TYPE_F32, 0,0,0), x_g)  // applies H_g to every group
+x_rot  = reshape x_rot back to [D, batch]
+```
+The fwht op requires F32 input and power-of-2 `ne[0]` — both satisfied. Cost is O(D log g) per unique input (~1/4096 of a GEMM).
 
-**Injection** (`src/llama-graph.cpp`): for each weight, `if (ggml_is_rotated(weight->type))` rotate its input activation by `H_g` (`g = ggml_blck_size(ggml_get_base_type(weight->type))`):
+**Optimization — rotate once, reuse across weights:** each unique input activation is rotated ONCE per group and shared by every weight that consumes it. Never rotate the same (input, group) pair twice:
+- QKV: rotate `cur` once → feed `wq`/`wk`/`wv` (3 GEMMs, 1 rotation).
+- FFN: rotate `cur` once → feed `up` + `gate`; rotate the gated output once → feed `down`.
+- Attn-out: rotate the attention output once → feed `wo`.
+
+**Injection** (`src/llama-graph.cpp`): for each rotated weight, rotate its input activation by `H_g`:
 - QKV — `build_qkv` (`:1617-1691`): rotate `cur` before `wq`/`wk`/`wv` (`:1651/1661/1671`; fused `:1631`).
 - Attn-out (wo) — `build_attn` (`:2787-2860`): rotate the attention-output `cur` before `wo` (`:2845/2851`).
-- FFN — `build_ffn` (`:1694-1896`): rotate `cur` before `up` (`:1732`); rotate `tmp`/`cur` before `gate` (`:1749/1754`); rotate the gated `cur` before `down` (`:1875`).
+- FFN — `build_ffn` (`:1694-1896`): rotate `cur` before `up` (`:1732`) + `gate` (`:1749/1754`); rotate the gated `cur` before `down` (`:1875`).
 
-The base graph methods receive the weight tensors as parameters, so the type check is self-contained (no model/side-table needed). The H input tensors live in `ctx0` (accessible from the graph context).
+The base graph methods receive the weight tensors as parameters, so the type check is self-contained (no model/side-table needed).
 
 **Load-time guard:** at model load, if a rotated-type tensor is present but the build lacks ConvRot inference → `throw` (safe invariant; a no-op if always compiled in).
 
@@ -151,7 +162,7 @@ The repo's test styles: `tools/quantize/tests.sh` (bash integration: download mo
 | Metal dispatch + name gotcha | `ggml-metal-ops.cpp:2375`, `ggml-metal-device.cpp:842,785` |
 | Vulkan `CREATE_MM2` + pipeline arrays | `ggml-vulkan.cpp:4803+`, `:921` |
 | Spacemit switch | `ggml-cpu/spacemit/ime.cpp:190` |
-| `llama_mul_mat_hadamard` (reuse) | `src/llama-impl.h:57-75` |
+| `fwht` ggml op (reuse for inference rotation) | `ggml_fwht` / `ggml_compute_forward_fwht_f32` `ggml/src/ggml-cpu/ops.cpp:11847` (also CUDA `fwht.cu`, Metal `ggml-metal-ops.cpp:2235`, Vulkan `ggml-vulkan.cpp`) |
 | `GGML_HINT_SRC0_IS_HADAMARD` | `ggml/include/ggml.h:451` |
 | `build_qkv` / `build_ffn` / `build_attn` | `src/llama-graph.cpp:1617 / 1694 / 2787` |
 | `llama_model_quantize_impl` (dequant/quant) | `src/llama-quant.cpp:896` (dequant `:1295`, quant `:1304`) |

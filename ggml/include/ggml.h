@@ -436,7 +436,16 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        // Hadamard-rotated variants: weights stored Hadamard-rotated before
+        // quantization; bytes use the base type's layout. Inference rotates the
+        // input activation so the output is unchanged. See plans/add_hadamard_rotated_quantization_plan.md
+        GGML_TYPE_Q4R_0   = 43,
+        GGML_TYPE_Q4R_1   = 44,
+        GGML_TYPE_Q4R_K   = 45,
+        GGML_TYPE_Q5R_0   = 46,
+        GGML_TYPE_Q5R_1   = 47,
+        GGML_TYPE_Q5R_K   = 48,
+        GGML_TYPE_COUNT   = 49,
     };
 
     // precision
