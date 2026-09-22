@@ -2162,6 +2162,21 @@ void llama_model::print_info() const {
         }
 
         LLAMA_LOG_INFO("%s: model type            = %s\n",     __func__, type_name().c_str());
+
+        {
+            // Hadamard-rotated (ConvRot) tensors: the engine rotates the input activation of
+            // every GEMM that consumes them (via build_lora_mm / build_lora_mm_id)
+            size_t n_hadamard_rotated = 0;
+            for (const auto & [tensor_name, tensor] : tensors_by_name) {
+                if (ggml_is_rotated(tensor->type)) {
+                    ++n_hadamard_rotated;
+                }
+            }
+            if (n_hadamard_rotated > 0) {
+                LLAMA_LOG_INFO("%s: n_hadamard_rotated    = %zu\n", __func__, n_hadamard_rotated);
+            }
+        }
+
         if (pimpl->n_elements >= 1e12) {
             LLAMA_LOG_INFO("%s: model params          = %.2f T\n", __func__, pimpl->n_elements*1e-12);
         } else if (pimpl->n_elements >= 1e9) {
@@ -2817,6 +2832,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     llm->build_dense_out(dense_2_out_layers, dense_2_out_layers_b, dense_3_out_layers);
 
     llm->res->set_outputs(params);
+
+    // ConvRot: fail loud if a rotated-type weight is consumed by a GEMM without input
+    // rotation (would silently produce wrong output)
+    llm_graph_check_hadamard_rotation(llm->res->get_gf());
 
     return llm->res->get_gf();
 }

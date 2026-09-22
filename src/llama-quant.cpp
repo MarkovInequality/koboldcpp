@@ -1079,8 +1079,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
         if (metadata[i].allows_quantization) {
             metadata[i].target_type = llama_tensor_get_type(qs, params, tensor, default_type, metadata[i]);
-            // Hadamard (ConvRot): auto-convert base Q4/Q5 types to their rotated variants
-            if (params->hadamard) {
+            // Hadamard (ConvRot): auto-convert base Q4/Q5 types to their rotated variants.
+            // Token embeddings are excluded: inference assumes they are stored unrotated,
+            // so that every GEMM input activation is in the unrotated space and the rotated
+            // weights rotate their own input (a rotated embedding table would put the first
+            // layer's input in the rotated space, which the engine does not detect).
+            if (params->hadamard && metadata[i].category != tensor_category::TOKEN_EMBD) {
                 metadata[i].target_type = ggml_get_rotated_type(metadata[i].target_type);
             }
         } else {
@@ -1199,6 +1203,14 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         // the rotated type index is the marker that tells inference to rotate the input
         // activation. When the input dim is not divisible by rot_group_size, we can't
         // rotate, so we fall back to using the base type.
+        // Hadamard (ConvRot): a rotated token embedding is not supported by inference
+        // (see the --hadamard exclusion above), so fail loud if one is requested explicitly
+        if (ggml_is_rotated(new_type) && tm.category == tensor_category::TOKEN_EMBD) {
+            throw std::runtime_error(format(
+                "tensor %s: rotated type %s is not supported for token embeddings",
+                tensor->name, ggml_type_name(new_type)));
+        }
+
         const ggml_type base_type      = ggml_get_base_type(new_type); // identity for non-rotated
         const bool      can_rotate     = ggml_is_rotated(new_type) && llama_hadamard_can_rotate(new_type, tensor->ne[0]);
         const ggml_type store_type     = can_rotate ? new_type : base_type;

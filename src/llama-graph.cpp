@@ -1,6 +1,7 @@
 #include "llama-graph.h"
 
 #include "llama-impl.h"
+#include "llama-hadamard.h"
 #include "llama-model.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
@@ -1509,11 +1510,88 @@ ggml_tensor * llm_graph_context::build_cvec(
     return cvec->apply_to(ctx0, cur, il);
 }
 
+ggml_tensor * llm_graph_result::get_hadamard_rot(int64_t g) {
+    auto it = hadamard_rot.find(g);
+    if (it != hadamard_rot.end()) {
+        return it->second;
+    }
+    if (!ctx_hadamard) {
+        ggml_init_params params = {
+            /*.mem_size   =*/ 1024*1024,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ false,
+        };
+        ctx_hadamard.reset(ggml_init(params));
+        GGML_ASSERT(ctx_hadamard && "failed to init hadamard rotation context");
+    }
+    const int64_t ne[2] = { g, g };
+    ggml_tensor * h = ggml_new_tensor(ctx_hadamard.get(), GGML_TYPE_F32, 2, ne);
+    llama_gen_hadamard_matrix((float *) h->data, g);
+    hadamard_rot[g] = h;
+    return h;
+}
+
+ggml_tensor * llm_graph_context::get_hadamard_rot(int64_t g) const {
+    return res->get_hadamard_rot(g);
+}
+
+ggml_tensor * llm_graph_context::build_hadamard_rotate(ggml_tensor * x, ggml_tensor * h) const {
+    GGML_ASSERT(x->ne[0] % h->ne[0] == 0);
+    return llama_mul_mat_hadamard(ctx0, x, h);
+}
+
+ggml_tensor * llm_graph_context::rotate_input_if_rotated(ggml_tensor * w, ggml_tensor * cur) const {
+    if (ggml_is_rotated(w->type)) {
+        const int64_t g = ggml_blck_size(ggml_get_base_type(w->type));
+        return build_hadamard_rotate(cur, get_hadamard_rot(g));
+    }
+    return cur;
+}
+
+// Fail loud when a Hadamard-rotated (ConvRot) weight is consumed by a GEMM whose input
+// activation was not rotated by H_g: such a GEMM computes W'*x instead of W'*(H_g*x)
+// and would silently produce wrong output. GEMMs that consume a rotated weight must feed
+// the hinted block-Hadamard rotation node directly as the GEMM input (this is what
+// build_lora_mm / build_lora_mm_id and the graph-level projections do via
+// rotate_input_if_rotated), so they pass this check. Called once per graph build.
+void llm_graph_check_hadamard_rotation(ggml_cgraph * gf) {
+    const int n_nodes = ggml_graph_n_nodes(gf);
+    for (int i = 0; i < n_nodes; ++i) {
+        const ggml_tensor * node = ggml_graph_node(gf, i);
+        if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) {
+            continue;
+        }
+        const ggml_tensor * w = node->src[0];
+        if (!ggml_is_rotated(w->type)) {
+            continue;
+        }
+        const ggml_tensor * x = node->src[1];
+        // the block-Hadamard rotation node is a mul_mat carrying the SRC0_IS_HADAMARD hint
+        // in op_params[1]
+        if (x->op == GGML_OP_MUL_MAT && x->op_params[1] == GGML_HINT_SRC0_IS_HADAMARD) {
+            continue; // input is the output of the block-Hadamard rotation
+        }
+        throw std::runtime_error(format(
+            "tensor %s: Hadamard-rotated type %s is consumed by a GEMM without input rotation - "
+            "the model graph does not route this weight through the ConvRot GEMM path, so the "
+            "output would be silently wrong",
+            w->name, ggml_type_name(w->type)));
+    }
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    // Hadamard-rotated (ConvRot) weights store W' = W*H_g and must consume the rotated
+    // input activation: W'*(H_g*x) == W*H_g*H_g*x == W*x. Rotate the main-GEMM input here,
+    // in the common GEMM wrapper, so that every call site (QKV, attn-out, FFN, MOE,
+    // lm_head, and model-specific projections) is covered. The LoRA branch below
+    // intentionally keeps the unrotated input: adapters are trained in the unrotated
+    // space, so applying them to the rotated input would silently corrupt the output.
+    ggml_tensor * cur_rot = rotate_input_if_rotated(w, cur);
+
+    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur_rot);
 
     if (w_s) {
         res = ggml_mul(ctx0, res, w_s);
@@ -1545,7 +1623,10 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    // Hadamard-rotated (ConvRot) expert weights: rotate the main-GEMM input, see build_lora_mm
+    ggml_tensor * cur_rot = rotate_input_if_rotated(w, cur);
+
+    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur_rot, ids);
 
     if (w_s) {
         const int64_t n_expert = w_s->ne[0];
@@ -2596,7 +2677,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             // It's preferable to do the calculation as a matrix-matrix multiplication with n_tokens in dimension 1.
             // The permutations are noops and only change how the tensor data is interpreted.
             cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
-            cur = ggml_mul_mat(ctx0, v_mla, cur);
+            // ConvRot: rotate the (permuted) input if v_mla is a Hadamard-rotated weight
+            cur = ggml_mul_mat(ctx0, v_mla, rotate_input_if_rotated(v_mla, cur));
             cb(cur, "fattn_mla", il);
             cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
             cur = ggml_cont(ctx0, cur); // Needed because ggml_reshape_2d expects contiguous inputs.
@@ -3595,13 +3677,14 @@ void llm_graph_context::build_dense_out(
     GGML_ASSERT(cur != nullptr && "missing t_embd_pooled/t_embd");
 
     if (dense_2) {
-        cur = ggml_mul_mat(ctx0, dense_2, cur);
+        // ConvRot: rotate the input if the dense projection is a Hadamard-rotated weight
+        cur = ggml_mul_mat(ctx0, dense_2, rotate_input_if_rotated(dense_2, cur));
     }
     if (dense_2_b) {
         cur = ggml_add(ctx0, cur, dense_2_b);
     }
     if (dense_3) {
-        cur = ggml_mul_mat(ctx0, dense_3, cur);
+        cur = ggml_mul_mat(ctx0, dense_3, rotate_input_if_rotated(dense_3, cur));
     }
     cb(cur, "result_embd_pooled", -1);
     res->t_embd_pooled = cur;
@@ -3666,7 +3749,8 @@ void llm_graph_context::build_pooling(
                 // classification head
                 // https://github.com/huggingface/transformers/blob/5af7d41e49bbfc8319f462eb45253dcb3863dfb7/src/transformers/models/roberta/modeling_roberta.py#L1566
                 if (cls) {
-                    cur = ggml_mul_mat(ctx0, cls, cur);
+                    // ConvRot: rotate the input if the classifier head is a Hadamard-rotated weight
+                    cur = ggml_mul_mat(ctx0, cls, rotate_input_if_rotated(cls, cur));
                     if (cls_b) {
                         cur = ggml_add(ctx0, cur, cls_b);
                     }
@@ -3686,7 +3770,8 @@ void llm_graph_context::build_pooling(
                 // Single layer classification head (direct projection)
                 // https://github.com/huggingface/transformers/blob/f4fc42216cd56ab6b68270bf80d811614d8d59e4/src/transformers/models/bert/modeling_bert.py#L1476
                 if (cls_out) {
-                    cur = ggml_mul_mat(ctx0, cls_out, cur);
+                    // ConvRot: rotate the input if the classifier head is a Hadamard-rotated weight
+                    cur = ggml_mul_mat(ctx0, cls_out, rotate_input_if_rotated(cls_out, cur));
                     if (cls_out_b) {
                         cur = ggml_add(ctx0, cur, cls_out_b);
                     }
