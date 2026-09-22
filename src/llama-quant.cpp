@@ -873,12 +873,72 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
     }
 }
 
-// True when the input dimension (ne0) is divisible by the rotation group (the base
-// type's block size: 32 for the _0/_1 variants, 256 for the _K variants), so the
-// Hadamard rotation can be applied.
-static bool llama_hadamard_can_rotate(ggml_type t, int64_t ne0) {
-    const int64_t g = ggml_blck_size(t); // rotated types share their base type's block size
-    return ne0 > 0 && ne0 % g == 0;
+// Rotate every row of an f32 [n_per_row, nrows] block in place by the block-Hadamard H_g.
+static void llama_hadamard_rotate_rows(float * data, int64_t nrows, int64_t n_per_row, int64_t g) {
+    for (int64_t r = 0; r < nrows; ++r) {
+        float * row = data + r*n_per_row;
+        for (int64_t c = 0; c < n_per_row; c += g) {
+            llama_hadamard_inplace(row + c, (int) g);
+        }
+    }
+}
+
+// Move a per-column imatrix vector into the rotated space.
+//
+// The imatrix holds E[x_i^2] per input column. After rotation the relevant quantity is E[(H*x)_i^2],
+// which under the imatrix's own diagonal assumption collapses to sum_j H_ij^2 E[x_j^2] - the mean
+// over the group. This is NOT H*v: that would make half the entries negative, and the k-quant
+// quantizers multiply their weights by these values. A block rotation therefore destroys all
+// intra-group imatrix resolution; only the weighting between groups survives.
+static void llama_hadamard_rotate_imatrix(float * v, int64_t n, int64_t g) {
+    for (int64_t c = 0; c < n; c += g) {
+        double sum = 0.0;
+        for (int64_t j = 0; j < g; ++j) {
+            sum += v[c + j];
+        }
+
+        const float mean = (float) (sum / (double) g);
+        for (int64_t j = 0; j < g; ++j) {
+            v[c + j] = mean;
+        }
+    }
+}
+
+// A rotated type is quantized as its base type but stored under the rotated type index, which is
+// the marker telling inference to rotate the GEMM input. Reject every combination the engine
+// cannot represent instead of writing a silently-wrong model.
+static void llama_hadamard_check_retype(const ggml_tensor * t, ggml_type cur_type, ggml_type new_type, bool is_token_embd) {
+    if (!ggml_is_rotated(cur_type) && !ggml_is_rotated(new_type)) {
+        return;
+    }
+
+    // inference assumes the embedding output is unrotated, so that every GEMM input starts there
+    if (ggml_is_rotated(new_type) && is_token_embd) {
+        throw std::runtime_error(format("tensor %s: rotated type %s is not supported for token embeddings",
+            t->name, ggml_type_name(new_type)));
+    }
+
+    // dequantizing a rotated tensor yields rotated values; storing them under a base type would
+    // drop the marker and leave the engine multiplying rotated weights by unrotated activations
+    if (ggml_is_rotated(cur_type) && !ggml_is_rotated(new_type)) {
+        throw std::runtime_error(format("tensor %s: cannot requantize a rotated tensor (%s) to the "
+            "non-rotated type %s - requantize from the original unrotated model instead",
+            t->name, ggml_type_name(cur_type), ggml_type_name(new_type)));
+    }
+
+    // rotated -> rotated keeps the data in place, so the two groups must agree
+    if (ggml_is_rotated(cur_type) && ggml_is_rotated(new_type) &&
+        ggml_blck_size(cur_type) != ggml_blck_size(new_type)) {
+        throw std::runtime_error(format("tensor %s: cannot requantize from %s to %s - the rotation "
+            "groups differ (%d vs %d)", t->name, ggml_type_name(cur_type), ggml_type_name(new_type),
+            (int) ggml_blck_size(cur_type), (int) ggml_blck_size(new_type)));
+    }
+
+    if (ggml_is_rotated(new_type) && t->ne[0] % ggml_blck_size(new_type) != 0) {
+        throw std::runtime_error(format("tensor %s: rotated type %s needs ne[0] divisible by the "
+            "rotation group %d, but ne[0] = %" PRId64, t->name, ggml_type_name(new_type),
+            (int) ggml_blck_size(new_type), t->ne[0]));
+    }
 }
 
 static void init_quantize_state_counters(quantize_state_impl & qs, std::vector<tensor_metadata> & metadata) {
@@ -1060,6 +1120,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
     // flag for --dry-run
     bool will_require_imatrix = false;
+    size_t n_hadamard_rotated = 0;
 
     //
     // preliminary iteration over all weights
@@ -1079,13 +1140,14 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
         if (metadata[i].allows_quantization) {
             metadata[i].target_type = llama_tensor_get_type(qs, params, tensor, default_type, metadata[i]);
-            // Hadamard (ConvRot): auto-convert base Q4/Q5 types to their rotated variants.
-            // Token embeddings are excluded: inference assumes they are stored unrotated,
-            // so that every GEMM input activation is in the unrotated space and the rotated
-            // weights rotate their own input (a rotated embedding table would put the first
-            // layer's input in the rotated space, which the engine does not detect).
+            // ConvRot: convert base Q4/Q5 types to their rotated variants. Token embeddings are
+            // excluded - see llama_hadamard_check_retype
             if (params->hadamard && metadata[i].category != tensor_category::TOKEN_EMBD) {
-                metadata[i].target_type = ggml_get_rotated_type(metadata[i].target_type);
+                const ggml_type rotated = ggml_get_rotated_type(metadata[i].target_type);
+                if (rotated != metadata[i].target_type) {
+                    metadata[i].target_type = rotated;
+                    ++n_hadamard_rotated;
+                }
             }
         } else {
             metadata[i].target_type = tensor->type;
@@ -1107,6 +1169,15 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                                 metadata[i].name.c_str(), ggml_type_name(metadata[i].target_type));
                 throw std::runtime_error("this quantization requires an imatrix!");
             }
+        }
+    }
+
+    if (params->hadamard) {
+        if (n_hadamard_rotated == 0) {
+            LLAMA_LOG_WARN("%s: WARNING: --hadamard had no effect - none of the selected quantization types have a "
+                           "Hadamard-rotated variant (only Q4_0/Q4_1/Q4_K/Q5_0/Q5_1/Q5_K do)\n", __func__);
+        } else {
+            LLAMA_LOG_INFO("%s: --hadamard: rotating %zu tensor(s) to their ConvRot variants\n", __func__, n_hadamard_rotated);
         }
     }
 
@@ -1198,27 +1269,18 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         const ggml_type cur_type = tensor->type;
         const ggml_type new_type = tm.target_type;
 
-        // Hadamard (ConvRot): a rotated target type is quantized as the base type
-        // (ggml_quantize_chunk has no rotated cases) but stored under the rotated type —
-        // the rotated type index is the marker that tells inference to rotate the input
-        // activation. When the input dim is not divisible by rot_group_size, we can't
-        // rotate, so we fall back to using the base type.
-        // Hadamard (ConvRot): a rotated token embedding is not supported by inference
-        // (see the --hadamard exclusion above), so fail loud if one is requested explicitly
-        if (ggml_is_rotated(new_type) && tm.category == tensor_category::TOKEN_EMBD) {
-            throw std::runtime_error(format(
-                "tensor %s: rotated type %s is not supported for token embeddings",
-                tensor->name, ggml_type_name(new_type)));
-        }
+        llama_hadamard_check_retype(tensor, cur_type, new_type, tm.category == tensor_category::TOKEN_EMBD);
 
+        // ConvRot: a rotated target is quantized as its base type (ggml_quantize_chunk has no
+        // rotated cases) but stored under the rotated type. Source data that is already rotated
+        // stays that way - only an unrotated source needs the rotation applied.
         const ggml_type base_type      = ggml_get_base_type(new_type); // identity for non-rotated
-        const bool      can_rotate     = ggml_is_rotated(new_type) && llama_hadamard_can_rotate(new_type, tensor->ne[0]);
-        const ggml_type store_type     = can_rotate ? new_type : base_type;
-        const int64_t   rot_group_size = ggml_blck_size(store_type); // rotation group when can_rotate (32 or 256)
+        const bool      rotate         = ggml_is_rotated(new_type) && !ggml_is_rotated(cur_type);
+        const int64_t   rot_group_size = ggml_blck_size(new_type);     // 32 or 256 when rotating
 
         // If we've decided to quantize to the same type the tensor is already
         // in then there's nothing to do.
-        bool quantize = cur_type != store_type;
+        bool quantize = cur_type != new_type;
 
         size_t new_size;
 
@@ -1302,23 +1364,20 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 // process the rows in slabs, so that the buffers stay below max_buf_size
                 // (the f32 conversion buffer is needed for non-F32 tensors, and also for
                 //  F32 tensors when rotating, since the rotation must not modify the mmap)
-                const size_t bytes_per_row = row_size_src + row_size_dst + ((tensor->type == GGML_TYPE_F32 && !can_rotate) ? 0 : n_per_row*sizeof(float));
+                const size_t bytes_per_row = row_size_src + row_size_dst + ((tensor->type == GGML_TYPE_F32 && !rotate) ? 0 : n_per_row*sizeof(float));
                 const int64_t nrows_slab = std::max<int64_t>(1, std::min<int64_t>(nrows, max_buf_size/bytes_per_row));
 
                 static const int64_t min_chunk_size = 32 * 512;
                 const int64_t chunk_size = (n_per_row >= min_chunk_size ? n_per_row : n_per_row * ((min_chunk_size + n_per_row - 1)/n_per_row));
 
-                // rotate the imatrix once (it is a per-column vector, shared across slabs)
+                // the imatrix is a per-column vector shared across slabs, so rotate it once
                 const float * imatrix_rot = imatrix;
                 std::vector<float> imatrix_rot_buf;
-                if (can_rotate && imatrix) {
+                if (rotate && imatrix) {
                     imatrix_rot_buf.resize((size_t) n_per_row * tensor->ne[2]);
                     std::memcpy(imatrix_rot_buf.data(), imatrix, (size_t) n_per_row * tensor->ne[2] * sizeof(float));
                     for (int64_t e = 0; e < tensor->ne[2]; ++e) {
-                        float * edata = imatrix_rot_buf.data() + e * n_per_row;
-                        for (int64_t c = 0; c < n_per_row; c += rot_group_size) {
-                            llama_hadamard_inplace(edata + c, (int) rot_group_size);
-                        }
+                        llama_hadamard_rotate_imatrix(imatrix_rot_buf.data() + e * n_per_row, n_per_row, rot_group_size);
                     }
                     imatrix_rot = imatrix_rot_buf.data();
                 }
@@ -1335,8 +1394,10 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                         const void * src = load_range((i03*nrows + ir)*row_size_src, nrows_cur*row_size_src);
 
                         const float * f32_data;
-                        if (can_rotate) {
-                            // need a writable f32 buffer to rotate in place
+                        if (tensor->type == GGML_TYPE_F32 && !rotate) {
+                            f32_data = (const float *) src;
+                        } else {
+                            // rotating needs a writable copy - the F32 source may be mmap'd read-only
                             if (f32_conv_buf.size() < (size_t) nelements_cur) {
                                 f32_conv_buf.resize(nelements_cur);
                             }
@@ -1345,21 +1406,9 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                             } else {
                                 llama_tensor_dequantize_impl(tensor->type, src, (float *) f32_conv_buf.data(), workers, nelements_cur, nthread);
                             }
-                            // rotate per row, per group of rot_group_size
-                            for (int64_t row = 0; row < nrows_cur; ++row) {
-                                float * rowdata = (float *) f32_conv_buf.data() + row * n_per_row;
-                                for (int64_t c = 0; c < n_per_row; c += rot_group_size) {
-                                    llama_hadamard_inplace(rowdata + c, (int) rot_group_size);
-                                }
+                            if (rotate) {
+                                llama_hadamard_rotate_rows((float *) f32_conv_buf.data(), nrows_cur, n_per_row, rot_group_size);
                             }
-                            f32_data = (const float *) f32_conv_buf.data();
-                        } else if (tensor->type == GGML_TYPE_F32) {
-                            f32_data = (const float *) src;
-                        } else {
-                            if (f32_conv_buf.size() < (size_t) nelements_cur) {
-                                f32_conv_buf.resize(nelements_cur);
-                            }
-                            llama_tensor_dequantize_impl(tensor->type, src, (float *) f32_conv_buf.data(), workers, nelements_cur, nthread);
                             f32_data = (const float *) f32_conv_buf.data();
                         }
 
@@ -1382,7 +1431,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             total_size_new += new_size;
 
             // update the gguf metadata as we go
-            gguf_set_tensor_type(ctx_outs[cur_split].get(), metadata[i].name.c_str(), store_type);
+            gguf_set_tensor_type(ctx_outs[cur_split].get(), metadata[i].name.c_str(), new_type);
             GGML_ASSERT(gguf_get_tensor_size(ctx_outs[cur_split].get(), gguf_find_tensor(ctx_outs[cur_split].get(), metadata[i].name.c_str())) == new_size);
 
             // tensor data is already written, add the padding

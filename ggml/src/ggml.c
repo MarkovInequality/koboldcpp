@@ -958,8 +958,7 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 0,
         .is_quantized             = false,
     },
-    // Hadamard-rotated variants: identical layout/quant to the base type, but the
-    // stored weights are Hadamard-rotated. Inference rotates the input activation.
+    // ConvRot variants: the base type's row, verbatim - only the stored values are rotated
     [GGML_TYPE_Q4R_0] = {
         .type_name                = "q4r_0",
         .blck_size                = QK4_0,
@@ -1426,35 +1425,35 @@ bool ggml_is_quantized(enum ggml_type type) {
     return type_traits[type].is_quantized;
 }
 
-// Hadamard-rotated variants (Q4R_*/Q5R_*) share their base type's layout and
-// kernels; only the stored values are rotated. Map a base Q4/Q5 type to its
-// rotated variant (keep in sync with ggml_get_base_type).
+// Hadamard-rotated variants (Q4R_*/Q5R_*) share their base type's layout and kernels; only the
+// stored values are rotated. One list drives both directions of the pairing.
+#define GGML_ROTATED_TYPE_PAIRS \
+    X(GGML_TYPE_Q4_0, GGML_TYPE_Q4R_0) \
+    X(GGML_TYPE_Q4_1, GGML_TYPE_Q4R_1) \
+    X(GGML_TYPE_Q4_K, GGML_TYPE_Q4R_K) \
+    X(GGML_TYPE_Q5_0, GGML_TYPE_Q5R_0) \
+    X(GGML_TYPE_Q5_1, GGML_TYPE_Q5R_1) \
+    X(GGML_TYPE_Q5_K, GGML_TYPE_Q5R_K)
+
 enum ggml_type ggml_get_rotated_type(enum ggml_type type) {
     assert(type >= 0);
     assert(type < GGML_TYPE_COUNT);
     switch (type) {
-        case GGML_TYPE_Q4_0: return GGML_TYPE_Q4R_0;
-        case GGML_TYPE_Q4_1: return GGML_TYPE_Q4R_1;
-        case GGML_TYPE_Q4_K: return GGML_TYPE_Q4R_K;
-        case GGML_TYPE_Q5_0: return GGML_TYPE_Q5R_0;
-        case GGML_TYPE_Q5_1: return GGML_TYPE_Q5R_1;
-        case GGML_TYPE_Q5_K: return GGML_TYPE_Q5R_K;
-        default:             return type; // no rotated variant (or already rotated)
+#define X(base, rot) case base: return rot;
+        GGML_ROTATED_TYPE_PAIRS
+#undef X
+        default: return type; // no rotated variant (or already rotated)
     }
 }
 
-// Map a rotated type to its base (inverse of ggml_get_rotated_type).
 enum ggml_type ggml_get_base_type(enum ggml_type type) {
     assert(type >= 0);
     assert(type < GGML_TYPE_COUNT);
     switch (type) {
-        case GGML_TYPE_Q4R_0: return GGML_TYPE_Q4_0;
-        case GGML_TYPE_Q4R_1: return GGML_TYPE_Q4_1;
-        case GGML_TYPE_Q4R_K: return GGML_TYPE_Q4_K;
-        case GGML_TYPE_Q5R_0: return GGML_TYPE_Q5_0;
-        case GGML_TYPE_Q5R_1: return GGML_TYPE_Q5_1;
-        case GGML_TYPE_Q5R_K: return GGML_TYPE_Q5_K;
-        default:              return type;
+#define X(base, rot) case rot: return base;
+        GGML_ROTATED_TYPE_PAIRS
+#undef X
+        default: return type;
     }
 }
 

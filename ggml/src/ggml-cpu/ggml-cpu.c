@@ -413,8 +413,7 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_I32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
     },
-    // Hadamard-rotated variants: identical to the base type's CPU kernels
-    // (layout is identical; only the stored values are rotated).
+    // ConvRot variants: the base type's row, verbatim - only the stored values are rotated
     [GGML_TYPE_Q4R_0] = {
         .from_float               = quantize_row_q4_0,
         .vec_dot                  = ggml_vec_dot_q4_0_q8_0,

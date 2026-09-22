@@ -6,7 +6,7 @@
 // orthonormal Walsh-Hadamard rotation matrix (Sylvester construction)
 // H is symmetric, orthonormal (H * H^T == I) and self-inverse (H * H == I)
 // n must be a power of 2
-void llama_gen_hadamard_matrix(float * out, int n) {
+inline void llama_gen_hadamard_matrix(float * out, int n) {
     assert(n > 0);
     assert((n & (n - 1)) == 0); // must be power of 2
 
@@ -28,7 +28,7 @@ void llama_gen_hadamard_matrix(float * out, int n) {
 // in-place orthonormal Walsh-Hadamard transform (O(n log n) butterfly)
 // computes vec = H_n * vec, where H_n is the orthonormal Walsh-Hadamard of size n
 // n must be a power of 2
-void llama_hadamard_inplace(float * vec, int n) {
+inline void llama_hadamard_inplace(float * vec, int n) {
     assert(n > 0);
     assert((n & (n - 1)) == 0); // must be power of 2
 

@@ -456,8 +456,7 @@ static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k,
 }
 
 to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
-    // Hadamard-rotated variants dequantize via their base type (identical layout).
-    switch (ggml_get_base_type(type)) {
+    switch (ggml_get_base_type(type)) { // rotated variants share their base type's layout
         case GGML_TYPE_Q1_0:
             return dequantize_block_cont_cuda<QK1_0, QR1_0, dequantize_q1_0>;
         case GGML_TYPE_Q2_0:
@@ -514,8 +513,7 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
 }
 
 to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
-    // Hadamard-rotated variants dequantize via their base type (identical layout).
-    switch (ggml_get_base_type(type)) {
+    switch (ggml_get_base_type(type)) { // rotated variants share their base type's layout
         case GGML_TYPE_Q1_0:
             return dequantize_block_cont_cuda<QK1_0, QR1_0, dequantize_q1_0>;
         case GGML_TYPE_Q2_0:
@@ -575,8 +573,7 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
 }
 
 to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
-    // Hadamard-rotated variants dequantize via their base type (identical layout).
-    switch (ggml_get_base_type(type)) {
+    switch (ggml_get_base_type(type)) { // rotated variants share their base type's layout
         case GGML_TYPE_Q1_0:
             return dequantize_block_cont_cuda<QK1_0, QR1_0, dequantize_q1_0>;
         case GGML_TYPE_Q2_0:
@@ -633,8 +630,7 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
 }
 
 to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
-    // Hadamard-rotated variants dequantize via their base type (identical layout).
-    switch (ggml_get_base_type(type)) {
+    switch (ggml_get_base_type(type)) { // rotated variants share their base type's layout
         case GGML_TYPE_F32:
             return convert_unary_cuda<float>;
         case GGML_TYPE_Q1_0:
@@ -659,8 +655,7 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
 }
 
 to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type) {
-    // Hadamard-rotated variants dequantize via their base type (identical layout).
-    switch (ggml_get_base_type(type)) {
+    switch (ggml_get_base_type(type)) { // rotated variants share their base type's layout
         case GGML_TYPE_F32:
             return convert_unary_cuda<float, nv_bfloat16>;
         case GGML_TYPE_Q1_0:
@@ -685,8 +680,7 @@ to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type) {
 }
 
 to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
-    // Hadamard-rotated variants dequantize via their base type (identical layout).
-    switch (ggml_get_base_type(type)) {
+    switch (ggml_get_base_type(type)) { // rotated variants share their base type's layout
         case GGML_TYPE_F16:
             return convert_unary_cuda<half, float>;
         case GGML_TYPE_Q1_0:

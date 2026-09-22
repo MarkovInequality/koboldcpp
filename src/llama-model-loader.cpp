@@ -745,7 +745,9 @@ llama_model_loader::llama_model_loader(
             }
         }
 
-        switch (type_max) {
+        // Hadamard-rotated (ConvRot) variants report their base type's ftype - the rotation is a
+        // per-tensor property, not a file type
+        switch (ggml_get_base_type(type_max)) {
             case GGML_TYPE_F32:     ftype = LLAMA_FTYPE_ALL_F32;        break;
             case GGML_TYPE_F16:     ftype = LLAMA_FTYPE_MOSTLY_F16;     break;
             case GGML_TYPE_BF16:    ftype = LLAMA_FTYPE_MOSTLY_BF16;    break;

@@ -436,9 +436,9 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        // Hadamard-rotated variants: weights stored Hadamard-rotated before
-        // quantization; bytes use the base type's layout. Inference rotates the
-        // input activation so the output is unchanged. See plans/add_hadamard_rotated_quantization_plan.md
+        // Hadamard-rotated (ConvRot) variants: the stored weights are rotated before quantization,
+        // in the base type's byte layout. Inference rotates the input activation to match, leaving
+        // the output unchanged. See plans/add_hadamard_rotated_quantization_plan.md
         GGML_TYPE_Q4R_0   = 43,
         GGML_TYPE_Q4R_1   = 44,
         GGML_TYPE_Q4R_K   = 45,
@@ -780,9 +780,9 @@ extern "C" {
     "use ggml_row_size() instead");
 
     GGML_API const char * ggml_type_name(enum ggml_type type);
-    GGML_API enum ggml_type ggml_get_rotated_type(enum ggml_type type); // Q4_*->Q4R_*, Q5_*->Q5R_* (single source of truth for the pairing), else identity
-    GGML_API enum ggml_type ggml_get_base_type(enum ggml_type type);    // Q4R_*->Q4_*, Q5R_*->Q5_* (inverse of ggml_get_rotated_type), else identity
-    GGML_API bool            ggml_is_rotated(enum ggml_type type);      // true for Hadamard-rotated variants
+    GGML_API enum ggml_type ggml_get_rotated_type(enum ggml_type type); // Q4_*->Q4R_*, Q5_*->Q5R_*, else identity
+    GGML_API enum ggml_type ggml_get_base_type   (enum ggml_type type); // the inverse
+    GGML_API bool           ggml_is_rotated      (enum ggml_type type);
     GGML_API const char * ggml_op_name  (enum ggml_op   op);
     GGML_API const char * ggml_op_symbol(enum ggml_op   op);
 
