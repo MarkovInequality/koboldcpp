@@ -16810,6 +16810,15 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct g
         return false;
     }
 
+    // A mul_mat carrying the ConvRot hint must keep its fast FWHT path: fusing it makes
+    // ggml_vk_can_use_fwht decline, falling back to a materialized-matrix GEMM that is correct but
+    // slower. Today the rotation node feeds a GEMM rather than an add so no fusion matches it
+    // anyway - this keeps that true if the graph shape changes.
+    if (cgraph->nodes[node_idx]->op == GGML_OP_MUL_MAT &&
+        ggml_get_op_params_i32(cgraph->nodes[node_idx], 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        return false;
+    }
+
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
         // additional constraints specific to this fusion
         const ggml_tensor *rms_norm = cgraph->nodes[node_idx];

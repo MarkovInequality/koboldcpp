@@ -6,6 +6,7 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <set>
 #include <cmath>
 #include <cstring>
 #include <cinttypes>
@@ -1121,6 +1122,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     // flag for --dry-run
     bool will_require_imatrix = false;
     size_t n_hadamard_rotated = 0;
+    std::set<int64_t> slow_hadamard_groups;
 
     //
     // preliminary iteration over all weights
@@ -1149,6 +1151,13 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     ++n_hadamard_rotated;
                 }
             }
+
+            // a group no backend can FWHT still produces a correct model - inference falls back to
+            // a materialized-matrix GEMM - it is just slower, so warn rather than refuse
+            if (ggml_is_rotated(metadata[i].target_type) &&
+                !ggml_fwht_supports_group(ggml_blck_size(metadata[i].target_type))) {
+                slow_hadamard_groups.insert(ggml_blck_size(metadata[i].target_type));
+            }
         } else {
             metadata[i].target_type = tensor->type;
         }
@@ -1172,10 +1181,16 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         }
     }
 
+    for (const int64_t g : slow_hadamard_groups) {
+        LLAMA_LOG_WARN("%s: WARNING: ConvRot rotation group %d has no fast FWHT on any backend - the "
+                       "model is correct but inference will run the slower materialized-matrix path\n",
+                       __func__, (int) g);
+    }
+
     if (params->hadamard) {
         if (n_hadamard_rotated == 0) {
             LLAMA_LOG_WARN("%s: WARNING: --hadamard had no effect - none of the selected quantization types have a "
-                           "Hadamard-rotated variant (only Q4_0/Q4_1/Q4_K/Q5_0/Q5_1/Q5_K do)\n", __func__);
+                           "Hadamard-rotated variant (only Q4_K and Q5_K do)\n", __func__);
         } else {
             LLAMA_LOG_INFO("%s: --hadamard: rotating %zu tensor(s) to their ConvRot variants\n", __func__, n_hadamard_rotated);
         }

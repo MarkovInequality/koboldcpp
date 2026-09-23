@@ -438,14 +438,17 @@ extern "C" {
         GGML_TYPE_Q2_0    = 42,
         // Hadamard-rotated (ConvRot) variants: the stored weights are rotated before quantization,
         // in the base type's byte layout. Inference rotates the input activation to match, leaving
-        // the output unchanged. See plans/add_hadamard_rotated_quantization_plan.md
-        GGML_TYPE_Q4R_0   = 43,
-        GGML_TYPE_Q4R_1   = 44,
-        GGML_TYPE_Q4R_K   = 45,
-        GGML_TYPE_Q5R_0   = 46,
-        GGML_TYPE_Q5R_1   = 47,
-        GGML_TYPE_Q5R_K   = 48,
-        GGML_TYPE_COUNT   = 49,
+        // the output unchanged. Only the 256-wide _K groups exist: a 32-wide rotation measured
+        // worse on both quality and speed than no rotation at all.
+        //
+        // Deliberately based at 150, well clear of upstream's allocation, so a rotated file can
+        // never be mistaken for some future upstream type with a matching block layout. The gap
+        // (45..149) is unused: those entries have type_name == NULL and blck_size == 0, which the
+        // GGUF reader rejects.
+        // See plans/add_hadamard_rotated_quantization_plan.md
+        GGML_TYPE_Q4R_K   = 150,
+        GGML_TYPE_Q5R_K   = 151,
+        GGML_TYPE_COUNT   = 152,
     };
 
     // precision
@@ -780,9 +783,14 @@ extern "C" {
     "use ggml_row_size() instead");
 
     GGML_API const char * ggml_type_name(enum ggml_type type);
-    GGML_API enum ggml_type ggml_get_rotated_type(enum ggml_type type); // Q4_*->Q4R_*, Q5_*->Q5R_*, else identity
+    GGML_API enum ggml_type ggml_get_rotated_type(enum ggml_type type); // Q4_K->Q4R_K, Q5_K->Q5R_K, else identity
     GGML_API enum ggml_type ggml_get_base_type   (enum ggml_type type); // the inverse
     GGML_API bool           ggml_is_rotated      (enum ggml_type type);
+
+    // A ConvRot rotation group is only allowed if every backend can run it as a fast FWHT.
+    // Smaller groups would fall back to a materialized-matrix GEMM, which is both slower and not
+    // worth it - the mixing is too weak to beat the block structure the rotation destroys.
+    GGML_API bool           ggml_fwht_supports_group(int64_t n);
     GGML_API const char * ggml_op_name  (enum ggml_op   op);
     GGML_API const char * ggml_op_symbol(enum ggml_op   op);
 

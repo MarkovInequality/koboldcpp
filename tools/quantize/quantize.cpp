@@ -133,10 +133,10 @@ static void usage(const char * executable) {
     printf("  --pure\n");
     printf("                                      disable k-quant mixtures and quantize all tensors to the same type\n");
     printf("  --hadamard\n");
-    printf("                                      rotate weights by a block-Hadamard before quantizing (ConvRot), which\n");
-    printf("                                      suppresses outliers and improves low-bit quality. Converts Q4_0/Q4_1/\n");
-    printf("                                      Q4_K/Q5_0/Q5_1/Q5_K to their rotated variants Q4R_*/Q5R_*; for specific\n");
-    printf("                                      tensors use e.g. --tensor-type 'blk.0..*'=q4r_K instead\n");
+    printf("                                      rotate weights by a 256-wide block-Hadamard before quantizing (ConvRot),\n");
+    printf("                                      which suppresses outliers and improves quality. Converts Q4_K/Q5_K to\n");
+    printf("                                      their rotated variants Q4R_K/Q5R_K; for specific tensors use e.g.\n");
+    printf("                                      --tensor-type 'blk.0..*'=q4r_K instead\n");
     printf("  --imatrix file_name\n");
     printf("                                      use data in file_name as importance matrix for quant optimizations\n");
     printf("  --include-weights tensor_name\n");

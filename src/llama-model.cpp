@@ -1830,6 +1830,33 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // ConvRot: weights whose GEMM input the engine rotates by H_g. Reported here rather than in
+    // print_info(), which runs before this point and would always see an empty tensors_by_name.
+    size_t n_hadamard_rotated = 0;
+    std::set<int64_t> slow_hadamard_groups;
+    for (const auto & [name, cur] : tensors_by_name) {
+        if (!ggml_is_rotated(cur->type)) {
+            continue;
+        }
+
+        // A group no backend can FWHT still runs correctly - the hinted node falls back to a
+        // materialized-matrix GEMM - so this is a performance note, not a load failure.
+        const int64_t g = ggml_blck_size(cur->type);
+        if (!ggml_fwht_supports_group(g)) {
+            slow_hadamard_groups.insert(g);
+        }
+
+        n_hadamard_rotated++;
+    }
+    if (n_hadamard_rotated > 0) {
+        LLAMA_LOG_INFO("%s: n_hadamard_rotated = %zu\n", __func__, n_hadamard_rotated);
+    }
+    for (const int64_t g : slow_hadamard_groups) {
+        LLAMA_LOG_WARN("%s: WARNING: ConvRot rotation group %" PRId64 " has no fast FWHT on this "
+                       "build's backends - falling back to the slower materialized-matrix path\n",
+                       __func__, g);
+    }
+
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
@@ -2162,13 +2189,6 @@ void llama_model::print_info() const {
         }
 
         LLAMA_LOG_INFO("%s: model type            = %s\n",     __func__, type_name().c_str());
-
-        // ConvRot: weights whose GEMM input the engine rotates by H_g
-        const size_t n_hadamard_rotated = std::count_if(tensors_by_name.begin(), tensors_by_name.end(),
-            [](const auto & it) { return ggml_is_rotated(it.second->type); });
-        if (n_hadamard_rotated > 0) {
-            LLAMA_LOG_INFO("%s: n_hadamard_rotated    = %zu\n", __func__, n_hadamard_rotated);
-        }
 
         if (pimpl->n_elements >= 1e12) {
             LLAMA_LOG_INFO("%s: model params          = %.2f T\n", __func__, pimpl->n_elements*1e-12);

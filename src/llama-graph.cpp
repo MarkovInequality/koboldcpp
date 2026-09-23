@@ -1547,6 +1547,11 @@ ggml_tensor * llm_graph_context::rotate_input_if_rotated(ggml_tensor * w, ggml_t
 
     const int64_t g = ggml_blck_size(w->type); // rotated types share their base type's block size
 
+    // No assert on the group size here on purpose. The quantizer and the model loader both reject
+    // groups outside the backends' fast-FWHT set, so one should never reach this point - but if it
+    // does, the hinted node still computes the right answer via a regular GEMM against H_g. Aborting
+    // would trade a correct-but-slower path for a crash.
+
     // rotate each (activation, group) pair once and share it with every weight that consumes it:
     // QKV is 3 GEMMs off one rotation, FFN up/gate is 2
     auto & cur_rot = hadamard_rot_cache[{ cur, g }];

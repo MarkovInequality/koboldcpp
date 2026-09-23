@@ -959,22 +959,6 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .is_quantized             = false,
     },
     // ConvRot variants: the base type's row, verbatim - only the stored values are rotated
-    [GGML_TYPE_Q4R_0] = {
-        .type_name                = "q4r_0",
-        .blck_size                = QK4_0,
-        .type_size                = sizeof(block_q4_0),
-        .is_quantized             = true,
-        .to_float                 = (ggml_to_float_t) dequantize_row_q4_0,
-        .from_float_ref           = (ggml_from_float_t) quantize_row_q4_0_ref,
-    },
-    [GGML_TYPE_Q4R_1] = {
-        .type_name                = "q4r_1",
-        .blck_size                = QK4_1,
-        .type_size                = sizeof(block_q4_1),
-        .is_quantized             = true,
-        .to_float                 = (ggml_to_float_t) dequantize_row_q4_1,
-        .from_float_ref           = (ggml_from_float_t) quantize_row_q4_1_ref,
-    },
     [GGML_TYPE_Q4R_K] = {
         .type_name                = "q4r_K",
         .blck_size                = QK_K,
@@ -982,22 +966,6 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_q4_K,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q4_K_ref,
-    },
-    [GGML_TYPE_Q5R_0] = {
-        .type_name                = "q5r_0",
-        .blck_size                = QK5_0,
-        .type_size                = sizeof(block_q5_0),
-        .is_quantized             = true,
-        .to_float                 = (ggml_to_float_t) dequantize_row_q5_0,
-        .from_float_ref           = (ggml_from_float_t) quantize_row_q5_0_ref,
-    },
-    [GGML_TYPE_Q5R_1] = {
-        .type_name                = "q5r_1",
-        .blck_size                = QK5_1,
-        .type_size                = sizeof(block_q5_1),
-        .is_quantized             = true,
-        .to_float                 = (ggml_to_float_t) dequantize_row_q5_1,
-        .from_float_ref           = (ggml_from_float_t) quantize_row_q5_1_ref,
     },
     [GGML_TYPE_Q5R_K] = {
         .type_name                = "q5r_K",
@@ -1416,7 +1384,9 @@ double ggml_type_sizef(enum ggml_type type) {
 const char * ggml_type_name(enum ggml_type type) {
     assert(type >= 0);
     assert(type < GGML_TYPE_COUNT);
-    return type_traits[type].type_name;
+    // the enum is sparse (the ConvRot types sit at 150+), so unused slots have a NULL name -
+    // never hand a NULL back to a caller that is about to printf or stream it
+    return type_traits[type].type_name ? type_traits[type].type_name : "(unused)";
 }
 
 bool ggml_is_quantized(enum ggml_type type) {
@@ -1428,11 +1398,7 @@ bool ggml_is_quantized(enum ggml_type type) {
 // Hadamard-rotated variants (Q4R_*/Q5R_*) share their base type's layout and kernels; only the
 // stored values are rotated. One list drives both directions of the pairing.
 #define GGML_ROTATED_TYPE_PAIRS \
-    X(GGML_TYPE_Q4_0, GGML_TYPE_Q4R_0) \
-    X(GGML_TYPE_Q4_1, GGML_TYPE_Q4R_1) \
     X(GGML_TYPE_Q4_K, GGML_TYPE_Q4R_K) \
-    X(GGML_TYPE_Q5_0, GGML_TYPE_Q5R_0) \
-    X(GGML_TYPE_Q5_1, GGML_TYPE_Q5R_1) \
     X(GGML_TYPE_Q5_K, GGML_TYPE_Q5R_K)
 
 enum ggml_type ggml_get_rotated_type(enum ggml_type type) {
@@ -1459,6 +1425,12 @@ enum ggml_type ggml_get_base_type(enum ggml_type type) {
 
 bool ggml_is_rotated(enum ggml_type type) {
     return ggml_get_base_type(type) != type;
+}
+
+// the group sizes every backend implements as a fast FWHT (CUDA fwht.cu, Metal
+// ggml_metal_fwht_supported_size, Vulkan ggml_vk_fwht_pipeline_idx; the CPU always has one)
+bool ggml_fwht_supports_group(int64_t n) {
+    return n == 64 || n == 128 || n == 256 || n == 512;
 }
 
 const char * ggml_op_name(enum ggml_op op) {
