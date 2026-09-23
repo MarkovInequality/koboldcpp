@@ -243,8 +243,22 @@ Every way a backend can decline, and what the design does about it:
 `ggml_compute_forward_mul_mat` takes the FWHT branch unconditionally on the hint and never reads src0, so a CPU run exercises neither the materialized `H_g` nor any of the Phase 2 backend dispatch. Only a GPU run with the FWHT path disabled reads `H_g` from device memory — which is precisely what a host-memory `H_g` would break.
 
 ## Phase 6 — Docs
-- Document the feature, the two types, and the backwards-compat behavior (new types ⇒ fail-loud on old engines).
-- Update the quantizer usage / README.
+**`tools/quantize/README.md`** — the user-facing home, since that is where a quant type gets chosen:
+- `--hadamard` added to the options list, linking to the feature section.
+- New **"Hadamard-rotated quantization (ConvRot)"** section: what the rotation does and why the
+  output is unchanged, the two types and their group, the measured perplexity and throughput, and a
+  "Things to know" list covering the five user-visible constraints — files are fork-only (type
+  indices 150/151, refused elsewhere rather than misread), token embeddings are never rotated,
+  requantizing back to a non-rotated type is refused, some architectures refuse to run rather than
+  produce wrong output, and imatrix resolution is averaged within each group.
+- Two worked examples added to the existing **Quantization Examples** block.
+
+**`tools/quantize/quantize.cpp`** — `--hadamard` documented in `usage()` (done in Phase 3).
+
+**Main `README.md` — intentionally untouched.** It is an end-user install/run/compile guide; a niche
+experimental quant type belongs with the quantizer docs, not there.
+
+Both documented example commands were run end-to-end to confirm they work as written.
 
 ---
 

@@ -54,6 +54,7 @@ Options:
 * `--allow-requantize` allow requantizing tensors that have already been quantized. Warning: This can severely reduce quality compared to quantizing from 16bit or 32bit
 * `--leave-output-tensor` leave output.weight un(re)quantized. Increases model size but may also increase quality, especially when requantizing
 * `--pure` disable k-quant mixtures and quantizes all tensors to the same type
+* `--hadamard` rotate weights by a block-Hadamard before quantizing ([ConvRot](#hadamard-rotated-quantization-convrot)), improving quality at the same file size
 * `--imatrix file_name` use data in file_name as importance matrix for quant optimizations
 * `--include-weights tensor_name` use importance matrix for this tensor (can be specified multiple times)
 * `--exclude-weights tensor_name` use importance matrix for the tensors **not** specified (include/exclude cannot be mixed)
@@ -122,6 +123,16 @@ python convert_hf_to_gguf.py --mmproj --outfile mmproj-gemma-4-E2B-it-Q8_0.gguf 
 ./llama-quantize --imatrix imatrix.gguf --override-kv qwen3moe.expert_used_count=int:16 --prune-layers 20,21,22 input-model-f32.gguf pruned-model-f32.gguf copy 8
 ```
 
+```bash
+# Hadamard-rotated Q4_K (ConvRot). Same file size as plain q4_k_m, lower perplexity
+./llama-quantize --hadamard input-model-f32.gguf q4_k_m 8
+```
+
+```bash
+# rotate only the ffn_down tensors, leaving everything else as plain Q4_K
+./llama-quantize --tensor-type "ffn_down=q4r_K" input-model-f32.gguf q4_k_m 8
+```
+
 ## Memory/Disk Requirements
 
 When running the larger models, make sure you have enough disk space to store all the intermediate files.
@@ -175,6 +186,49 @@ Several quantization methods are supported. They differ in the resulting model d
 | size (GiB)                  |      14.96   |
 | prompt processing t/s @ 512 | 923.49 ±0.53 |
 | text generation t/s @ 128   |  29.17 ±0.04 |
+
+## Hadamard-rotated quantization (ConvRot)
+
+`--hadamard` multiplies each weight by an orthonormal Walsh-Hadamard matrix `H` before quantizing it, in blocks of 256 along the input dimension. Because `H` is orthonormal and self-inverse, the engine can undo the rotation at inference by applying the same `H` to the activation feeding that GEMM:
+
+```
+y = (W·H)·(H·x) = W·(H·H)·x = W·x
+```
+
+The output is mathematically unchanged, but the *stored* weights are better behaved: the rotation mixes each block so that a single large outlier is spread across 256 values instead of forcing the whole block's scale. Quantization error drops as a result, **at identical file size** — the rotated tensors use the base type's byte layout exactly.
+
+### Types
+
+| type | base | rotation group |
+| ---- | ---- | -------------- |
+| `Q4R_K` | `Q4_K` | 256 |
+| `Q5R_K` | `Q5_K` | 256 |
+
+`--hadamard` converts `Q4_K` and `Q5_K` selections to these automatically; other types are left alone (and the tool warns if nothing was converted). Individual tensors can be selected with `--tensor-type`, e.g. `--tensor-type "ffn_down=q4r_K"`.
+
+There are deliberately no 32-wide (`_0`/`_1`) rotated variants. A 32-wide rotation was measured as worse than no rotation at all on both quality and speed — too little mixing to pay for the block structure it destroys.
+
+### Measured effect
+
+Qwen3-0.6B, wikitext-2 test split, 35190 scored tokens:
+
+| model | perplexity | vs. unrotated |
+| ----- | ---------- | ------------- |
+| f16 (reference) | 21.56 | — |
+| Q4_K  | 23.43 | |
+| **Q4R_K** | **23.30** | −0.13 |
+| Q5_K  | 22.30 | |
+| **Q5R_K** | **21.92** | −0.38 |
+
+Throughput cost on an RTX 5090: prompt processing is unaffected (within measurement noise, since the rotation amortizes across the batch), and token generation is roughly 8–13% slower. The decode cost is dominated by kernel-launch overhead for the extra rotation nodes rather than by their arithmetic.
+
+### Things to know
+
+* **These files only load in this fork.** The rotated types use ggml type indices 150 and 151, which upstream llama.cpp does not have. Any other build refuses the file outright rather than misreading it — but that also means a rotated GGUF is not portable, so do not distribute one.
+* **Token embeddings are never rotated.** The engine assumes every GEMM input starts in the unrotated space, so `--hadamard` skips `token_embd`, and asking for it explicitly is an error. No quality is lost: the first layer's GEMM *weights* are still rotated.
+* **Requantizing from a rotated model is restricted.** Going back to a non-rotated type is refused, because the stored values are in the rotated space and the marker that tells the engine to rotate would be lost. Requantize from the original unrotated model instead. Rotated → rotated at the same group works and is a plain copy.
+* **Some architectures are not supported yet.** Models whose graphs call the matmul path directly rather than through the common wrapper (deepseek2, glm-dsa, plm and a few others) will refuse to run with a rotated weight, naming the offending tensor, rather than producing silently wrong output.
+* **imatrix interacts with the rotation.** An importance matrix is carried into the rotated space, but a block rotation necessarily averages importance across each group of 256 — only the relative weighting *between* groups survives.
 
 ## Background information on llama-quantize
 
