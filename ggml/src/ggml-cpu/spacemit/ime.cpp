@@ -187,7 +187,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
     bool compute_forward(ggml_compute_params * params, ggml_tensor * op) override {
         switch (op->op) {
             case GGML_OP_MUL_MAT:
-                switch (ggml_get_base_type(op->src[0]->type)) {
+                switch (op->src[0]->type) {
                     case GGML_TYPE_Q2_K:
                     case GGML_TYPE_Q3_K:
                     case GGML_TYPE_Q4_0:
@@ -207,7 +207,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                 }
                 break;
             case GGML_OP_MUL_MAT_ID:
-                switch (ggml_get_base_type(op->src[0]->type)) {
+                switch (op->src[0]->type) {
                     case GGML_TYPE_Q2_K:
                     case GGML_TYPE_Q3_K:
                     case GGML_TYPE_Q4_0:
@@ -1257,7 +1257,7 @@ static const tensor_traits_common               rvv_impl;
 }  // namespace ggml::cpu::riscv64_spacemit
 
 static const ggml::cpu::tensor_traits * ggml_riscv64_spacemit_get_optimal_repack_type(const ggml_tensor * cur) {
-    switch (ggml_get_base_type(cur->type)) {
+    switch (cur->type) {
         case GGML_TYPE_Q2_K:
             {
 #if defined(RISCV64_SPACEMIT_IME2)
@@ -1540,7 +1540,7 @@ static size_t ggml_backend_cpu_riscv64_spacemit_nbytes(ggml_backend_buffer_type_
     };
 
     size_t nbytes = row_nbytes;
-    switch (ggml_get_base_type(tensor->type)) {
+    switch (tensor->type) {
         case GGML_TYPE_Q4_K:
             nbytes = remap_block_nbytes(sizeof(block_q4_K), sizeof(block_q4_1) * 8);
             break;

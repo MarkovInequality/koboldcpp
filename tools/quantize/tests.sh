@@ -61,30 +61,15 @@ $MAIN -no-cnv --model $WORK_PATH/ggml-model-requant-merge.gguf -p "I believe the
 echo PASS
 echo
 
-# 5. Hadamard-rotated quantization (ConvRot): --hadamard converts Q4_K -> Q4R_K
+# 5. Hadamard-rotated (HQ) quantization; tools/quantize/tests-hq.sh has the full HQ suite
+grep -rn 'ggml_get_base_type\|ggml_is_rotated' "$ROOT_DIR"/ggml/src/ggml-*/ && { echo "FAIL: a backend references the rotated types"; exit 1; }
 $QUANTIZE --allow-requantize --hadamard $WORK_PATH/Qwen3-0.6B-Q8_0.gguf $WORK_PATH/ggml-model-rot.gguf Q4_K
-echo PASS
-echo
-
-# 5a. The rotated model must load and generate. A missing or wrong inference-side rotation does
-#     not crash - it produces garbage - so this step only catches the gross failures (the graph
-#     guard throwing, a backend having no kernel for the rotated type). Use the perplexity tool
-#     for the quality check.
 $MAIN -no-cnv --model $WORK_PATH/ggml-model-rot.gguf -p "I believe the meaning of life is" --n-predict 32
 echo PASS
 echo
 
-# 5b. A rotated type can also be selected per-tensor, without --hadamard
-$QUANTIZE --allow-requantize --tensor-type 'blk\..*ffn_down'=q4r_K $WORK_PATH/Qwen3-0.6B-Q8_0.gguf $WORK_PATH/ggml-model-rot-partial.gguf Q4_K
-echo PASS
-echo
-
-$MAIN -no-cnv --model $WORK_PATH/ggml-model-rot-partial.gguf -p "I believe the meaning of life is" --n-predict 32
-echo PASS
-echo
-
-# 5c. Rotating the token embeddings is not representable by the engine - must fail loud
-if $QUANTIZE --allow-requantize --token-embedding-type q4r_K $WORK_PATH/Qwen3-0.6B-Q8_0.gguf $WORK_PATH/ggml-model-rot-bad.gguf Q4_K
+# 5a. Rotated token embeddings are refused
+if $QUANTIZE --allow-requantize --token-embedding-type hq4_K $WORK_PATH/Qwen3-0.6B-Q8_0.gguf $WORK_PATH/ggml-model-rot-bad.gguf Q4_K
 then
     echo "FAIL: rotated token embeddings should have been rejected"
     exit 1

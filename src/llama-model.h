@@ -704,6 +704,12 @@ struct llama_model {
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
 
+    // weights stored rotated by the RHT with this seed; they are created with their base type
+    std::unordered_set<const ggml_tensor *> rotated_tensors;
+    uint64_t hadamard_seed = 0;
+
+    bool is_rotated(const ggml_tensor * t) const;
+
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
 

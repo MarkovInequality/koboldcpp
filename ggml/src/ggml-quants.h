@@ -110,6 +110,13 @@ GGML_API void iq2xs_free_impl(enum ggml_type type);
 GGML_API void iq3xs_init_impl(int grid_size);
 GGML_API void iq3xs_free_impl(int grid_size);
 
+// tables built by iq2xs_init_impl / iq3xs_init_impl, NULL until then
+GGML_API void ggml_iq2_entry(enum ggml_type type, const uint64_t ** grid, const int ** map, const uint16_t ** neighbours);
+GGML_API void ggml_iq3_entry(int grid_size,       const uint32_t ** grid, const int ** map, const uint16_t ** neighbours);
+
+// HQ types: src rows are already rotated (ggml_rht_ref); uniform weights, no imatrix
+GGML_API size_t quantize_hq(enum ggml_type type, const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row);
+
 #ifdef __cplusplus
 }
 #endif

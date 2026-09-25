@@ -163,6 +163,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_GENERAL_QUANTIZATION_VERSION,     "general.quantization_version"          },
     { LLM_KV_GENERAL_ALIGNMENT,                "general.alignment"                     },
     { LLM_KV_GENERAL_FILE_TYPE,                "general.file_type"                     },
+    { LLM_KV_HADAMARD_SEED,                    "hadamard.seed"                         },
     { LLM_KV_GENERAL_SAMPLING_SEQUENCE,        "general.sampling.sequence"             },
     { LLM_KV_GENERAL_SAMPLING_TOP_K,           "general.sampling.top_k"                },
     { LLM_KV_GENERAL_SAMPLING_TOP_P,           "general.sampling.top_p"                },

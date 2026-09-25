@@ -403,6 +403,10 @@ add_library(ggml
             ggml/include/ggml-cpp.h
             ggml/src/ggml-quants.c
             ggml/src/ggml-quants.h
+            ggml/src/ggml-quants-hq.c
+            ggml/src/ggml-hadamard.c
+            ggml/src/ggml-hadamard.h
+            ggml/src/ggml-hadamard-tables.h
             ggml/src/ggml-cpu/llamafile/sgemm.cpp
             ggml/src/ggml-cpu/llamafile/sgemm.h
             ggml/src/ggml-cpu/traits.cpp

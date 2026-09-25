@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cinttypes>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -1539,6 +1540,43 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
     vocab.load(ml, kv);
 }
 
+static bool llama_dev_has_rht(ggml_backend_dev_t dev) {
+    if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return true;
+    }
+    // the ggml-cuda registry name is "CUDA", or "ROCm"/"MUSA" when built with HIP/MUSA; llama is
+    // shared between the backend builds, so this can't be an #ifdef
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    const std::string name = reg ? ggml_backend_reg_name(reg) : "";
+    return name == "CUDA" || name == "ROCm" || name == "MUSA";
+}
+
+// Only the CPU and the CUDA backend implement GGML_OP_RHT. Anywhere else each rotation would run
+// on the CPU through a graph split and a device round trip, with nothing reporting the slowdown.
+// The whole device list counts, since the scheduler can offload ops to any of them.
+static void llama_check_rotated_devices(const std::vector<llama_device> & devices, const llama_model_loader & ml) {
+    std::vector<ggml_backend_dev_t> used;
+    for (const auto & dev : devices) {
+        used.push_back(dev.dev);
+    }
+    for (const auto & [buft, ctx_ptr] : ml.ctx_map) {
+        if (ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft)) {
+            used.push_back(dev);
+        }
+    }
+
+    for (ggml_backend_dev_t dev : used) {
+        if (llama_dev_has_rht(dev)) {
+            continue;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        throw std::runtime_error(format("this model has Hadamard-rotated (HQ) tensors, which are only supported on the "
+            "CPU and the CUDA backend (CUDA, ROCm, MUSA); device %s (%s) isn't. Run CPU-only (koboldcpp: --usecpu; "
+            "llama tools: --device none) or on a CUDA/ROCm build.",
+            ggml_backend_dev_name(dev), reg ? ggml_backend_reg_name(reg) : "unknown backend"));
+    }
+}
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
@@ -1830,31 +1868,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // ConvRot: weights whose GEMM input the engine rotates by H_g. Reported here rather than in
-    // print_info(), which runs before this point and would always see an empty tensors_by_name.
-    size_t n_hadamard_rotated = 0;
-    std::set<int64_t> slow_hadamard_groups;
-    for (const auto & [name, cur] : tensors_by_name) {
-        if (!ggml_is_rotated(cur->type)) {
-            continue;
-        }
-
-        // A group no backend can FWHT still runs correctly - the hinted node falls back to a
-        // materialized-matrix GEMM - so this is a performance note, not a load failure.
-        const int64_t g = ggml_blck_size(cur->type);
-        if (!ggml_fwht_supports_group(g)) {
-            slow_hadamard_groups.insert(g);
-        }
-
-        n_hadamard_rotated++;
-    }
-    if (n_hadamard_rotated > 0) {
-        LLAMA_LOG_INFO("%s: n_hadamard_rotated = %zu\n", __func__, n_hadamard_rotated);
-    }
-    for (const int64_t g : slow_hadamard_groups) {
-        LLAMA_LOG_WARN("%s: WARNING: ConvRot rotation group %" PRId64 " has no fast FWHT on this "
-                       "build's backends - falling back to the slower materialized-matrix path\n",
-                       __func__, g);
+    rotated_tensors = std::move(ml.rotated_tensors);
+    hadamard_seed   = ml.hadamard_seed;
+    if (!rotated_tensors.empty()) {
+        LLAMA_LOG_INFO("%s: %zu Hadamard-rotated (HQ) tensors, seed = %" PRIu64 "\n", __func__, rotated_tensors.size(), hadamard_seed);
+        llama_check_rotated_devices(devices, ml);
     }
 
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
@@ -2346,6 +2364,16 @@ ggml_backend_buffer_type_t llama_model::select_buft(int il) const {
 
 bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
+}
+
+bool llama_model::is_rotated(const ggml_tensor * t) const {
+    if (rotated_tensors.empty() || !t) {
+        return false;
+    }
+    while (t->view_src) {
+        t = t->view_src;
+    }
+    return rotated_tensors.count(t) > 0;
 }
 
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
@@ -2846,7 +2874,7 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
 
     llm->res->set_outputs(params);
 
-    llm_graph_check_hadamard_rotation(llm->res->get_gf());
+    llm_graph_check_hadamard_rotation(llm->res->get_gf(), *this);
 
     return llm->res->get_gf();
 }

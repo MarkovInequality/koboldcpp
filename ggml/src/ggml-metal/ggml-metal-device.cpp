@@ -729,8 +729,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_
     char base[256];
     char name[256];
 
-    // the kernel name is built from the type name, so rotated variants must map to their base
-    const ggml_type tsrc0 = ggml_get_base_type(op->src[0]->type);
+    const ggml_type tsrc0 = op->src[0]->type;
     const ggml_type tsrc1 = op->src[1]->type;
     const int       ne12  = op->src[1]->ne[2];
     const int       r2    = ne12 / op->src[0]->ne[2];
@@ -763,7 +762,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     char base[256];
     char name[256];
 
-    const ggml_type tsrc0 = ggml_get_base_type(op->src[0]->type);
+    const ggml_type tsrc0 = op->src[0]->type;
     const ggml_type tsrc1 = op->src[1]->type;
 
     const bool bc_inp = op->src[0]->ne[0] % 32 != 0;
@@ -834,7 +833,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
 
     size_t smem = 0; // shared memory
 
-    const ggml_type tsrc0 = ggml_get_base_type(op->src[0]->type);
+    const ggml_type tsrc0 = op->src[0]->type;
     const ggml_type tsrc1 = op->src[1]->type;
 
     const char * suffix = "";
@@ -1038,7 +1037,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
     char base[256];
     char name[256];
 
-    const ggml_type tsrc0 = ggml_get_base_type(op->src[0]->type);
+    const ggml_type tsrc0 = op->src[0]->type;
     const ggml_type tsrc1 = op->src[1]->type;
 
     const bool bc_inp = op->src[0]->ne[0] % 32 != 0;
@@ -1075,7 +1074,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
 
     size_t smem = 0; // shared memory
 
-    const ggml_type tsrc0 = ggml_get_base_type(op->src[0]->type);
+    const ggml_type tsrc0 = op->src[0]->type;
     const ggml_type tsrc1 = op->src[1]->type;
 
     const char * suffix = "";

@@ -14,6 +14,7 @@
 #include <map>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 
@@ -110,6 +111,10 @@ struct llama_model_loader {
 
     size_t size_done = 0;
     size_t size_data = 0;
+
+    // tensors stored rotated by the RHT (created with their base type), and the file's seed
+    std::unordered_set<const ggml_tensor *> rotated_tensors;
+    uint64_t hadamard_seed = 0;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:

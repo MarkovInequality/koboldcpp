@@ -119,7 +119,8 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
 
 [[noreturn]]
 static void usage(const char * executable) {
-    printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--hadamard] [--imatrix] [--include-weights]\n", executable);
+    printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--hadamard] [--hadamard-seed] [--lora]\n", executable);
+    printf("       [--imatrix] [--include-weights]\n");
     printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--tensor-type-file]\n");
     printf("       [--prune-layers] [--keep-split] [--override-kv] [--dry-run] [--max-buffer-size]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
@@ -133,10 +134,17 @@ static void usage(const char * executable) {
     printf("  --pure\n");
     printf("                                      disable k-quant mixtures and quantize all tensors to the same type\n");
     printf("  --hadamard\n");
-    printf("                                      rotate weights by a 256-wide block-Hadamard before quantizing (ConvRot),\n");
-    printf("                                      which suppresses outliers and improves quality. Converts Q4_K/Q5_K to\n");
-    printf("                                      their rotated variants Q4R_K/Q5R_K; for specific tensors use e.g.\n");
-    printf("                                      --tensor-type 'blk.0..*'=q4r_K instead\n");
+    printf("                                      rotate each weight row by a randomized Hadamard transform over the full row\n");
+    printf("                                      and quantize with nearest-neighbour rounding: every chosen Q4_K, Q5_K, IQ2_XXS,\n");
+    printf("                                      IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL or IQ4_XS tensor becomes its HQ variant\n");
+    printf("                                      (hq4_K, ..., hq4_xs); HQ tensors ignore --imatrix. For specific tensors use\n");
+    printf("                                      e.g. --tensor-type ffn_down=hq4_K instead\n");
+    printf("  --hadamard-seed N\n");
+    printf("                                      seed of the rotation's random signs (default: fixed); a source that already\n");
+    printf("                                      has rotated tensors keeps its own seed\n");
+    printf("  --lora FILE[:scale]\n");
+    printf("                                      merge a LoRA adapter into the weights (scale defaults to 1); may be repeated.\n");
+    printf("                                      Merging into a quantized source quantizes twice\n");
     printf("  --imatrix file_name\n");
     printf("                                      use data in file_name as importance matrix for quant optimizations\n");
     printf("  --include-weights tensor_name\n");
@@ -408,6 +416,9 @@ int llama_quantize(int argc, char ** argv) {
     std::string imatrix_file;
     std::vector<std::string> included_weights, excluded_weights;
     std::vector<llama_model_kv_override> kv_overrides;
+    std::vector<std::string> lora_paths;
+    std::vector<float>       lora_scales;
+    std::vector<llama_model_quantize_lora> loras;
     std::vector<tensor_type_option> tensor_type_opts;
     std::vector<int> prune_layers;
 
@@ -456,6 +467,34 @@ int llama_quantize(int argc, char ** argv) {
             params.pure = true;
         } else if (strcmp(argv[arg_idx], "--hadamard") == 0) {
             params.hadamard = true;
+        } else if (strcmp(argv[arg_idx], "--hadamard-seed") == 0) {
+            if (arg_idx == argc-1) {
+                usage(argv[0]);
+            }
+            char * end = nullptr;
+            params.hadamard_seed     = strtoull(argv[++arg_idx], &end, 0);
+            params.hadamard_seed_set = true;
+            if (*end != '\0') {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--lora") == 0) {
+            if (arg_idx == argc-1) {
+                usage(argv[0]);
+            }
+            const std::string arg = argv[++arg_idx];
+            const size_t colon = arg.find_last_of(':');
+            float scale = 1.0f;
+            std::string path = arg;
+            if (colon != std::string::npos && colon + 1 < arg.size()) {
+                char * end = nullptr;
+                const float s = strtof(arg.c_str() + colon + 1, &end);
+                if (*end == '\0') {
+                    scale = s;
+                    path  = arg.substr(0, colon);
+                }
+            }
+            lora_paths.push_back(path);
+            lora_scales.push_back(scale);
         } else if (strcmp(argv[arg_idx], "--imatrix") == 0) {
             if (arg_idx < argc-1) {
                 imatrix_file = argv[++arg_idx];
@@ -560,6 +599,13 @@ int llama_quantize(int argc, char ** argv) {
     if (!prune_layers.empty()) {
         prune_layers.push_back(-1);  // array terminator
         params.prune_layers = prune_layers.data();
+    }
+    if (!lora_paths.empty()) {
+        for (size_t i = 0; i < lora_paths.size(); ++i) {
+            loras.push_back({ lora_paths[i].c_str(), lora_scales[i] });
+        }
+        loras.push_back({ nullptr, 0.0f });
+        params.loras = loras.data();
     }
 
     llama_backend_init();

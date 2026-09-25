@@ -3267,6 +3267,13 @@ void iq2xs_free_impl(enum ggml_type type) {
     }
 }
 
+void ggml_iq2_entry(enum ggml_type type, const uint64_t ** grid, const int ** map, const uint16_t ** neighbours) {
+    const iq2_entry_t * e = &iq2_data[iq2_data_index(type)];
+    *grid       = e->grid;
+    *map        = e->map;
+    *neighbours = e->neighbours;
+}
+
 static int iq2_find_best_neighbour(const uint16_t * GGML_RESTRICT neighbours, const uint64_t * GGML_RESTRICT grid,
         const float * GGML_RESTRICT xval, const float * GGML_RESTRICT weight, float scale, int8_t * GGML_RESTRICT L) {
     int num_neighbors = neighbours[0];
@@ -3909,6 +3916,13 @@ void iq3xs_free_impl(int grid_size) {
         free(iq3_data[gindex].map);        iq3_data[gindex].map  = NULL;
         free(iq3_data[gindex].neighbours); iq3_data[gindex].neighbours = NULL;
     }
+}
+
+void ggml_iq3_entry(int grid_size, const uint32_t ** grid, const int ** map, const uint16_t ** neighbours) {
+    const iq3_entry_t * e = &iq3_data[iq3_data_index(grid_size)];
+    *grid       = e->grid;
+    *map        = e->map;
+    *neighbours = e->neighbours;
 }
 
 static int iq3_find_best_neighbour(const uint16_t * GGML_RESTRICT neighbours, const uint32_t * GGML_RESTRICT grid,

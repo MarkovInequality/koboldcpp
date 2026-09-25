@@ -54,7 +54,9 @@ Options:
 * `--allow-requantize` allow requantizing tensors that have already been quantized. Warning: This can severely reduce quality compared to quantizing from 16bit or 32bit
 * `--leave-output-tensor` leave output.weight un(re)quantized. Increases model size but may also increase quality, especially when requantizing
 * `--pure` disable k-quant mixtures and quantizes all tensors to the same type
-* `--hadamard` rotate weights by a block-Hadamard before quantizing ([ConvRot](#hadamard-rotated-quantization-convrot)), improving quality at the same file size
+* `--hadamard` rotate each weight row by a randomized Hadamard transform and store the tensor as its [HQ type](#hadamard-rotated-hq-quantization), improving quality at the same file size
+* `--hadamard-seed N` seed of the rotation's random signs (default: a fixed seed, so builds are reproducible)
+* `--lora FILE[:scale]` merge a LoRA adapter into the weights while quantizing (may be repeated)
 * `--imatrix file_name` use data in file_name as importance matrix for quant optimizations
 * `--include-weights tensor_name` use importance matrix for this tensor (can be specified multiple times)
 * `--exclude-weights tensor_name` use importance matrix for the tensors **not** specified (include/exclude cannot be mixed)
@@ -124,13 +126,18 @@ python convert_hf_to_gguf.py --mmproj --outfile mmproj-gemma-4-E2B-it-Q8_0.gguf 
 ```
 
 ```bash
-# Hadamard-rotated Q4_K (ConvRot). Same file size as plain q4_k_m, lower perplexity
-./llama-quantize --hadamard input-model-f32.gguf q4_k_m 8
+# Hadamard-rotated (HQ) Q4_K_M: every Q4_K/Q5_K/IQ* tensor of the mix becomes its HQ variant. Same size, lower KL
+./llama-quantize --hadamard input-model-f16.gguf q4_k_m 8
 ```
 
 ```bash
-# rotate only the ffn_down tensors, leaving everything else as plain Q4_K
-./llama-quantize --tensor-type "ffn_down=q4r_K" input-model-f32.gguf q4_k_m 8
+# rotate only the ffn_down tensors, leaving everything else unrotated
+./llama-quantize --tensor-type "ffn_down=hq4_K" input-model-f16.gguf q4_k_m 8
+```
+
+```bash
+# merge a LoRA adapter at half strength while quantizing
+./llama-quantize --hadamard --lora adapter.gguf:0.5 input-model-f16.gguf q4_k_m 8
 ```
 
 ## Memory/Disk Requirements
@@ -187,48 +194,129 @@ Several quantization methods are supported. They differ in the resulting model d
 | prompt processing t/s @ 512 | 923.49 ±0.53 |
 | text generation t/s @ 128   |  29.17 ±0.04 |
 
-## Hadamard-rotated quantization (ConvRot)
+## Hadamard-rotated (HQ) quantization
 
-`--hadamard` multiplies each weight by an orthonormal Walsh-Hadamard matrix `H` before quantizing it, in blocks of 256 along the input dimension. Because `H` is orthonormal and self-inverse, the engine can undo the rotation at inference by applying the same `H` to the activation feeding that GEMM:
+`--hadamard` stores each weight row `w` as `R·w`, where `R` is a randomized Hadamard transform over the row's **full** input dimension, and quantizes that. At inference the engine rotates the activation feeding the GEMM by the same `R`, so the result is unchanged:
 
 ```
-y = (W·H)·(H·x) = W·(H·H)·x = W·x
+y = (W·Rᵀ)·(R·x) = W·x
 ```
 
-The output is mathematically unchanged, but the *stored* weights are better behaved: the rotation mixes each block so that a single large outlier is spread across 256 values instead of forcing the whole block's scale. Quantization error drops as a result, **at identical file size** — the rotated tensors use the base type's byte layout exactly.
+`R` is orthogonal, so it moves nothing but the basis. What it buys is well-behaved stored values: the rotation spreads every outlier across the whole row, so each quant block sees near-Gaussian values and no single value forces a block's scale. Quantization error drops **at identical file size**, since an HQ type uses its base type's block layout exactly.
+
+`R = (1/√n)·(H_K ⊗ H_P)·diag(s)`: `s` are random signs from the seed, `H_P` is a Walsh-Hadamard transform of a power-of-2 size `P`, and `H_K` is a fixed Hadamard matrix of order `K` (a multiple of 4, from N. J. A. Sloane's library) that covers the odd part of `n = K·P`. Every row width divisible by 4 whose odd part is at most 63 is supported: that is every hidden and FFN width of the common model families (Llama, Mistral, Qwen2.5/3, Gemma 2/3, Phi-3, ...). Tensors of other widths keep their unrotated type, with a warning.
 
 ### Types
 
-| type | base | rotation group |
-| ---- | ---- | -------------- |
-| `Q4R_K` | `Q4_K` | 256 |
-| `Q5R_K` | `Q5_K` | 256 |
+| HQ type | base type |
+| ------- | --------- |
+| `HQ4_K` / `HQ5_K` | `Q4_K` / `Q5_K` |
+| `HQ2_XXS` / `HQ2_XS` / `HQ2_S` | `IQ2_XXS` / `IQ2_XS` / `IQ2_S` |
+| `HQ3_XXS` / `HQ3_S` | `IQ3_XXS` / `IQ3_S` |
+| `HQ4_NL` / `HQ4_XS` | `IQ4_NL` / `IQ4_XS` |
 
-`--hadamard` converts `Q4_K` and `Q5_K` selections to these automatically; other types are left alone (and the tool warns if nothing was converted). Individual tensors can be selected with `--tensor-type`, e.g. `--tensor-type "ffn_down=q4r_K"`.
+There are no HQ file types: `--hadamard` maps each tensor type the chosen mix picks to its HQ variant, so `--hadamard IQ3_XS` gives HQ3_S / HQ3_XXS / HQ4_K tensors, and leaves types without an HQ variant (Q6_K, Q8_0, ...) as they are. Individual tensors can be selected with `--tensor-type`, e.g. `--tensor-type "ffn_down=hq4_K"`.
 
-There are deliberately no 32-wide (`_0`/`_1`) rotated variants. A 32-wide rotation was measured as worse than no rotation at all on both quality and speed — too little mixing to pay for the block structure it destroys.
+HQ types are quantized with **nearest-neighbour rounding (uniform weights)** and **ignore `--imatrix`** (with one warning), so the IQ2 HQ types run without one. The unrotated types in the same mix still use the imatrix.
 
-### Measured effect
+### Measured quality
 
-Qwen3-0.6B, wikitext-2 test split, 35190 scored tokens:
+Qwen3-4B, wikitext-2 test (80 windows of 512 tokens, the second half of each scored, 20 400 tokens), against the BF16 model. KL is the mean KL divergence to the BF16 model's next-token distribution (lower is better); the imatrix comes from upstream `llama-imatrix` on wikitext-2's training split. Single types use `--pure --token-embedding-type q6_K`.
 
-| model | perplexity | vs. unrotated |
-| ----- | ---------- | ------------- |
-| f16 (reference) | 21.56 | — |
-| Q4_K  | 23.43 | |
-| **Q4R_K** | **23.30** | −0.13 |
-| Q5_K  | 22.30 | |
-| **Q5R_K** | **21.92** | −0.38 |
+| type | bpw | KL plain | KL imatrix | KL HQ | PPL plain / imatrix / HQ |
+| ---- | --: | -------: | ---------: | ----: | ------------------------ |
+| Q5_K | 5.60 | 0.0286 | **0.0170** | 0.0240 | 14.14 / 14.48 / 13.85 |
+| Q4_K | 4.70 | 0.0966 | **0.0523** | 0.0844 | 14.96 / 15.08 / 15.81 |
+| IQ4_NL | 4.70 | 0.0812 | **0.0615** | 0.1036 | 15.62 / 15.56 / 15.58 |
+| IQ4_XS | 4.48 | 0.0814 | **0.0611** | 0.1101 | 15.64 / 15.44 / 16.33 |
+| IQ3_S | 3.74 | 0.6182 | **0.1663** | 0.2649 | 19.74 / 14.88 / 16.09 |
+| IQ3_XXS | 3.40 | — | **0.2689** | 0.5145 | — / 15.51 / 18.44 |
+| IQ2_S | 2.95 | — | **0.7201** | 1.1914 | — / 19.46 / 30.96 |
+| IQ2_XS | 2.73 | — | **0.9122** | 3.0025 | — / 22.15 / 215.3 |
+| IQ2_XXS | 2.50 | — | **1.4076** | 3.3513 | — / 33.31 / 198.6 |
 
-Throughput cost on an RTX 5090: prompt processing is unaffected (within measurement noise, since the rotation amortizes across the batch), and token generation is roughly 8–13% slower. The decode cost is dominated by kernel-launch overhead for the extra rotation nodes rather than by their arithmetic.
+| mix | bpw | KL plain | KL imatrix | KL `--hadamard` |
+| --- | --: | -------: | ---------: | --------------: |
+| Q4_K_M | 4.96 | 0.0690 | **0.0451** | 0.0561 |
+| IQ4_XS | 4.50–4.54 | 0.0739 | **0.0578** | 0.0940 |
+| IQ3_XS | 3.60 | — | **0.2092** | 0.3168 |
+| IQ2_XXS | 2.47 | — | **1.1819** | 2.5960 |
+
+(BF16: PPL 14.25. "—": the type needs an imatrix. Wikitext perplexity alone is a poor guide at these differences, which is why KL is reported.)
+
+**What this means:**
+
+* **With an imatrix, use the unrotated imatrix quants.** They beat the HQ types at every width measured.
+* **Without an imatrix, `--hadamard` helps the K-quants and IQ3_S:** `--hadamard Q4_K_M` cuts KL by 19 % against plain Q4_K_M at the same size, HQ5_K and HQ4_K beat Q5_K and Q4_K, and HQ3_S more than halves IQ3_S's KL.
+* **Don't use HQ4_XS / HQ4_NL** (worse than the plain IQ4 types even without an imatrix) or **the HQ2 types** (unusable).
+
+Why: a few input channels of an LLM carry most of the activation energy (attention-sink / massive activations, e.g. four channels at ±1000–5000 in a couple of `ffn_down` inputs). Plain quantization happens to be accurate in exactly those weight columns — for IQ4 especially — while the rotation spreads each of them over the whole row, where nearest-neighbour rounding gives them only average accuracy. An imatrix can't be applied per rotated column to fix this; what does fix it is error feedback (GPTQ-style) in the rotated space using the imatrix as a diagonal Hessian, which a prototype measured at 32–38 % *below* the imatrix quants' KL (HQ4_XS 0.038 vs IQ4_XS + imatrix 0.061). That quantizer isn't implemented yet.
+
+### Speed
+
+Each rotated GEMM input costs one extra kernel (two for decode-sized batches), shared by every weight that reads the same activation (QKV share one rotation, FFN up/gate another). On CUDA the rotation writes the 8-bit activation layout the quantized GEMMs need, so it replaces their own conversion. RTX 5090, 9285-token prompt + 512 generated tokens, HQ vs the same model unrotated:
+
+| model | prompt processing | generation |
+| ----- | ----------------- | ---------- |
+| Qwen3-4B Q4_K_M | −6 % | −7 % (−14 % without CUDA graphs) |
+| Qwen3.8-27B Q4_K_M | −3 % | −5 % |
+
+On the CPU (8 threads, Qwen3-4B pure Q4_K), both prompt processing and generation are about 5 % slower.
+
+### Seed and metadata
+
+The random signs come from a seed stored in the file as `hadamard.seed` (uint64), the only HQ metadata key. The default seed is fixed, so builds are reproducible; `--hadamard-seed N` picks another. A file has one seed: requantizing a file that already has rotated tensors keeps its seed (and `--hadamard-seed` with a different value is an error).
+
+### Requantizing
+
+* HQ → the same HQ type is a plain copy.
+* HQ → a different HQ type (e.g. HQ5_K → HQ4_XS) dequantizes and quantizes again, without re-rotating.
+* HQ → an unrotated type is refused: the stored values are in the rotated space. Requantize from the original model instead.
+
+### Merging LoRA adapters
+
+`--lora FILE[:scale]` (repeatable) merges adapters into the weights while quantizing, for any target type. Deltas are added before the rotation; for an HQ source they are rotated with the file's seed first. The merged adapters are recorded in `general.merged_loras`. Merging into an f16/bf16 source quantizes once; **merging into an already quantized source quantizes twice** and costs quality accordingly. Runtime LoRA adapters work on HQ models unchanged.
+
+### Supported devices
+
+HQ models run on the **CPU** and the **CUDA backend** (CUDA, plus ROCm and MUSA, which build the same code; ROCm and MUSA are **unverified**, since they haven't been run on real hardware). A model with HQ tensors is refused at load if any other device is in use (Vulkan, Metal, SYCL, OpenCL, RPC, ...): the rotation would silently fall back to the CPU with a device round trip for every rotated activation. On a Vulkan or Metal build, run HQ models CPU-only (koboldcpp: `--usecpu`; llama tools: `--device none`).
 
 ### Things to know
 
-* **These files only load in this fork.** The rotated types use ggml type indices 150 and 151, which upstream llama.cpp does not have. Any other build refuses the file outright rather than misreading it — but that also means a rotated GGUF is not portable, so do not distribute one.
-* **Token embeddings are never rotated.** The engine assumes every GEMM input starts in the unrotated space, so `--hadamard` skips `token_embd`, and asking for it explicitly is an error. No quality is lost: the first layer's GEMM *weights* are still rotated.
-* **Requantizing from a rotated model is restricted.** Going back to a non-rotated type is refused, because the stored values are in the rotated space and the marker that tells the engine to rotate would be lost. Requantize from the original unrotated model instead. Rotated → rotated at the same group works and is a plain copy.
-* **Some architectures are not supported yet.** Models whose graphs call the matmul path directly rather than through the common wrapper (deepseek2, glm-dsa, plm and a few others) will refuse to run with a rotated weight, naming the offending tensor, rather than producing silently wrong output.
-* **imatrix interacts with the rotation.** An importance matrix is carried into the rotated space, but a block rotation necessarily averages importance across each group of 256 — only the relative weighting *between* groups survives.
+* **These files only load in this fork**, and not in its older ConvRot builds: the HQ types use ggml type indices 150–158, which upstream llama.cpp does not have. Do not distribute HQ files.
+* **ConvRot files (`Q4R_K`/`Q5R_K`) no longer load.** They are refused with a hint; requantize them from the original model.
+* **Token embeddings are never rotated**; asking for it is an error.
+* **Some architectures are not supported yet.** Models whose graphs call the matmul directly rather than through the common wrapper (deepseek2, glm-dsa, plm and a few others) refuse to run with a rotated weight, naming the offending tensor.
+
+### Testing
+
+The HQ tests are separate programs, built with make. `maincuda`, `test-backend-ops` and the `-cuda` variants need `LLAMA_CUBLAS=1`; `bench-rht` calls `nvcc` directly (`-arch=native`); the rest are CPU-only:
+
+```bash
+make LLAMA_CUBLAS=1 -j$(nproc) quantize_gguf main maincuda test-hadamard test-hadamard-quants test-hadamard-quantize \
+    test-hadamard-llama test-hadamard-llama-cuda test-hadamard-ppl test-hadamard-ppl-cuda test-backend-ops bench-rht
+```
+
+Some take a small model and a text file: a BF16 GGUF of Qwen3-0.6B (e.g. `Qwen3-0.6B-BF16.gguf` from `unsloth/Qwen3-0.6B-GGUF`) and wikitext-2's `wiki.test.raw` (in `wikitext-2-raw-v1.zip` from `ggml-org/ci` on Hugging Face). Every program exits non-zero on a failure; the `test-hadamard*` ones print PASS/FAIL per check.
+
+| program | what it checks | how to run |
+| ------- | -------------- | ---------- |
+| `test-hadamard` | The rotation itself: every Hadamard matrix (`H·Hᵀ = K·I`, the set of orders, row orientation), the width rule, the random signs (golden vectors), the transform against a dense `R` built from its definition, thread safety, that every way of splitting the work gives the same bytes, the HQ types' traits, pairing and names, row validation, and the CPU op with 1, 4 and 16 threads. | `./test-hadamard` |
+| `test-hadamard-quants` | The HQ quantizers: the base quantizers are unchanged (output hashes), HQ output decodes with the base type's kernels, no imatrix is needed or used, first-use initialization, determinism across threads, and a quantize → dequantize → un-rotate round trip. Also reports MSE against the base quantizers and how often the IQ2/IQ3 neighbour search differs from an exhaustive one. About a minute. | `./test-hadamard-quants` |
+| `test-hadamard-quantize` | The quantizer tool, through `llama_model_quantize` on a two-layer copy of the model: stored rows are `R·w` with the file's seed; the same seed gives identical files, any thread count gives identical files, and `--hadamard-seed` changes only the HQ tensors and the key; `hadamard.seed` is the only HQ metadata; the imatrix is ignored with one warning; unsupported widths keep their type (and an explicit HQ type for one is refused); the refusals (HQ token embeddings, a missing seed, a conflicting seed, HQ → unrotated); the requantize rules; and the `--lora` merge math and its refusals. About a minute. | `./test-hadamard-quantize <workdir> <Qwen3-0.6B-BF16.gguf>` |
+| `test-hadamard-llama` | Loading and running HQ models. It takes plain quantizations and relabels their eligible tensors as HQ (the data isn't rotated; that doesn't matter here). Checks: HQ tensors load as their base type with the same bytes and buffer types (including the CPU repack), the loader still reports the HQ types, a saved model round-trips with its types and seed, one rotation per distinct rotated activation, no Hadamard graph inputs, the LoRA branch uses the unrotated input, the graph guard refuses every misuse of a rotated weight (wrong input, GET_ROWS, ADD, writes, views), a missing seed and a rotated `token_embd` are refused, and a model with an RPC device (an in-process server on 127.0.0.1:50931) is refused. The `-cuda` build also loads a real HQ model on the GPU and compares its logits with the CPU's. | `./quantize_gguf --pure <model-bf16.gguf> pure-q4k.gguf Q4_K`, then `./test-hadamard-llama <workdir> pure-q4k.gguf [more plain quantizations]` (same for `-cuda`) |
+| `test-backend-ops` | Upstream's backend test harness plus this fork's cases (`make_test_cases_fork`): the RHT op on CUDA against the CPU for every kernel, Hadamard order and width class, row counts, strides and 3D inputs; that CUDA accepts every width the rule accepts; and the graphs where the rotation writes the matmuls' 8-bit input directly, including every case that must fall back. | `./test-backend-ops -o RHT -b CUDA0`, also `-o MUL_MAT` and `-o MUL_MAT_ID`; repeat with `GGML_CUDA_DISABLE_FUSION=1` (all fusion off) and `GGML_CUDA_RHT_F32=1` (only the direct 8-bit output off) |
+| `bench-rht` | The CUDA kernels against the reference transform for every width class, the 8-bit outputs byte for byte against `quantize.cu`, and the device sign generator; then timings as CSV: µs per rotation in a CUDA graph for decode, and bandwidth against a copy for 512 rows. | `./bench-rht`; `--sweep` adds the kernel variants, `--once` launches each once for `ncu`, `-n N[,N...]`, `-r ROWS`, `-k A\|B` restrict the shapes |
+| `test-hadamard-ppl` | Quality against a reference model: perplexity, mean and 99th-percentile KL divergence, top-token agreement and bits per weight, over windows of a text file. The reference's log-probabilities are cached to a file (FP16, about 6 GB for 80 windows with a 152k vocabulary) and reused. `--lora` applies an adapter to every model. | `./test-hadamard-ppl-cuda -ngl 99 --chunks 80 [--cache FILE] [--lora FILE] wiki.test.raw <reference-bf16.gguf> <model.gguf>...` (CPU: `./test-hadamard-ppl` without `-ngl`) |
+
+`tools/quantize/tests-hq.sh` runs the whole set end to end on Qwen3-0.6B. It checks that no backend references the HQ types, runs the unit tests above, and quantizes and generates with `--hadamard` for Q4_K_M, Q5_K_M, IQ4_XS, IQ3_S, IQ3_XS and IQ2_XXS (the 4–5 bit ones must answer "Paris"). It then checks HQ5_K → HQ4_XS requantizing, runtime LoRA and `--lora` merges by KL (it writes a synthetic adapter with Python, so it needs `python3` and `numpy`), and, with `CUDA=1` on a build with CUDA graphs, that graphs on and off give identical output. About 10–15 minutes on the CPU, 5 on the GPU:
+
+```bash
+tools/quantize/tests-hq.sh . Qwen3-0.6B-BF16.gguf wikitext-2-raw/wiki.test.raw /tmp/hq          # CPU
+CUDA=1 tools/quantize/tests-hq.sh . Qwen3-0.6B-BF16.gguf wikitext-2-raw/wiki.test.raw /tmp/hq   # GPU
+```
+
+`BIN=<dir>` takes the binaries from another directory than the repo root, and `CHUNKS=N` sets the number of windows for the KL checks (default 20).
 
 ## Background information on llama-quantize
 

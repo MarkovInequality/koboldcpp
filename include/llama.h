@@ -432,6 +432,11 @@ extern "C" {
         size_t size;
     };
 
+    typedef struct llama_model_quantize_lora {
+        const char * path;
+        float        scale;
+    } llama_model_quantize_lora;
+
     // model quantization parameters
     typedef struct llama_model_quantize_params {
         int32_t nthread;                                            // number of threads to use for quantizing, if <=0 will use std::thread::hardware_concurrency()
@@ -449,7 +454,10 @@ extern "C" {
         const struct llama_model_tensor_override * tt_overrides;    // pointer to tensor overrides
         const int32_t * prune_layers;                               // pointer to layer indices to prune
         size_t max_buf_size;                                        // max bytes of tensor rows kept in memory at once, 0 = default (8 GiB)
-        bool hadamard;                                              // rotate Q4_K/Q5_K weights by a block-Hadamard before quantizing (ConvRot)
+        bool hadamard;                                              // map each tensor's type to its Hadamard-rotated (HQ) variant
+        uint64_t hadamard_seed;                                     // RHT seed for a source without rotated tensors
+        bool hadamard_seed_set;                                     // hadamard_seed was given explicitly
+        const struct llama_model_quantize_lora * loras;             // LoRA adapters to merge, terminated by path == NULL
     } llama_model_quantize_params;
 
     typedef struct llama_logit_bias {

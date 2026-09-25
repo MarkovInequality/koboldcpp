@@ -110,10 +110,10 @@ endif
 CUBLASLD_FLAGS =
 CUBLAS_OBJS =
 
-OBJS_FULL += ggml-alloc.o ggml-cpu-traits.o ggml-quants.o ggml-cpu-quants.o kcpp-quantmapper.o kcpp-repackmapper.o unicode.o unicode-common.o unicode-data.o ggml-threading.o ggml-cpu-cpp.o gguf.o sgemm.o common.o common-json.o speculative.o llama-impl.o sampling.o budget.o kcpputils.o kcppllmutils.o mtmdaudio.o ggml-rpc.o transport.o hash.o
-OBJS_SIMPLE += ggml-alloc.o ggml-cpu-traits.o ggml-quants_noavx2.o ggml-cpu-quants.o kcpp-quantmapper_noavx2.o kcpp-repackmapper_noavx2.o unicode.o unicode-common.o unicode-data.o ggml-threading.o ggml-cpu-cpp.o gguf.o sgemm_noavx2.o common.o common-json.o speculative.o llama-impl.o sampling.o budget.o kcpputils.o kcppllmutils.o mtmdaudio.o ggml-rpc.o transport.o hash.o
-OBJS_SIMPLER += ggml-alloc.o ggml-cpu-traits.o ggml-quants_noavx1.o ggml-cpu-quants.o kcpp-quantmapper_noavx1.o kcpp-repackmapper_noavx1.o unicode.o unicode-common.o unicode-data.o ggml-threading.o ggml-cpu-cpp.o gguf.o sgemm_noavx1.o common.o common-json.o speculative.o llama-impl.o sampling.o budget.o kcpputils.o kcppllmutils.o mtmdaudio.o ggml-rpc.o transport.o hash.o
-OBJS_FAILSAFE += ggml-alloc.o ggml-cpu-traits.o ggml-quants_failsafe.o ggml-cpu-quants.o kcpp-quantmapper_failsafe.o kcpp-repackmapper_failsafe.o unicode.o unicode-common.o unicode-data.o ggml-threading.o ggml-cpu-cpp.o gguf.o sgemm_failsafe.o common.o common-json.o speculative.o llama-impl.o sampling.o budget.o kcpputils.o kcppllmutils.o mtmdaudio.o ggml-rpc.o transport.o hash.o
+OBJS_FULL += ggml-alloc.o ggml-hadamard.o ggml-quants-hq.o ggml-cpu-traits.o ggml-quants.o ggml-cpu-quants.o kcpp-quantmapper.o kcpp-repackmapper.o unicode.o unicode-common.o unicode-data.o ggml-threading.o ggml-cpu-cpp.o gguf.o sgemm.o common.o common-json.o speculative.o llama-impl.o sampling.o budget.o kcpputils.o kcppllmutils.o mtmdaudio.o ggml-rpc.o transport.o hash.o
+OBJS_SIMPLE += ggml-alloc.o ggml-hadamard_noavx2.o ggml-quants-hq.o ggml-cpu-traits.o ggml-quants_noavx2.o ggml-cpu-quants.o kcpp-quantmapper_noavx2.o kcpp-repackmapper_noavx2.o unicode.o unicode-common.o unicode-data.o ggml-threading.o ggml-cpu-cpp.o gguf.o sgemm_noavx2.o common.o common-json.o speculative.o llama-impl.o sampling.o budget.o kcpputils.o kcppllmutils.o mtmdaudio.o ggml-rpc.o transport.o hash.o
+OBJS_SIMPLER += ggml-alloc.o ggml-hadamard_noavx1.o ggml-quants-hq.o ggml-cpu-traits.o ggml-quants_noavx1.o ggml-cpu-quants.o kcpp-quantmapper_noavx1.o kcpp-repackmapper_noavx1.o unicode.o unicode-common.o unicode-data.o ggml-threading.o ggml-cpu-cpp.o gguf.o sgemm_noavx1.o common.o common-json.o speculative.o llama-impl.o sampling.o budget.o kcpputils.o kcppllmutils.o mtmdaudio.o ggml-rpc.o transport.o hash.o
+OBJS_FAILSAFE += ggml-alloc.o ggml-hadamard_failsafe.o ggml-quants-hq.o ggml-cpu-traits.o ggml-quants_failsafe.o ggml-cpu-quants.o kcpp-quantmapper_failsafe.o kcpp-repackmapper_failsafe.o unicode.o unicode-common.o unicode-data.o ggml-threading.o ggml-cpu-cpp.o gguf.o sgemm_failsafe.o common.o common-json.o speculative.o llama-impl.o sampling.o budget.o kcpputils.o kcppllmutils.o mtmdaudio.o ggml-rpc.o transport.o hash.o
 
 # OS specific
 ifeq ($(UNAME_S),Linux)
@@ -223,6 +223,15 @@ CUBLAS_OBJS += $(OBJS_CUDA_TEMP_INST)
 NVCC      = nvcc
 NVCCFLAGS = --forward-unknown-to-host-compiler -use_fast_math -extended-lambda
 
+# CUDA graphs for CUDA 12+, as in the CMake build; LLAMA_CUDA_NO_GRAPHS=1 turns them off.
+# Changing this needs a rebuild of the CUDA objects (make clean).
+ifndef LLAMA_CUDA_NO_GRAPHS
+NVCC_MAJOR := $(shell $(NVCC) --version 2>/dev/null | sed -n 's/.*release \([0-9]*\)\..*/\1/p')
+ifeq ($(shell [ "$(NVCC_MAJOR)" -ge 12 ] 2>/dev/null && echo yes),yes)
+CUBLAS_FLAGS += -DGGML_CUDA_USE_GRAPHS
+endif
+endif
+
 ifdef LLAMA_ADD_CONDA_PATHS
 CUBLASLD_FLAGS += -Lconda/envs/linux/lib -Lconda/envs/linux/lib/stubs
 endif
@@ -267,9 +276,17 @@ ifdef LLAMA_CUDA_CCBIN
 NVCCFLAGS += -ccbin $(LLAMA_CUDA_CCBIN)
 endif
 
-ggml/src/ggml-cuda/%.o: ggml/src/ggml-cuda/%.cu ggml/include/ggml.h ggml/src/ggml-common.h ggml/src/ggml-cuda/common.cuh
-	$(NVCC) $(NVCCFLAGS) $(subst -Ofast,-O3,$(CXXFLAGS)) $(CUBLAS_FLAGS) $(HIPFLAGS) $(CUBLAS_CXXFLAGS) -Wno-pedantic -c $< -o $@
-ggml-cuda.o: ggml/src/ggml-cuda/ggml-cuda.cu ggml/include/ggml-cuda.h ggml/include/ggml.h ggml/include/ggml-backend.h ggml/src/ggml-backend-impl.h ggml/src/ggml-common.h $(wildcard ggml/src/ggml-cuda/*.cuh)
+# the CUDA flags (e.g. GGML_CUDA_USE_GRAPHS) change struct layouts shared by all CUDA objects, so
+# every one of them rebuilds when the flags do
+CUDA_FLAGS_STAMP := ggml/src/ggml-cuda/.flags
+$(shell echo '$(NVCCFLAGS) $(CUBLAS_FLAGS) $(HIPFLAGS) $(CUBLAS_CXXFLAGS)' | cmp -s - $(CUDA_FLAGS_STAMP) || echo '$(NVCCFLAGS) $(CUBLAS_FLAGS) $(HIPFLAGS) $(CUBLAS_CXXFLAGS)' > $(CUDA_FLAGS_STAMP))
+
+# -MMD -MP: the .cuh headers the kernels include are tracked through the generated .d files
+ggml/src/ggml-cuda/%.o: ggml/src/ggml-cuda/%.cu ggml/include/ggml.h ggml/src/ggml-common.h ggml/src/ggml-cuda/common.cuh $(CUDA_FLAGS_STAMP)
+	$(NVCC) $(NVCCFLAGS) $(subst -Ofast,-O3,$(CXXFLAGS)) $(CUBLAS_FLAGS) $(HIPFLAGS) $(CUBLAS_CXXFLAGS) -Wno-pedantic -MMD -MP -c $< -o $@
+-include $(wildcard ggml/src/ggml-cuda/*.d ggml/src/ggml-cuda/template-instances/*.d)
+ggml/src/ggml-cuda/rht.o: ggml/src/ggml-cuda/rht.cuh ggml/src/ggml-cuda/quantize.cuh ggml/src/ggml-hadamard.h ggml/src/ggml-hadamard-tables.h
+ggml-cuda.o: ggml/src/ggml-cuda/ggml-cuda.cu ggml/include/ggml-cuda.h ggml/include/ggml.h ggml/include/ggml-backend.h ggml/src/ggml-backend-impl.h ggml/src/ggml-common.h $(wildcard ggml/src/ggml-cuda/*.cuh) $(CUDA_FLAGS_STAMP)
 	$(NVCC) $(NVCCFLAGS) $(subst -Ofast,-O3,$(CXXFLAGS)) $(CUBLAS_FLAGS) $(HIPFLAGS) $(CUBLAS_CXXFLAGS) -Wno-pedantic -c $< -o $@
 ggml_v2-cuda.o: otherarch/ggml_v2-cuda.cu otherarch/ggml_v2-cuda.h
 	$(NVCC) $(NVCCFLAGS) $(subst -Ofast,-O3,$(CXXFLAGS)) $(CUBLAS_FLAGS) $(HIPFLAGS) $(CUBLAS_CXXFLAGS) -Wno-pedantic -c $< -o $@
@@ -521,7 +538,7 @@ ggml-binops.o: ggml/src/ggml-cpu/binary-ops.cpp ggml/src/ggml-cpu/binary-ops.h g
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 ggml-unops.o: ggml/src/ggml-cpu/unary-ops.cpp ggml/src/ggml-cpu/unary-ops.h ggml/src/ggml-cpu/common.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
-ggml-ops.o: ggml/src/ggml-cpu/ops.cpp ggml/include/ggml.h ggml/src/ggml-cpu/ops.h
+ggml-ops.o: ggml/src/ggml-cpu/ops.cpp ggml/include/ggml.h ggml/src/ggml-cpu/ops.h ggml/src/ggml-hadamard.h
 	$(CXX) $(FASTCXXFLAGS) $(FULLCFLAGS) -c $< -o $@
 ggml-ops-noavx2.o: ggml/src/ggml-cpu/ops.cpp ggml/include/ggml.h ggml/src/ggml-cpu/ops.h
 	$(CXX) $(FASTCXXFLAGS) $(SIMPLECFLAGS) $(FAILSAFE_FLAGS) -c $< -o $@
@@ -580,6 +597,16 @@ sgemm_failsafe.o: ggml/src/ggml-cpu/llamafile/sgemm.cpp ggml/src/ggml-cpu/llamaf
 
 #there's no intrinsics or special gpu ops used here, so we can have a universal object
 ggml-alloc.o: ggml/src/ggml-alloc.c ggml/include/ggml.h ggml/include/ggml-alloc.h
+	$(CC)  $(CFLAGS) -c $< -o $@
+ggml-hadamard.o: ggml/src/ggml-hadamard.c ggml/include/ggml.h ggml/src/ggml-hadamard.h ggml/src/ggml-hadamard-tables.h
+	$(CC)  $(CFLAGS) $(FULLCFLAGS) -c $< -o $@
+ggml-hadamard_noavx2.o: ggml/src/ggml-hadamard.c ggml/include/ggml.h ggml/src/ggml-hadamard.h ggml/src/ggml-hadamard-tables.h
+	$(CC)  $(CFLAGS) $(SIMPLECFLAGS) $(FAILSAFE_FLAGS) -c $< -o $@
+ggml-hadamard_noavx1.o: ggml/src/ggml-hadamard.c ggml/include/ggml.h ggml/src/ggml-hadamard.h ggml/src/ggml-hadamard-tables.h
+	$(CC)  $(CFLAGS) $(SIMPLERCFLAGS) $(FAILSAFE_FLAGS) -c $< -o $@
+ggml-hadamard_failsafe.o: ggml/src/ggml-hadamard.c ggml/include/ggml.h ggml/src/ggml-hadamard.h ggml/src/ggml-hadamard-tables.h
+	$(CC)  $(CFLAGS) $(NONECFLAGS) $(FAILSAFE_FLAGS) -c $< -o $@
+ggml-quants-hq.o: ggml/src/ggml-quants-hq.c ggml/include/ggml.h ggml/src/ggml-quants.h ggml/src/ggml-common.h
 	$(CC)  $(CFLAGS) -c $< -o $@
 mtmd.o: tools/mtmd/mtmd.cpp tools/mtmd/mtmd.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
@@ -765,8 +792,8 @@ kcpp_backend_vulkan_noavx2.o: kcpp_backend.cpp kcpp_backend.h
 
 clean:
 	rm -vf *.o main ttsmain sdmain whispermain quantize_gguf quantize_gpt2 quantize_gptj quantize_neox quantize_mpt vulkan-shaders-gen vulkan-shaders-gen-noext gguf-split mtmd-cli mainvk fitparams embedding embeddingvk qwen3tts rpcserver llamaserver llamaservervk rpcserver.exe llamaserver.exe llamaservervk.exe qwen3tts.exe embeddingvk.exe embedding.exe fitparams.exe mainvk.exe mtmd-cli.exe gguf-split.exe vulkan-shaders-gen.exe vulkan-shaders-gen-noext.exe main.exe ttsmain.exe sdmain.exe whispermain.exe quantize_gguf.exe quantize_gptj.exe quantize_gpt2.exe quantize_neox.exe quantize_mpt.exe koboldcpp_default.dll koboldcpp_failsafe.dll koboldcpp_noavx2.dll koboldcpp_vulkan_failsafe.dll koboldcpp_cublas.dll koboldcpp_hipblas.dll koboldcpp_vulkan.dll koboldcpp_vulkan_noavx2.dll koboldcpp_default.so koboldcpp_failsafe.so koboldcpp_macos_failsafe.so koboldcpp_noavx2.so koboldcpp_vulkan_failsafe.so koboldcpp_cublas.so koboldcpp_hipblas.so koboldcpp_vulkan.so koboldcpp_vulkan_noavx2.so ggml/src/ggml-vulkan-shaders.cpp ggml/src/ggml-vulkan-shaders.hpp ggml/src/ggml-vulkan-shaders-noext.cpp ggml/src/ggml-vulkan-shaders-noext.hpp
-	rm -vrf ggml/src/ggml-cuda/*.o
-	rm -vrf ggml/src/ggml-cuda/template-instances/*.o
+	rm -vrf ggml/src/ggml-cuda/*.o ggml/src/ggml-cuda/*.d ggml/src/ggml-cuda/.flags
+	rm -vrf ggml/src/ggml-cuda/template-instances/*.o ggml/src/ggml-cuda/template-instances/*.d
 	rm -vrf llguidance
 	rm -vf otherarch/sdcpp/*.o otherarch/sdcpp/*/*.o otherarch/sdcpp/*/*/*.o otherarch/sdcpp/*/*/*/*.o
 
@@ -980,7 +1007,7 @@ quantize_ace: otherarch/acestep/quantize-acestep.cpp tools/mtmd/clip.cpp ggml_v3
 
 # tests
 # ggml-only, so it does not drag in llama/common
-HADAMARD_TEST_OBJS = ggml.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o ggml-alloc.o \
+HADAMARD_TEST_OBJS = ggml.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o ggml-alloc.o ggml-hadamard.o ggml-quants-hq.o \
 	ggml-backend.o ggml-backend-meta.o ggml-backend-reg_default.o ggml-repack.o ggml-cpu-traits.o \
 	ggml-quants.o ggml-cpu-quants.o kcpp-quantmapper.o kcpp-repackmapper.o ggml-threading.o \
 	ggml-cpu-cpp.o gguf.o sgemm.o ggml-rpc.o transport.o hash.o
@@ -988,14 +1015,20 @@ HADAMARD_TEST_OBJS = ggml.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-
 test-hadamard: tests/test-hadamard.cpp $(HADAMARD_TEST_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
+test-hadamard-quants: tests/test-hadamard-quants.cpp $(HADAMARD_TEST_OBJS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+
+test-hadamard-llama: tests/test-hadamard-llama.cpp ggml.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_default.o ggml-repack.o $(OBJS_FULL) $(OBJS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+
+test-hadamard-quantize: tests/test-hadamard-quantize.cpp ggml.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_default.o ggml-repack.o $(OBJS_FULL) $(OBJS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+
 test-hadamard-ppl: tests/test-hadamard-ppl.cpp ggml.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_default.o ggml-repack.o $(OBJS_FULL) $(OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
-# GPU variants of the perplexity harness - the CPU mul_mat always takes the FWHT fast path and
-# never reads the H_g matrix, so only these exercise the backend dispatch and the materialized
-# rotation matrix (needs LLAMA_CUBLAS=1 / LLAMA_VULKAN=1)
-# CUBLAS_OBJS also carries the legacy v2/v3 CUDA backends, which need the v2/v3 cores - this
-# tool only wants the modern one
+# CUDA variants (LLAMA_CUBLAS=1). CUBLAS_OBJS also carries the legacy v2/v3 CUDA backends, which
+# need the v2/v3 cores - these tools only want the modern one
 CUBLAS_OBJS_V4 = ggml-cuda.o $(patsubst %.cu,%.o,$(filter-out ggml/src/ggml-cuda/ggml-cuda.cu, $(wildcard ggml/src/ggml-cuda/*.cu))) $(OBJS_CUDA_TEMP_INST)
 
 test-hadamard-ppl-cuda: tests/test-hadamard-ppl.cpp ggml_v4_cublas.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_cublas.o ggml-repack.o $(CUBLAS_OBJS_V4) $(OBJS_FULL) $(OBJS)
@@ -1004,8 +1037,14 @@ test-hadamard-ppl-cuda: tests/test-hadamard-ppl.cpp ggml_v4_cublas.o ggml-cpu.o 
 maincuda: tools/completion/main.cpp tools/completion/completion.cpp common/arg.cpp common/preset.cpp $(COMMON_DOWNLOAD_SRCS) build-info.h ggml_v4_cublas.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o console.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_cublas.o ggml-repack.o $(CUBLAS_OBJS_V4) $(OBJS_FULL) $(OBJS)
 	$(CXX) $(CXXFLAGS) $(CUBLAS_FLAGS) $(filter-out %.h,$^) -o $@ $(CUBLASLD_FLAGS) $(LDFLAGS)
 
-test-hadamard-ppl-vulkan: tests/test-hadamard-ppl.cpp ggml_v4_vulkan.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_vulkan.o ggml-vulkan.o ggml-vulkan-shaders.o ggml-repack.o $(OBJS_FULL) $(OBJS)
-	$(CXX) $(CXXFLAGS) -DGGML_USE_VULKAN $(filter-out %.h,$^) $(VULKAN_LIB) -o $@ $(LDFLAGS)
+test-hadamard-llama-cuda: tests/test-hadamard-llama.cpp ggml_v4_cublas.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_cublas.o ggml-repack.o $(CUBLAS_OBJS_V4) $(OBJS_FULL) $(OBJS)
+	$(CXX) $(CXXFLAGS) $(CUBLAS_FLAGS) $(filter-out %.h,$^) -o $@ $(CUBLASLD_FLAGS) $(LDFLAGS)
+
+test-backend-ops: tests/test-backend-ops.cpp $(filter-out ggml.o ggml-backend-reg_default.o,$(HADAMARD_TEST_OBJS)) ggml_v4_cublas.o ggml-backend-reg_cublas.o $(CUBLAS_OBJS_V4)
+	$(CXX) $(CXXFLAGS) $(CUBLAS_FLAGS) $(filter-out %.h,$^) -o $@ $(CUBLASLD_FLAGS) $(LDFLAGS)
+
+bench-rht: tests/bench-rht.cu ggml/src/ggml-cuda/quantize.cu ggml-hadamard.o ggml/src/ggml-cuda/rht.cuh ggml/src/ggml-cuda/quantize.cuh ggml/src/ggml-cuda/common.cuh ggml/src/ggml-hadamard.h ggml/src/ggml-hadamard-tables.h
+	nvcc -O3 -std=c++17 -arch=native -use_fast_math -DGGML_USE_CUDA -Iggml/include -Iggml/src $(filter %.cu %.o,$^) -o $@
 
 
 #window simple clinfo

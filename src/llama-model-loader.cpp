@@ -712,6 +712,26 @@ llama_model_loader::llama_model_loader(
 
     fver = (enum llama_fver) gguf_get_version(metadata);
 
+    bool has_rotated = false;
+    for (const auto & it : weights_map) {
+        has_rotated |= ggml_is_rotated(it.second.tensor->type);
+    }
+    for (int64_t i = 0; i < gguf_get_n_tensors(metadata); ++i) {
+        has_rotated |= ggml_is_rotated(gguf_get_tensor_type(metadata, i));
+    }
+    if (has_rotated) {
+        const std::string key = llm_kv(LLM_KV_HADAMARD_SEED);
+        const int64_t kid = gguf_find_key(metadata, key.c_str());
+        if (kid < 0) {
+            throw std::runtime_error(format("model has rotated tensor types but no %s - probably a ConvRot file "
+                "from an older build of this fork; requantize from the original model", key.c_str()));
+        }
+        if (gguf_get_kv_type(metadata, kid) != GGUF_TYPE_UINT64) {
+            throw std::runtime_error(format("%s must be a uint64", key.c_str()));
+        }
+        hadamard_seed = gguf_get_val_u64(metadata, kid);
+    }
+
     LLAMA_LOG_INFO("%s: loaded meta data with %d key-value pairs and %d tensors from %s (version %s)\n",
             __func__, n_kv, n_tensors, fname.empty() ? "(file*)" : fname.c_str(), llama_file_version_name(fver));
 
@@ -745,8 +765,6 @@ llama_model_loader::llama_model_loader(
             }
         }
 
-        // Hadamard-rotated (ConvRot) variants report their base type's ftype - the rotation is a
-        // per-tensor property, not a file type
         switch (ggml_get_base_type(type_max)) {
             case GGML_TYPE_F32:     ftype = LLAMA_FTYPE_ALL_F32;        break;
             case GGML_TYPE_F16:     ftype = LLAMA_FTYPE_MOSTLY_F16;     break;
@@ -1259,6 +1277,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        const bool rotated = ggml_is_rotated(type);
+        type = ggml_get_base_type(type);
+
         ggml_tensor t_meta;
         memset(&t_meta, 0, sizeof(ggml_tensor));
         t_meta.type = type;
@@ -1281,6 +1302,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_context * ctx = ctx_for_buft(buft);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
+        if (rotated) {
+            rotated_tensors.insert(ret);
+        }
         return ret;
     }
 
@@ -1302,7 +1326,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
     }
 
+    // HQ tensors run as their base type: same bytes, and every backend already has the kernels.
+    // The loader's meta tensors keep the HQ type, which llama-quant needs.
     ggml_tensor t_meta = *cur;
+    t_meta.type = ggml_get_base_type(cur->type);
     if (flags & TENSOR_ALLOW_RESHAPE) {
         for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
             t_meta.ne[dim] = dim < ne.size() ? ne.begin()[dim] : 1;
@@ -1337,6 +1364,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
     ggml_set_name(tensor, ggml_get_name(&t_meta));
+    if (ggml_is_rotated(cur->type)) {
+        rotated_tensors.insert(tensor);
+    }
 
     if (duplicated) {
         size_data += ggml_nbytes(&t_meta);

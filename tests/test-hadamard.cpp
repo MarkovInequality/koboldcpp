@@ -1,249 +1,518 @@
-// Hadamard-rotated quantization (ConvRot) correctness tests.
-//
-// Covers the invariants the Q4R_*/Q5R_* types rely on:
-//   - the Sylvester matrix is orthonormal, symmetric and self-inverse
-//   - the FWHT butterfly used by the quantizer computes the same H_n as that matrix
-//   - the rotated/base type pairing round-trips and both spellings share a byte layout
-//   - a rotated quantize -> dequantize -> inverse-rotate round-trip stays within quant error
-//   - quantizer/inference consistency: <H*w, H*x> == <w, x>, which is what makes a rotated
-//     weight's GEMM produce the same output as the unrotated one
-//   - the imatrix transform is the group mean, i.e. sum_j H_ij^2 * m_j
-
-#include "llama-hadamard.h"
+// Unit tests for the randomized Hadamard transform (RHT), the HQ types and the CPU RHT op.
 
 #include "ggml.h"
+#include "ggml-cpu.h"
+#include "ggml-hadamard.h"
 
+#include <cinttypes>
 #include <cmath>
 #include <cstdio>
-#include <cstdint>
-#include <cinttypes>
+#include <cstring>
+#include <map>
 #include <random>
+#include <set>
+#include <string>
+#include <thread>
 #include <vector>
+
+#define GGML_HAD_DECL(K) static const char test_had_##K[]
+#include "ggml-hadamard-tables.h"
+#undef GGML_HAD_DECL
+
+static const std::vector<std::pair<int, const char *>> header_orders = {
+#define X(K) { K, test_had_##K },
+    GGML_HAD_ORDERS(X)
+#undef X
+};
 
 static int g_failed = 0;
 
-static void check(bool ok, const char * name, double got, double tol) {
-    printf("  %-58s %10.3e  (tol %.0e)  %s\n", name, got, tol, ok ? "PASS" : "FAIL");
+static void check(bool ok, const std::string & name) {
+    printf("  %-72s %s\n", name.c_str(), ok ? "PASS" : "FAIL");
     if (!ok) {
         g_failed++;
     }
 }
 
-static std::vector<float> make_random(int64_t n, uint32_t seed, float scale = 1.0f) {
+static std::vector<float> make_random(int64_t n, uint32_t seed) {
     std::mt19937 rng(seed);
-    std::normal_distribution<float> dist(0.0f, scale);
-
+    std::normal_distribution<float> dist(0.0f, 1.0f);
     std::vector<float> v(n);
     for (auto & x : v) {
         x = dist(rng);
     }
-
     return v;
 }
 
-// H_n is orthonormal, symmetric and self-inverse, and the butterfly agrees with the matrix
-static void test_matrix(int n) {
-    printf("H_%d:\n", n);
-
-    std::vector<float> H((size_t) n*n);
-    llama_gen_hadamard_matrix(H.data(), n);
-
-    double e_orth = 0.0;
-    double e_sym  = 0.0;
-    for (int i = 0; i < n; i++) {
-        for (int j = 0; j < n; j++) {
-            double dot = 0.0;
-            for (int k = 0; k < n; k++) {
-                dot += (double) H[i*n + k] * H[j*n + k];
-            }
-
-            e_orth = std::max(e_orth, std::fabs(dot - (i == j ? 1.0 : 0.0)));
-            e_sym  = std::max(e_sym,  (double) std::fabs(H[i*n + j] - H[j*n + i]));
-        }
-    }
-
-    check(e_orth < 1e-5, "orthonormal: max|H*H^T - I|",   e_orth, 1e-5);
-    check(e_sym == 0.0,  "symmetric:   max|H - H^T|",     e_sym,  0.0);
-
-    const std::vector<float> v = make_random(n, 1234 + n);
-
-    // the butterfly must compute the same transform as the materialized matrix - inference uses
-    // one or the other depending on whether the backend has a fast FWHT for this size
-    std::vector<float> w = v;
-    llama_hadamard_inplace(w.data(), n);
-
-    double e_bfly = 0.0;
-    for (int i = 0; i < n; i++) {
-        double dot = 0.0;
-        for (int j = 0; j < n; j++) {
-            dot += (double) H[i*n + j] * v[j];
-        }
-        e_bfly = std::max(e_bfly, std::fabs(dot - w[i]));
-    }
-    check(e_bfly < 1e-5, "butterfly == matrix: max|H*v - fwht(v)|", e_bfly, 1e-5);
-
-    // H*H == I, so the same routine undoes itself
-    llama_hadamard_inplace(w.data(), n);
-
-    double e_inv = 0.0;
-    for (int i = 0; i < n; i++) {
-        e_inv = std::max(e_inv, (double) std::fabs(w[i] - v[i]));
-    }
-    check(e_inv < 1e-5, "self-inverse: max|H(H(v)) - v|", e_inv, 1e-5);
-
-    // the imatrix transform: sum_j H_ij^2 * m_j is the group mean, for every row i
-    std::vector<float> m = make_random(n, 99 + n);
-    double mean = 0.0;
-    for (int i = 0; i < n; i++) {
-        m[i] = std::fabs(m[i]) + 1.0f; // importances are non-negative
-        mean += m[i];
-    }
-    mean /= n;
-
-    double e_imat = 0.0;
-    for (int i = 0; i < n; i++) {
-        double s = 0.0;
-        for (int j = 0; j < n; j++) {
-            s += (double) H[i*n + j] * H[i*n + j] * m[j];
-        }
-        e_imat = std::max(e_imat, std::fabs(s - mean));
-    }
-    check(e_imat < 1e-5, "imatrix: max|sum_j H_ij^2 m_j - mean(m)|", e_imat, 1e-5);
+static std::vector<float> rht(const std::vector<float> & x, uint64_t seed) {
+    std::vector<float> y = x;
+    ggml_rht_ref(y.data(), (int64_t) y.size(), seed);
+    return y;
 }
 
-// ggml_get_rotated_type / ggml_get_base_type round-trip, and a rotated type is a byte-level alias
-static void test_type_pairing() {
-    printf("type pairing:\n");
+static const std::vector<int64_t> dims_11 = {
+    5120, 6144, 10240, 17408, 2560, 4096, 9728, 1024, 2048, 3072,
+    14336, 8192, 28672, 11008, 3584, 5376, 21504, 12288, 25600, 18944, 13824, 27648,
+};
 
-    int n_pairs = 0;
-    int n_bad   = 0;
+// runs first: every order's matrix cache is still cold
+static void test_thread_safety() {
+    printf("concurrent first use of every order:\n");
 
-    for (int i = 0; i < GGML_TYPE_COUNT; i++) {
-        const ggml_type base = (ggml_type) i;
-        const ggml_type rot  = ggml_get_rotated_type(base);
+    std::vector<int64_t> ns;
+    for (const auto & [K, rows] : header_orders) {
+        if (K % 8 != 0) {
+            ns.push_back(4*(int64_t) K);
+        }
+    }
 
-        if (rot == base) {
+    const int nth = 16;
+    std::vector<std::vector<float>> in(ns.size());
+    std::vector<std::vector<std::vector<float>>> out(nth, std::vector<std::vector<float>>(ns.size()));
+    for (size_t i = 0; i < ns.size(); ++i) {
+        in[i] = make_random(ns[i], 100 + (uint32_t) i);
+    }
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < nth; ++t) {
+        threads.emplace_back([&, t]() {
+            for (size_t k = 0; k < ns.size(); ++k) {
+                const size_t i = (k + t) % ns.size();
+                out[t][i] = in[i];
+                ggml_rht_ref(out[t][i].data(), ns[i], 7);
+            }
+        });
+    }
+    for (auto & th : threads) {
+        th.join();
+    }
+
+    bool same = true;
+    for (size_t i = 0; i < ns.size(); ++i) {
+        const std::vector<float> ref = rht(in[i], 7);
+        for (int t = 0; t < nth; ++t) {
+            same &= memcmp(ref.data(), out[t][i].data(), ns[i]*sizeof(float)) == 0;
+        }
+    }
+    check(same, "16 threads, first use of each K, match a single-threaded run");
+}
+
+static void test_table() {
+    printf("table:\n");
+
+    std::set<int> seen;
+    bool unique = true;
+    for (const auto & [K, rows] : header_orders) {
+        unique &= seen.insert(K).second;
+    }
+    check(unique, "each order appears once in GGML_HAD_ORDERS");
+
+    std::set<int> expected = { 40 };
+    for (int m = 3; 4*m <= GGML_RHT_K_MAX; m += 2) {
+        expected.insert(4*m);
+    }
+    check(seen == expected, "orders are 4*odd for 12..252, plus 40");
+
+    std::set<int> accepted;
+    std::vector<float> H((size_t) 512*512);
+    for (int K = 0; K <= 512; ++K) {
+        if (ggml_hadamard_matrix(K, H.data())) {
+            accepted.insert(K);
+        }
+    }
+    check(accepted == expected, "ggml_hadamard_matrix accepts exactly the table orders");
+
+    for (const auto & [K, rows] : header_orders) {
+        std::vector<int> h((size_t) K*K);
+        for (int i = 0; i < K*K; ++i) {
+            h[i] = rows[i] == '+' ? 1 : (rows[i] == '-' ? -1 : 0);
+        }
+
+        bool ok = strlen(rows) == (size_t) K*K;
+        for (int i = 0; i < K && ok; ++i) {
+            for (int j = 0; j < K && ok; ++j) {
+                int64_t dot = 0;
+                for (int k = 0; k < K; ++k) {
+                    dot += h[i*K + k]*h[j*K + k];
+                }
+                ok = dot == (i == j ? K : 0);
+            }
+        }
+
+        std::vector<float> Hf((size_t) K*K);
+        ggml_hadamard_matrix(K, Hf.data());
+        bool rows_ok = true;
+        for (int i = 0; i < K*K; ++i) {
+            rows_ok &= Hf[i] == (float) h[i];
+        }
+
+        const float * cached = ggml_rht_matrix_f32(K);
+        const bool cached_ok = cached && memcmp(cached, Hf.data(), Hf.size()*sizeof(float)) == 0;
+
+        check(ok && rows_ok && cached_ok, "H_" + std::to_string(K) + ": H*H^T == K*I, accessor row i == header row i");
+    }
+}
+
+static void test_plan() {
+    printf("decomposition rule:\n");
+
+    struct tc { int64_t n; int K; int64_t P; };
+    const std::vector<tc> cases = {
+        { 5120, 20, 256 }, { 6144, 12, 512 }, { 10240, 20, 512 }, { 17408, 68, 256 },
+        { 2560, 20, 128 }, { 4096, 1, 4096 }, { 9728, 76, 128 }, { 1024, 1, 1024 }, { 2048, 1, 2048 },
+        { 3072, 12, 256 }, { 14336, 28, 512 }, { 8192, 1, 8192 }, { 28672, 28, 1024 }, { 11008, 172, 64 },
+        { 3584, 28, 128 }, { 5376, 84, 64 }, { 21504, 84, 256 }, { 12288, 12, 1024 }, { 25600, 100, 256 },
+        { 18944, 148, 128 }, { 13824, 108, 128 }, { 27648, 108, 256 },
+        { 24*256, 12, 512 }, { 128, 1, 128 }, { 40*256, 20, 512 }, { 64*63, 252, 16 },
+        { 64*65, 0, 0 }, { 6, 0, 0 }, { 2*63, 0, 0 }, { 0, 0, 0 },
+    };
+
+    for (const auto & c : cases) {
+        int     K = -1;
+        int64_t P = -1;
+        const bool ok = ggml_rht_plan(c.n, &K, &P);
+        const bool pass = c.K == 0 ? !ok : (ok && K == c.K && P == c.P);
+        char buf[128];
+        snprintf(buf, sizeof(buf), "n = %" PRId64 " -> %s", c.n,
+                 c.K == 0 ? "NONE" : ("(" + std::to_string(c.K) + ", " + std::to_string(c.P) + ")").c_str());
+        check(pass, buf);
+    }
+
+    bool all = true;
+    for (int64_t n = 1; n <= 65536; ++n) {
+        int64_t m = n;
+        int     t = 0;
+        while (m % 2 == 0) { m /= 2; t++; }
+        const bool want = m == 1 || (t >= 2 && m <= 63);
+        int K; int64_t P;
+        const bool got = ggml_rht_plan(n, &K, &P);
+        all &= got == want;
+        if (got) {
+            all &= (int64_t) K*P == n && (P & (P - 1)) == 0 && (K == 1 || (K == 4*m));
+        }
+    }
+    check(all, "n = 1..65536: accepted iff divisible by 4 with odd part <= 63 (or a power of 2)");
+}
+
+static uint64_t splitmix64_step(uint64_t & state) {
+    state += GGML_RHT_GAMMA;
+    uint64_t z = state;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
+static void test_signs() {
+    printf("signs:\n");
+
+    check(ggml_rht_sign_word(0, 64, 0) == 0x2a7b67af6c6ad50eull, "golden (seed 0, n 64) word 0");
+
+    const uint64_t golden42[4] = { 0xe9239fdbd1fd73cbull, 0xce417ca0454148f0ull, 0x70dc16857a11f4f1ull, 0x4b8d8bc782ad1c24ull };
+    bool ok = true;
+    uint64_t fnv = 0xcbf29ce484222325ull;
+    for (int k = 0; k < 80; ++k) {
+        const uint64_t w = ggml_rht_sign_word(42, 5120, k);
+        if (k < 4) {
+            ok &= w == golden42[k];
+        }
+        for (int b = 0; b < 8; ++b) {
+            fnv ^= (w >> (8*b)) & 0xff;
+            fnv *= 0x100000001b3ull;
+        }
+    }
+    check(ok && ggml_rht_sign_word(42, 5120, 79) == 0xc7df6955514c4871ull && fnv == 0xcec84e1c346746a6ull,
+          "golden (seed 42, n 5120) words 0..79");
+
+    bool stepped = true;
+    for (uint64_t seed : { 0ull, 42ull, 0xdeadbeefcafef00dull }) {
+        for (int64_t n : { 64ll, 5120ll, 17408ll }) {
+            uint64_t state = seed ^ (GGML_RHT_GAMMA * (uint64_t) n);
+            for (int64_t k = 0; k < (n + 63)/64; ++k) {
+                stepped &= splitmix64_step(state) == ggml_rht_sign_word(seed, n, k);
+            }
+        }
+    }
+    check(stepped, "word k == splitmix64 stepped k+1 times from seed ^ gamma*n");
+}
+
+static int popcount64(uint64_t x) {
+    int c = 0;
+    while (x) { x &= x - 1; c++; }
+    return c;
+}
+
+// R = (1/sqrt(n)) * (H_K (x) H_P) * diag(s), natural order, H_K row-major from the header
+static std::vector<double> dense_rht(int64_t n, uint64_t seed) {
+    int K; int64_t P;
+    ggml_rht_plan(n, &K, &P);
+
+    std::vector<float> HK(1, 1.0f);
+    if (K > 1) {
+        HK.resize((size_t) K*K);
+        ggml_hadamard_matrix(K, HK.data());
+    }
+
+    std::vector<double> R((size_t) n*n);
+    for (int64_t r = 0; r < n; ++r) {
+        const int64_t cr = r / P, jr = r % P;
+        for (int64_t c = 0; c < n; ++c) {
+            const int64_t cc = c / P, jc = c % P;
+            const double hp = popcount64((uint64_t) (jr & jc)) % 2 ? -1.0 : 1.0;
+            const double s  = (ggml_rht_sign_word(seed, n, c / 64) >> (c % 64)) & 1 ? -1.0 : 1.0;
+            R[r*n + c] = HK[cr*K + cc] * hp * s / sqrt((double) n);
+        }
+    }
+    return R;
+}
+
+static void test_reference() {
+    printf("reference transform:\n");
+
+    for (int64_t n : dims_11) {
+        const std::vector<float> w = make_random(n, 1), x = make_random(n, 2);
+        const std::vector<float> Rw = rht(w, 1234), Rx = rht(x, 1234);
+
+        double nx = 0, nRx = 0, wx = 0, RwRx = 0;
+        for (int64_t i = 0; i < n; ++i) {
+            nx   += (double) x[i]*x[i];
+            nRx  += (double) Rx[i]*Rx[i];
+            wx   += (double) w[i]*x[i];
+            RwRx += (double) Rw[i]*Rx[i];
+        }
+        const bool ok = fabs(sqrt(nRx) - sqrt(nx)) < 1e-5*sqrt(nx) && fabs(RwRx - wx) < 1e-4*sqrt(nx*nx);
+        check(ok, "n = " + std::to_string(n) + ": |Rx| == |x|, <Rw,Rx> == <w,x>");
+    }
+
+    for (int64_t n : { 64ll, 192ll, 160ll, 112ll, 272ll, 688ll }) {
+        int K; int64_t P;
+        ggml_rht_plan(n, &K, &P);
+        const uint64_t seed = 99;
+        const std::vector<double> R = dense_rht(n, seed);
+
+        double err = 0;
+        for (int64_t b = 0; b < n + 4; ++b) {
+            std::vector<float> x = b < n ? std::vector<float>(n, 0.0f) : make_random(n, 1000 + (uint32_t) b);
+            if (b < n) {
+                x[b] = 1.0f;
+            }
+            const std::vector<float> y = rht(x, seed);
+            for (int64_t r = 0; r < n; ++r) {
+                double ref = 0;
+                for (int64_t c = 0; c < n; ++c) {
+                    ref += R[r*n + c]*x[c];
+                }
+                err = std::max(err, fabs(ref - y[r]));
+            }
+        }
+        check(err < 1e-5, "(K, P) = (" + std::to_string(K) + ", " + std::to_string(P) + "): equals the dense R on basis and random vectors");
+    }
+}
+
+static void test_stage_split() {
+    printf("stage split:\n");
+
+    for (int64_t n : { 5120ll, 17408ll, 4096ll, 11008ll, 4032ll }) {
+        int K; int64_t P;
+        ggml_rht_plan(n, &K, &P);
+        const std::vector<float> x   = make_random(n, 5);
+        const std::vector<float> ref = rht(x, 77);
+
+        bool ok = true;
+        for (int parts : { 1, 3, 8 }) {
+            std::vector<float> y = x;
+            for (int p = 0; p < parts; ++p) {
+                ggml_rht_stage_chunks(y.data(), n, 77, P, (int64_t) K*p/parts, (int64_t) K*(p + 1)/parts);
+            }
+            for (int p = parts - 1; p >= 0; --p) {
+                ggml_rht_stage_mix(y.data(), n, K, P, ggml_rht_matrix_f32(K), P*p/parts, P*(p + 1)/parts);
+            }
+            ok &= memcmp(y.data(), ref.data(), n*sizeof(float)) == 0;
+        }
+        check(ok, "n = " + std::to_string(n) + ": 1, 3 and 8-way splits give the bytes of ggml_rht_ref");
+
+        bool ok_out = true;
+        std::vector<float> u = x;
+        if (K == 1) {
+            for (int64_t P1 : { 2ll, 16ll }) {
+                u = x;
+                const int64_t cs = P/P1;
+                for (int64_t c = 0; c < P1; ++c) {
+                    ggml_rht_stage_chunks(u.data(), n, 77, cs, c, c + 1);
+                }
+                std::vector<float> y(n, 0.0f);
+                for (int parts : { 1, 3, 8 }) {
+                    for (int p = 0; p < parts; ++p) {
+                        ggml_rht_stage_fwht_outer(u.data(), y.data(), n, cs, cs*p/parts, cs*(p + 1)/parts);
+                    }
+                    ok_out &= memcmp(y.data(), ref.data(), n*sizeof(float)) == 0;
+                }
+            }
+            check(ok_out, "n = " + std::to_string(n) + ": H_P1 (x) H_P2 split with the outer stage gives the same bytes");
+        } else {
+            ggml_rht_stage_chunks(u.data(), n, 77, P, 0, K);
+            std::vector<float> y(n, 0.0f);
+            for (int jp : { 1, 3 }) {
+                for (int gp : { 1, 5 }) {
+                    for (int a = 0; a < jp; ++a) {
+                        for (int b = 0; b < gp; ++b) {
+                            ggml_rht_stage_mix_out(u.data(), y.data(), n, K, P, ggml_rht_matrix_f32(K),
+                                                   P*a/jp, P*(a + 1)/jp, K*b/gp, K*(b + 1)/gp);
+                        }
+                    }
+                    ok_out &= memcmp(y.data(), ref.data(), n*sizeof(float)) == 0;
+                }
+            }
+            check(ok_out, "n = " + std::to_string(n) + ": out-of-place mix over position and output splits gives the same bytes");
+        }
+    }
+}
+
+static const std::vector<std::pair<ggml_type, ggml_type>> hq_pairs = {
+    { GGML_TYPE_Q4_K,    GGML_TYPE_HQ4_K   }, { GGML_TYPE_Q5_K,    GGML_TYPE_HQ5_K   },
+    { GGML_TYPE_IQ2_XXS, GGML_TYPE_HQ2_XXS }, { GGML_TYPE_IQ2_XS,  GGML_TYPE_HQ2_XS  },
+    { GGML_TYPE_IQ2_S,   GGML_TYPE_HQ2_S   }, { GGML_TYPE_IQ3_XXS, GGML_TYPE_HQ3_XXS },
+    { GGML_TYPE_IQ3_S,   GGML_TYPE_HQ3_S   }, { GGML_TYPE_IQ4_NL,  GGML_TYPE_HQ4_NL  },
+    { GGML_TYPE_IQ4_XS,  GGML_TYPE_HQ4_XS  },
+};
+
+static void test_types() {
+    printf("types:\n");
+
+    const std::map<ggml_type, std::string> names = {
+        { GGML_TYPE_HQ4_K, "hq4_K" }, { GGML_TYPE_HQ5_K, "hq5_K" }, { GGML_TYPE_HQ2_XXS, "hq2_xxs" },
+        { GGML_TYPE_HQ2_XS, "hq2_xs" }, { GGML_TYPE_HQ2_S, "hq2_s" }, { GGML_TYPE_HQ3_XXS, "hq3_xxs" },
+        { GGML_TYPE_HQ3_S, "hq3_s" }, { GGML_TYPE_HQ4_NL, "hq4_nl" }, { GGML_TYPE_HQ4_XS, "hq4_xs" },
+    };
+    check(GGML_TYPE_COUNT == 159 && GGML_TYPE_HQ4_K == 150 && GGML_TYPE_HQ4_XS == 158, "indices 150..158, GGML_TYPE_COUNT == 159");
+
+    for (const auto & [base, hq] : hq_pairs) {
+        const ggml_type_traits * tb = ggml_get_type_traits(base);
+        const ggml_type_traits * th = ggml_get_type_traits(hq);
+        const bool traits_ok =
+            th->blck_size == tb->blck_size && th->blck_size_interleave == tb->blck_size_interleave &&
+            th->type_size == tb->type_size && th->is_quantized == tb->is_quantized &&
+            th->to_float == tb->to_float && th->from_float_ref == nullptr;
+
+        const ggml_type_traits_cpu * cpu = ggml_get_type_traits_cpu(hq);
+        const bool cpu_ok = cpu->from_float == nullptr && cpu->vec_dot == nullptr;
+
+        const bool pair_ok = ggml_get_rotated_type(base) == hq && ggml_get_base_type(hq) == base &&
+            ggml_is_rotated(hq) && !ggml_is_rotated(base) && ggml_get_rotated_type(hq) == hq;
+
+        ggml_type parsed = GGML_TYPE_COUNT;
+        for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+            if (names.at(hq) == ggml_type_name((ggml_type) t)) {
+                parsed = (ggml_type) t;
+            }
+        }
+
+        check(traits_ok && cpu_ok && pair_ok && parsed == hq,
+              std::string(ggml_type_name(hq)) + ": traits == " + ggml_type_name(base) + "'s, no CPU traits, pairing, name");
+    }
+
+    bool others = true;
+    for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+        const ggml_type type = (ggml_type) t;
+        if (names.count(type)) {
             continue;
         }
-
-        n_pairs++;
-        n_bad += ggml_get_base_type(rot) != base;      // round-trips
-        n_bad += !ggml_is_rotated(rot);                // the rotated one is rotated
-        n_bad += ggml_is_rotated(base);                // the base one is not
-        n_bad += ggml_blck_size(rot) != ggml_blck_size(base);
-        n_bad += ggml_type_size(rot) != ggml_type_size(base);
-        n_bad += ggml_is_quantized(rot) != ggml_is_quantized(base);
-        n_bad += !ggml_fwht_supports_group(ggml_blck_size(rot)); // every group must be FWHT-able
-
-        printf("  %-7s <-> %-7s  blck=%3d  size=%3zu\n",
-            ggml_type_name(base), ggml_type_name(rot), (int) ggml_blck_size(base), ggml_type_size(base));
+        others &= !ggml_is_rotated(type) && ggml_get_base_type(type) == type;
+        bool is_base = false;
+        for (const auto & p : hq_pairs) {
+            is_base |= p.first == type;
+        }
+        others &= is_base || ggml_get_rotated_type(type) == type;
     }
-
-    check(n_pairs == 2, "two rotated variants exist (_K only)", (double) n_pairs, 0.0);
-    check(n_bad  == 0,  "pairing invariants hold",    (double) n_bad,  0.0);
+    check(others, "every non-HQ type is its own base; only the nine bases have a rotated type");
 }
 
-// Rotate -> quantize as the base type -> dequantize -> inverse-rotate should land within the
-// error the unrotated path has, and <H*w, H*x> must equal <w, x> exactly enough that a rotated
-// GEMM reproduces the unrotated one.
-static void test_round_trip(ggml_type base, int64_t n_per_row, int64_t nrows) {
-    const ggml_type rot = ggml_get_rotated_type(base);
-    const int64_t   g   = ggml_blck_size(base);
+static void test_validate() {
+    printf("row validation:\n");
 
-    printf("round-trip %s -> %s (%" PRId64 " x %" PRId64 "):\n",
-        ggml_type_name(base), ggml_type_name(rot), n_per_row, nrows);
+    const int64_t n = 512;
+    const std::vector<float> x = make_random(n, 3);
+    const std::vector<float> imat(n, 1.0f);
 
-    const int64_t n = n_per_row * nrows;
+    for (const auto & [base, hq] : hq_pairs) {
+        std::vector<uint8_t> row(ggml_row_size(base, n));
+        ggml_quantize_chunk(base, x.data(), row.data(), 0, 1, n, imat.data());
 
-    const std::vector<float> w = make_random(n, 4242);
+        const bool valid = ggml_validate_row_data(base, row.data(), row.size()) &&
+                           ggml_validate_row_data(hq,   row.data(), row.size());
 
-    // --- baseline: quantize unrotated ---
-    std::vector<uint8_t> q_plain(ggml_row_size(base, n_per_row) * nrows);
-    ggml_quantize_chunk(base, w.data(), q_plain.data(), 0, nrows, n_per_row, nullptr);
+        std::vector<uint8_t> bad = row;
+        const uint16_t nan16 = 0x7e00;
+        memcpy(bad.data(), &nan16, sizeof(nan16));
+        const bool rejected = !ggml_validate_row_data(base, bad.data(), bad.size()) &&
+                              !ggml_validate_row_data(hq,   bad.data(), bad.size());
 
-    std::vector<float> w_plain(n);
-    ggml_get_type_traits(base)->to_float(q_plain.data(), w_plain.data(), n);
+        check(valid && rejected, std::string(ggml_type_name(hq)) + ": accepts a valid row, rejects a NaN scale like the base type");
+    }
+}
 
-    // --- rotated: rotate, quantize as the base type, dequantize, rotate back ---
-    std::vector<float> w_rot = w;
-    for (int64_t r = 0; r < nrows; r++) {
-        for (int64_t c = 0; c < n_per_row; c += g) {
-            llama_hadamard_inplace(w_rot.data() + r*n_per_row + c, (int) g);
+static std::vector<float> cpu_op(const std::vector<float> & x, int64_t n, int64_t nr, int64_t stride, uint64_t seed, int nth, bool as3d) {
+    ggml_init_params ip = { (size_t) 64*1024*1024 + x.size()*8, nullptr, false };
+    ggml_context * ctx = ggml_init(ip);
+
+    ggml_tensor * buf = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, stride*nr);
+    memcpy(buf->data, x.data(), x.size()*sizeof(float));
+
+    ggml_tensor * src = as3d
+        ? ggml_view_3d(ctx, buf, n, 2, nr/2, stride*sizeof(float), 2*stride*sizeof(float), 0)
+        : ggml_view_2d(ctx, buf, n, nr, stride*sizeof(float), 0);
+    ggml_tensor * out = ggml_rht(ctx, src, seed);
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+    ggml_graph_compute_with_ctx(ctx, gf, nth);
+
+    std::vector<float> y(n*nr);
+    memcpy(y.data(), out->data, y.size()*sizeof(float));
+    ggml_free(ctx);
+    return y;
+}
+
+static void test_cpu_op() {
+    printf("CPU op:\n");
+
+    for (int64_t n : { 5120ll, 3072ll, 4096ll, 17408ll, 688ll, 4032ll, 9728ll }) {
+        for (int64_t nr : { 1ll, 2ll, 7ll, 16ll, 33ll }) {
+            const int64_t stride = n + (nr > 1 ? 16 : 0);
+            const std::vector<float> x = make_random(stride*nr, 9 + (uint32_t) nr);
+
+            std::vector<float> ref(n*nr);
+            for (int64_t r = 0; r < nr; ++r) {
+                std::vector<float> row(x.begin() + r*stride, x.begin() + r*stride + n);
+                ggml_rht_ref(row.data(), n, 4242);
+                memcpy(ref.data() + r*n, row.data(), n*sizeof(float));
+            }
+
+            bool ok = true;
+            for (int nth : { 1, 4, 16 }) {
+                ok &= memcmp(cpu_op(x, n, nr, stride, 4242, nth, false).data(), ref.data(), ref.size()*sizeof(float)) == 0;
+                if (nr % 2 == 0) {
+                    ok &= memcmp(cpu_op(x, n, nr, stride, 4242, nth, true).data(), ref.data(), ref.size()*sizeof(float)) == 0;
+                }
+            }
+            check(ok, "n = " + std::to_string(n) + ", rows = " + std::to_string(nr) +
+                      (stride != n ? " (padded stride)" : "") + ": 1, 4, 16 threads == ggml_rht_ref");
         }
     }
-
-    std::vector<uint8_t> q_rot(ggml_row_size(base, n_per_row) * nrows);
-    ggml_quantize_chunk(base, w_rot.data(), q_rot.data(), 0, nrows, n_per_row, nullptr);
-
-    std::vector<float> w_back(n);
-    ggml_get_type_traits(base)->to_float(q_rot.data(), w_back.data(), n);
-    for (int64_t r = 0; r < nrows; r++) {
-        for (int64_t c = 0; c < n_per_row; c += g) {
-            llama_hadamard_inplace(w_back.data() + r*n_per_row + c, (int) g);
-        }
-    }
-
-    double err_plain = 0.0;
-    double err_rot   = 0.0;
-    for (int64_t i = 0; i < n; i++) {
-        err_plain = std::max(err_plain, (double) std::fabs(w_plain[i] - w[i]));
-        err_rot   = std::max(err_rot,   (double) std::fabs(w_back[i]  - w[i]));
-    }
-
-    printf("  max|dequant - original|: unrotated %.3e, rotated %.3e\n", err_plain, err_rot);
-    check(err_rot < 4.0*err_plain, "rotated round-trip error is comparable", err_rot, 4.0*err_plain);
-
-    // --- what inference actually relies on: <W'_row, H*x> == <W_row, x> ---
-    // W' is the *quantized* rotated weight, so this also folds in the quantization error the
-    // engine will really see.
-    const std::vector<float> x = make_random(n_per_row, 777);
-
-    std::vector<float> x_rot = x;
-    for (int64_t c = 0; c < n_per_row; c += g) {
-        llama_hadamard_inplace(x_rot.data() + c, (int) g);
-    }
-
-    // dequantize the rotated weight without rotating it back - this is literally what the GEMM
-    // sees - and pair it with the rotated activation
-    std::vector<float> w_quant_rot(n);
-    ggml_get_type_traits(base)->to_float(q_rot.data(), w_quant_rot.data(), n);
-
-    double err_dot_plain = 0.0;
-    double err_dot_rot   = 0.0;
-    for (int64_t r = 0; r < nrows; r++) {
-        double ref = 0.0, dot_plain = 0.0, dot_rot = 0.0;
-        for (int64_t c = 0; c < n_per_row; c++) {
-            const int64_t i = r*n_per_row + c;
-            ref       += (double) w[i]           * x[c];     // exact
-            dot_plain += (double) w_plain[i]     * x[c];     // <dequant(W), x>
-            dot_rot   += (double) w_quant_rot[i] * x_rot[c]; // <dequant(W'), H*x>
-        }
-
-        err_dot_plain = std::max(err_dot_plain, std::fabs(dot_plain - ref));
-        err_dot_rot   = std::max(err_dot_rot,   std::fabs(dot_rot   - ref));
-    }
-
-    printf("  max|dot - exact|:        unrotated %.3e, rotated %.3e\n", err_dot_plain, err_dot_rot);
-    check(err_dot_rot < 4.0*err_dot_plain + 1e-4, "rotated GEMM matches the unrotated result",
-        err_dot_rot, 4.0*err_dot_plain + 1e-4);
 }
 
 int main() {
-    ggml_quantize_init(GGML_TYPE_Q4_K);
+    ggml_cpu_init();
 
-    test_matrix(256);
-    test_matrix(512);
+    test_thread_safety();
+    test_table();
+    test_plan();
+    test_signs();
+    test_reference();
+    test_stage_split();
+    test_types();
+    test_validate();
+    test_cpu_op();
 
-    test_type_pairing();
-
-    test_round_trip(GGML_TYPE_Q4_K, 512, 8);
-    test_round_trip(GGML_TYPE_Q5_K, 512, 8);
-
-    if (g_failed > 0) {
-        printf("\n%d check(s) FAILED\n", g_failed);
-        return 1;
-    }
-
-    printf("\nall checks passed\n");
-    return 0;
+    printf("\n%s: %d failure(s)\n", g_failed ? "FAIL" : "PASS", g_failed);
+    return g_failed ? 1 : 0;
 }

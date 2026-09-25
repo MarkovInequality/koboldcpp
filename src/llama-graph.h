@@ -11,7 +11,6 @@
 #include <set>
 #include <functional>
 #include <map>
-#include <utility>
 
 struct ggml_cgraph;
 struct ggml_context;
@@ -123,33 +122,6 @@ protected:
 };
 
 using llm_graph_input_ptr = std::unique_ptr<llm_graph_input_i>;
-
-// ConvRot inference: the materialized F32 H_g rotation matrices, one per rotation group g.
-//
-// These must be graph *inputs* so the allocator gives them a real backend buffer and the scheduler
-// copies them to the device. A plain host-memory tensor (data set, buffer null) is treated as
-// already-allocated by ggml-alloc and never copied, so any backend that falls back to a regular
-// GEMM for the rotation would read a host pointer from the GPU.
-class llm_graph_input_hadamard : public llm_graph_input_i {
-public:
-    llm_graph_input_hadamard() = default;
-    virtual ~llm_graph_input_hadamard() = default;
-
-    void set_input(const llama_ubatch * ubatch) override;
-
-    // the matrices are constants - they never depend on the ubatch
-    bool can_reuse(const llm_graph_params & params) override {
-        GGML_UNUSED(params);
-        return true;
-    }
-
-    struct entry {
-        ggml_tensor *      t = nullptr; // F32 [g, g] graph input
-        std::vector<float> data;        // H_g, generated once per graph build
-    };
-
-    std::map<int64_t, entry> rot; // rotation group -> H_g
-};
 
 class llm_graph_input_embd : public llm_graph_input_i {
 public:
@@ -837,6 +809,8 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    const llama_model * hq_model = nullptr; // for its rotated (HQ) tensors and seed
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -995,10 +969,9 @@ private:
 
 using llm_graph_result_ptr = std::unique_ptr<llm_graph_result>;
 
-// Fail loud when a Hadamard-rotated (ConvRot) weight in the graph is consumed by a GEMM
-// whose input was not rotated by the matching H_g (would silently produce wrong output);
-// called once per graph build
-void llm_graph_check_hadamard_rotation(ggml_cgraph * gf);
+// Throws unless every rotated (HQ) weight in the graph is only the src0 of a MUL_MAT/MUL_MAT_ID
+// whose input is a matching RHT node; called once per graph build
+void llm_graph_check_hadamard_rotation(ggml_cgraph * gf, const llama_model & model);
 
 //
 // llm_graph_context
@@ -1065,6 +1038,8 @@ struct llm_graph_context {
 
     llm_graph_result * res;
 
+    const llama_model * hq_model;
+
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
@@ -1073,17 +1048,10 @@ struct llm_graph_context {
 
     void cb(ggml_tensor * cur, const char * name, int il) const;
 
-    // get (or create) the materialized F32 H_g graph input used to rotate activations
-    ggml_tensor * get_hadamard_rot(int64_t g) const;
-
-    // rotate the input activation for a ConvRot weight w; returns cur unchanged when w is not a
-    // rotated type. Each (activation, group) pair is rotated once and shared by every weight that
-    // consumes it (QKV: 3 GEMMs, 1 rotation)
+    // R*cur if w is rotated, else cur; each activation is rotated once for all its consumers
     ggml_tensor * rotate_input_if_rotated(ggml_tensor * w, ggml_tensor * cur) const;
 
-    // ConvRot state for the graph currently being built
-    mutable llm_graph_input_hadamard * inp_hadamard = nullptr;
-    mutable std::map<std::pair<ggml_tensor *, int64_t>, ggml_tensor *> hadamard_rot_cache;
+    mutable std::map<ggml_tensor *, ggml_tensor *> hadamard_rot_cache;
 
     //
     // common

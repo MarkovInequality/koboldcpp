@@ -436,19 +436,19 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        // Hadamard-rotated (ConvRot) variants: the stored weights are rotated before quantization,
-        // in the base type's byte layout. Inference rotates the input activation to match, leaving
-        // the output unchanged. Only the 256-wide _K groups exist: a 32-wide rotation measured
-        // worse on both quality and speed than no rotation at all.
-        //
-        // Deliberately based at 150, well clear of upstream's allocation, so a rotated file can
-        // never be mistaken for some future upstream type with a matching block layout. The gap
-        // (45..149) is unused: those entries have type_name == NULL and blck_size == 0, which the
-        // GGUF reader rejects.
-        // See plans/add_hadamard_rotated_quantization_plan.md
-        GGML_TYPE_Q4R_K   = 150,
-        GGML_TYPE_Q5R_K   = 151,
-        GGML_TYPE_COUNT   = 152,
+        // Hadamard-rotated (HQ) variants: rows are stored rotated by the full-row RHT (ggml_rht_ref),
+        // in the base type's block layout (see ggml_get_base_type). They exist only in files and in
+        // the quantizer; llama loads them as their base type. Based at 150, clear of upstream.
+        GGML_TYPE_HQ4_K   = 150,
+        GGML_TYPE_HQ5_K   = 151,
+        GGML_TYPE_HQ2_XXS = 152,
+        GGML_TYPE_HQ2_XS  = 153,
+        GGML_TYPE_HQ2_S   = 154,
+        GGML_TYPE_HQ3_XXS = 155,
+        GGML_TYPE_HQ3_S   = 156,
+        GGML_TYPE_HQ4_NL  = 157,
+        GGML_TYPE_HQ4_XS  = 158,
+        GGML_TYPE_COUNT   = 159,
     };
 
     // precision
@@ -607,6 +607,8 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+
+        GGML_OP_RHT,
 
         GGML_OP_COUNT,
 
@@ -783,14 +785,11 @@ extern "C" {
     "use ggml_row_size() instead");
 
     GGML_API const char * ggml_type_name(enum ggml_type type);
-    GGML_API enum ggml_type ggml_get_rotated_type(enum ggml_type type); // Q4_K->Q4R_K, Q5_K->Q5R_K, else identity
-    GGML_API enum ggml_type ggml_get_base_type   (enum ggml_type type); // the inverse
+    // Q4_K, Q5_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS <-> their HQ variants;
+    // every other type maps to itself
+    GGML_API enum ggml_type ggml_get_rotated_type(enum ggml_type type);
+    GGML_API enum ggml_type ggml_get_base_type   (enum ggml_type type);
     GGML_API bool           ggml_is_rotated      (enum ggml_type type);
-
-    // A ConvRot rotation group is only allowed if every backend can run it as a fast FWHT.
-    // Smaller groups would fall back to a materialized-matrix GEMM, which is both slower and not
-    // worth it - the mixing is too weak to beat the block structure the rotation destroys.
-    GGML_API bool           ggml_fwht_supports_group(int64_t n);
     GGML_API const char * ggml_op_name  (enum ggml_op   op);
     GGML_API const char * ggml_op_symbol(enum ggml_op   op);
 
@@ -1485,6 +1484,13 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    // randomized Hadamard transform of each row: R*x, with R = ggml_rht_ref(., ne[0], seed)
+    // x: F32 with contiguous rows, ne[0] accepted by ggml_rht_plan
+    GGML_API struct ggml_tensor * ggml_rht(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            uint64_t              seed);
 
     // A: m columns, n rows,
     // B: p columns, n rows,
@@ -2917,6 +2923,19 @@ extern "C" {
                    int64_t   nrows,
                    int64_t   n_per_row,
                const float * imatrix);
+
+    //
+    // randomized Hadamard transform (RHT): R = (1/sqrt(n)) * (H_K (x) H_P) * diag(s), n = K*P
+    //
+
+    // n = K*P with P a power of 2 and H_K a table matrix (K = 1 or 4*odd <= 256); false if unsupported
+    GGML_API bool     ggml_rht_plan(int64_t n, int * K, int64_t * P);
+    // unnormalized, row-major +-1 K x K matrix; false if the table has no order K
+    GGML_API bool     ggml_hadamard_matrix(int K, float * out);
+    // bits 64*k .. 64*k+63 of the sign vector s (bit set = -1)
+    GGML_API uint64_t ggml_rht_sign_word(uint64_t seed, int64_t n, int64_t k);
+    // x = R*x for one row, in place
+    GGML_API void     ggml_rht_ref(float * x, int64_t n, uint64_t seed);
 
 #ifdef __cplusplus
     // restrict not standard in C++

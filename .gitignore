@@ -57,6 +57,13 @@ models-mnt
 /lookahead
 /lookup
 /main
+/maincuda
+/quantize_gguf
+/test-hadamard*
+/test-backend-ops
+/bench-rht
+/ggml/src/ggml-cuda/**/*.d
+/ggml/src/ggml-cuda/.flags
 /metal
 /passkey
 /perplexity

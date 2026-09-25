@@ -152,6 +152,9 @@ void llama_model_saver::add_tensor(const struct ggml_tensor * tensor) {
         return;
     }
     gguf_add_tensor(gguf_ctx, tensor);
+    if (model && model->is_rotated(tensor)) {
+        gguf_set_tensor_type(gguf_ctx, tensor->name, ggml_get_rotated_type(tensor->type));
+    }
 }
 
 void llama_model_saver::add_kv_from_model() {
@@ -189,6 +192,9 @@ void llama_model_saver::add_kv_from_model() {
 
     // add_kv(LLM_KV_GENERAL_TYPE,                      ???);
     add_kv(LLM_KV_GENERAL_ARCHITECTURE,              model->arch_name());
+    if (!model->rotated_tensors.empty()) {
+        add_kv(LLM_KV_HADAMARD_SEED,                 model->hadamard_seed);
+    }
     // add_kv(LLM_KV_GENERAL_QUANTIZATION_VERSION,      ???);
     // add_kv(LLM_KV_GENERAL_ALIGNMENT,                 ???);
     // add_kv(LLM_KV_GENERAL_FILE_TYPE,                 ???);

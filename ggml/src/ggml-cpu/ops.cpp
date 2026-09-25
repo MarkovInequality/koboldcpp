@@ -2,6 +2,7 @@
 
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
+#include "ggml-hadamard.h"
 #include "binary-ops.h"
 #include "simd-gemm.h"
 #include "ggml.h"
@@ -11840,6 +11841,115 @@ void ggml_compute_forward_opt_step_sgd(const ggml_compute_params * params, ggml_
         default:
             {
                 GGML_ABORT("fatal error - sgd is F32 only");
+            }
+    }
+}
+
+// ggml_compute_forward_rht
+
+static void ggml_compute_forward_rht_f32(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    uint64_t seed;
+    memcpy(&seed, dst->op_params, sizeof(seed));
+
+    int     K;
+    int64_t P;
+    GGML_ASSERT(ggml_rht_plan(ne00, &K, &P));
+    const float * H = ggml_rht_matrix_f32(K);
+
+    const int64_t nr = ggml_nrows(src0);
+
+    auto src_row = [&](int64_t ir) {
+        const int64_t i3 = ir/(ne02*ne01);
+        const int64_t i2 = (ir - i3*ne02*ne01)/ne01;
+        const int64_t i1 = ir - i3*ne02*ne01 - i2*ne01;
+        return (const float *) ((const char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03);
+    };
+    auto dst_row = [&](int64_t ir) {
+        const int64_t i3 = ir/(ne2*ne1);
+        const int64_t i2 = (ir - i3*ne2*ne1)/ne1;
+        const int64_t i1 = ir - i3*ne2*ne1 - i2*ne1;
+        return (float *) ((char *) dst->data + i1*nb1 + i2*nb2 + i3*nb3);
+    };
+
+    if (nr >= nth) {
+        const int64_t dr  = (nr + nth - 1)/nth;
+        const int64_t ir0 = dr*ith;
+        const int64_t ir1 = MIN(ir0 + dr, nr);
+        for (int64_t ir = ir0; ir < ir1; ++ir) {
+            float * y = dst_row(ir);
+            memmove(y, src_row(ir), ne00*sizeof(float));
+            ggml_rht_stage_chunks(y, ne00, seed, P, 0, K);
+            ggml_rht_stage_mix(y, ne00, K, P, H, 0, P);
+        }
+        return;
+    }
+
+    // fewer rows than threads (decode): split each row as well, through the work buffer so the
+    // second stage can write any part of the output. K = 1 rows are split as H_P1 (x) H_P2.
+    float * u = (float *) params->wdata;
+
+    int64_t cs = P;
+    int64_t nc = K;
+    if (K == 1 && P >= 64) {
+        nc = MIN(16, P/32);
+        cs = P/nc;
+    }
+
+    const int64_t n1  = nr*nc;
+    const int64_t d1  = (n1 + nth - 1)/nth;
+    const int64_t i10 = MIN(d1*ith, n1);
+    const int64_t i11 = MIN(i10 + d1, n1);
+    for (int64_t i = i10; i < i11; ++i) {
+        const int64_t ir = i/nc;
+        const int64_t c  = i - ir*nc;
+        float * ur = u + ir*ne00;
+        memcpy(ur + c*cs, src_row(ir) + c*cs, cs*sizeof(float));
+        ggml_rht_stage_chunks(ur, ne00, seed, cs, c, c + 1);
+    }
+
+    ggml_barrier(params->threadpool);
+
+    const int64_t tile = 32;
+    const int64_t nt   = (cs + tile - 1)/tile;
+    const int64_t ng   = K == 1 ? 1 : MIN((int64_t) K, (2*nth + nr*nt - 1)/(nr*nt));
+    const int64_t n2   = nr*nt*ng;
+    const int64_t d2   = (n2 + nth - 1)/nth;
+    const int64_t i20  = MIN(d2*ith, n2);
+    const int64_t i21  = MIN(i20 + d2, n2);
+    for (int64_t i = i20; i < i21; ++i) {
+        const int64_t ir = i/(nt*ng);
+        const int64_t t  = (i/ng) % nt;
+        const int64_t g  = i % ng;
+        const int64_t j0 = t*tile;
+        const int64_t j1 = MIN(j0 + tile, cs);
+        const float * ur = u + ir*ne00;
+        float       * y  = dst_row(ir);
+        if (nc > 1 && K == 1) {
+            ggml_rht_stage_fwht_outer(ur, y, ne00, cs, j0, j1);
+        } else {
+            ggml_rht_stage_mix_out(ur, y, ne00, K, P, H, j0, j1, (int) (K*g/ng), (int) (K*(g + 1)/ng));
+        }
+    }
+}
+
+void ggml_compute_forward_rht(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_rht_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error - rht is F32 only");
             }
     }
 }

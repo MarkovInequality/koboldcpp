@@ -958,22 +958,79 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 0,
         .is_quantized             = false,
     },
-    // ConvRot variants: the base type's row, verbatim - only the stored values are rotated
-    [GGML_TYPE_Q4R_K] = {
-        .type_name                = "q4r_K",
+    // HQ variants: the base type's row with no from_float_ref - rows are only produced by the
+    // HQ quantizers, which rotate the whole row first
+    [GGML_TYPE_HQ4_K] = {
+        .type_name                = "hq4_K",
         .blck_size                = QK_K,
         .type_size                = sizeof(block_q4_K),
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_q4_K,
-        .from_float_ref           = (ggml_from_float_t) quantize_row_q4_K_ref,
+        .from_float_ref           = NULL,
     },
-    [GGML_TYPE_Q5R_K] = {
-        .type_name                = "q5r_K",
+    [GGML_TYPE_HQ5_K] = {
+        .type_name                = "hq5_K",
         .blck_size                = QK_K,
         .type_size                = sizeof(block_q5_K),
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_q5_K,
-        .from_float_ref           = (ggml_from_float_t) quantize_row_q5_K_ref,
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_HQ2_XXS] = {
+        .type_name                = "hq2_xxs",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_iq2_xxs),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_iq2_xxs,
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_HQ2_XS] = {
+        .type_name                = "hq2_xs",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_iq2_xs),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_iq2_xs,
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_HQ2_S] = {
+        .type_name                = "hq2_s",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_iq2_s),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_iq2_s,
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_HQ3_XXS] = {
+        .type_name                = "hq3_xxs",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_iq3_xxs),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_iq3_xxs,
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_HQ3_S] = {
+        .type_name                = "hq3_s",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_iq3_s),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_iq3_s,
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_HQ4_NL] = {
+        .type_name                = "hq4_nl",
+        .blck_size                = QK4_NL,
+        .type_size                = sizeof(block_iq4_nl),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_iq4_nl,
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_HQ4_XS] = {
+        .type_name                = "hq4_xs",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_iq4_xs),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_iq4_xs,
+        .from_float_ref           = NULL,
     },
 };
 
@@ -1131,9 +1188,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "RHT",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1246,9 +1305,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "rht(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1384,8 +1445,7 @@ double ggml_type_sizef(enum ggml_type type) {
 const char * ggml_type_name(enum ggml_type type) {
     assert(type >= 0);
     assert(type < GGML_TYPE_COUNT);
-    // the enum is sparse (the ConvRot types sit at 150+), so unused slots have a NULL name -
-    // never hand a NULL back to a caller that is about to printf or stream it
+    // the enum is sparse (the HQ types sit at 150+), so unused slots have a NULL name
     return type_traits[type].type_name ? type_traits[type].type_name : "(unused)";
 }
 
@@ -1395,11 +1455,16 @@ bool ggml_is_quantized(enum ggml_type type) {
     return type_traits[type].is_quantized;
 }
 
-// Hadamard-rotated variants (Q4R_*/Q5R_*) share their base type's layout and kernels; only the
-// stored values are rotated. One list drives both directions of the pairing.
 #define GGML_ROTATED_TYPE_PAIRS \
-    X(GGML_TYPE_Q4_K, GGML_TYPE_Q4R_K) \
-    X(GGML_TYPE_Q5_K, GGML_TYPE_Q5R_K)
+    X(GGML_TYPE_Q4_K,    GGML_TYPE_HQ4_K)   \
+    X(GGML_TYPE_Q5_K,    GGML_TYPE_HQ5_K)   \
+    X(GGML_TYPE_IQ2_XXS, GGML_TYPE_HQ2_XXS) \
+    X(GGML_TYPE_IQ2_XS,  GGML_TYPE_HQ2_XS)  \
+    X(GGML_TYPE_IQ2_S,   GGML_TYPE_HQ2_S)   \
+    X(GGML_TYPE_IQ3_XXS, GGML_TYPE_HQ3_XXS) \
+    X(GGML_TYPE_IQ3_S,   GGML_TYPE_HQ3_S)   \
+    X(GGML_TYPE_IQ4_NL,  GGML_TYPE_HQ4_NL)  \
+    X(GGML_TYPE_IQ4_XS,  GGML_TYPE_HQ4_XS)
 
 enum ggml_type ggml_get_rotated_type(enum ggml_type type) {
     assert(type >= 0);
@@ -1408,7 +1473,7 @@ enum ggml_type ggml_get_rotated_type(enum ggml_type type) {
 #define X(base, rot) case base: return rot;
         GGML_ROTATED_TYPE_PAIRS
 #undef X
-        default: return type; // no rotated variant (or already rotated)
+        default: return type;
     }
 }
 
@@ -1425,12 +1490,6 @@ enum ggml_type ggml_get_base_type(enum ggml_type type) {
 
 bool ggml_is_rotated(enum ggml_type type) {
     return ggml_get_base_type(type) != type;
-}
-
-// the group sizes every backend implements as a fast FWHT (CUDA fwht.cu, Metal
-// ggml_metal_fwht_supported_size, Vulkan ggml_vk_fwht_pipeline_idx; the CPU always has one)
-bool ggml_fwht_supports_group(int64_t n) {
-    return n == 64 || n == 128 || n == 256 || n == 512;
 }
 
 const char * ggml_op_name(enum ggml_op op) {
@@ -3421,6 +3480,26 @@ struct ggml_tensor * ggml_mul_mat_id(
     result->src[0] = as;
     result->src[1] = b;
     result->src[2] = ids;
+
+    return result;
+}
+
+// ggml_rht
+
+struct ggml_tensor * ggml_rht(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        uint64_t              seed) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous_rows(a));
+    GGML_ASSERT(ggml_rht_plan(a->ne[0], NULL, NULL));
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, a->ne);
+
+    ggml_set_op_params(result, &seed, sizeof(seed));
+
+    result->op     = GGML_OP_RHT;
+    result->src[0] = a;
 
     return result;
 }
@@ -7998,6 +8077,11 @@ void ggml_quantize_init(enum ggml_type type) {
         case GGML_TYPE_IQ1_M:   iq2xs_init_impl(type); break;
         case GGML_TYPE_IQ3_XXS: iq3xs_init_impl(256); break;
         case GGML_TYPE_IQ3_S:   iq3xs_init_impl(512); break;
+        case GGML_TYPE_HQ2_XXS:
+        case GGML_TYPE_HQ2_XS:
+        case GGML_TYPE_HQ2_S:   iq2xs_init_impl(ggml_get_base_type(type)); break;
+        case GGML_TYPE_HQ3_XXS: iq3xs_init_impl(256); break;
+        case GGML_TYPE_HQ3_S:   iq3xs_init_impl(512); break;
         default: // nothing
             break;
     }
@@ -8077,6 +8161,15 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_IQ1_M:   result = quantize_iq1_m  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ4_NL:  result = quantize_iq4_nl (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ4_XS:  result = quantize_iq4_xs (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_HQ4_K:
+        case GGML_TYPE_HQ5_K:
+        case GGML_TYPE_HQ2_XXS:
+        case GGML_TYPE_HQ2_XS:
+        case GGML_TYPE_HQ2_S:
+        case GGML_TYPE_HQ3_XXS:
+        case GGML_TYPE_HQ3_S:
+        case GGML_TYPE_HQ4_NL:
+        case GGML_TYPE_HQ4_XS:  result = quantize_hq(type, src + start, (char *) dst + start_row * row_size, nrows, n_per_row); break;
         case GGML_TYPE_F16:
             {
                 size_t elemsize = sizeof(ggml_fp16_t);

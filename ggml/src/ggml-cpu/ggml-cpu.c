@@ -413,23 +413,6 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_I32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
     },
-    // ConvRot variants: the base type's row, verbatim - only the stored values are rotated
-    [GGML_TYPE_Q4R_K] = {
-        .from_float               = quantize_row_q4_K,
-        .vec_dot                  = ggml_vec_dot_q4_K_q8_K,
-        .vec_dot_type             = GGML_TYPE_Q8_K,
-#if defined (__ARM_FEATURE_MATMUL_INT8)
-        .nrows                    = 2,
-#else
-        .nrows                    = 1,
-#endif
-    },
-    [GGML_TYPE_Q5R_K] = {
-        .from_float               = quantize_row_q5_K,
-        .vec_dot                  = ggml_vec_dot_q5_K_q8_K,
-        .vec_dot_type             = GGML_TYPE_Q8_K,
-        .nrows                    = 1,
-    },
 };
 
 const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type) {
@@ -2905,6 +2888,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_opt_step_sgd(params, tensor);
             }
             break;
+        case GGML_OP_RHT:
+            {
+                ggml_compute_forward_rht(params, tensor);
+            } break;
         case GGML_OP_NONE:
             {
                 // nop
@@ -3290,6 +3277,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
+            {
+                n_tasks = n_threads;
+            } break;
+        case GGML_OP_RHT:
             {
                 n_tasks = n_threads;
             } break;
@@ -3701,6 +3692,12 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_COUNT_EQUAL:
                     {
                         cur = ggml_type_size(node->type)*n_tasks;
+                    } break;
+                case GGML_OP_RHT:
+                    {
+                        if (ggml_nrows(node) < n_tasks) {
+                            cur = ggml_nbytes(node);
+                        }
                     } break;
                 case GGML_OP_MUL_MAT:
                     {

@@ -72,6 +72,10 @@ bool g_mul_mat_q = true;
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml.h"
 
+// rht.cuh holds the Hadamard tables as device data, so only rht.cu includes it
+void ggml_cuda_op_rht(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+bool ggml_cuda_rht_write_q8_1(const ggml_tensor * dst, int fmt, int n_consumers);
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1813,13 +1817,18 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
-static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_TENSOR_BINARY_OP_LOCALS
+enum ggml_cuda_mm_path {
+    GGML_CUDA_MM_CUBLAS,
+    GGML_CUDA_MM_VEC_F,
+    GGML_CUDA_MM_VEC_F_TRANSPOSED,
+    GGML_CUDA_MM_F,
+    GGML_CUDA_MM_VEC_Q,
+    GGML_CUDA_MM_Q,
+};
 
-    const int32_t hint = ggml_get_op_params_i32(dst, 1);
-    if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
-        return;
-    }
+// the kernel ggml_cuda_mul_mat runs, unless the Hadamard hint applies
+static ggml_cuda_mm_path ggml_cuda_mul_mat_path(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, const int cc, const int warp_size) {
+    GGML_TENSOR_BINARY_OP_LOCALS
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
@@ -1827,46 +1836,179 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
     if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
-        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
-        return;
+        return GGML_CUDA_MM_CUBLAS;
     }
-
-    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
-    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
-        ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
-        return;
+        return GGML_CUDA_MM_VEC_F;
     }
     // A transposed vector can still use MMVQ (i.e. ne01 == 1)
     if (ne01 == 1 && ne11 > MMVF_MAX_BATCH_SIZE && ne2 == 1 && ne3 == 1
             && src0->type == GGML_TYPE_F32
             && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
             && ggml_cuda_should_use_mmvf(src1->type, cc, src1->ne, src1->nb, /*ne11 =*/ 1)) {
-        ggml_tensor dst_vec = *dst;
-        dst_vec.ne[0] = ne11;
-        dst_vec.ne[1] = 1;
-        dst_vec.nb[1] = dst_vec.nb[0]*ne11;
-        dst_vec.nb[2] = dst_vec.nb[1];
-        dst_vec.nb[3] = dst_vec.nb[1];
-        ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
-        return;
+        return GGML_CUDA_MM_VEC_F_TRANSPOSED;
     }
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
-        ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
-        return;
+        return GGML_CUDA_MM_F;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
-        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
-        return;
+        return GGML_CUDA_MM_VEC_Q;
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
-        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+        return GGML_CUDA_MM_Q;
+    }
+    return GGML_CUDA_MM_CUBLAS;
+}
+
+static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const int32_t hint = ggml_get_op_params_i32(dst, 1);
+    if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
         return;
     }
-    ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+
+    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+
+    switch (ggml_cuda_mul_mat_path(src0, src1, dst, cc, warp_size)) {
+        case GGML_CUDA_MM_CUBLAS:
+            ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+            break;
+        case GGML_CUDA_MM_VEC_F:
+            ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
+            break;
+        case GGML_CUDA_MM_VEC_F_TRANSPOSED: {
+            ggml_tensor dst_vec = *dst;
+            dst_vec.ne[0] = src1->ne[1];
+            dst_vec.ne[1] = 1;
+            dst_vec.nb[1] = dst_vec.nb[0]*src1->ne[1];
+            dst_vec.nb[2] = dst_vec.nb[1];
+            dst_vec.nb[3] = dst_vec.nb[1];
+            ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
+        } break;
+        case GGML_CUDA_MM_F:
+            ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
+            break;
+        case GGML_CUDA_MM_VEC_Q:
+            ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+            break;
+        case GGML_CUDA_MM_Q:
+            ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+            break;
+    }
+}
+
+// Q8_1 emission: an RHT node whose consumers all quantize it to the same Q8_1 layout writes that layout
+// itself, and the consumers skip their quantize_* launch (ggml_cuda_get_src1_fmt).
+
+// the RHT nodes writing Q8_1 in the graph being evaluated on this thread
+static thread_local std::unordered_map<const ggml_tensor *, ggml_cuda_src1_fmt> ggml_cuda_src1_fmts;
+
+static std::atomic<int64_t> ggml_cuda_rht_q8_1_count{0};
+
+ggml_cuda_src1_fmt ggml_cuda_get_src1_fmt(const ggml_tensor * t) {
+    const auto it = ggml_cuda_src1_fmts.find(t);
+    return it == ggml_cuda_src1_fmts.end() ? GGML_CUDA_SRC1_F32 : it->second;
+}
+
+// number of RHT launches that wrote Q8_1, for tests
+static int64_t ggml_backend_cuda_rht_q8_1_count(void) {
+    return ggml_cuda_rht_q8_1_count.load();
+}
+
+// the Q8_1 a MUL_MAT would quantize its src1 rht to, and the bytes it reads (tile overrun included); F32 if none
+static ggml_cuda_src1_fmt ggml_cuda_rht_consumer_fmt(
+        const ggml_tensor * mm, const ggml_tensor * rht, const int cc, const int warp_size, size_t & nbytes) {
+    if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != rht || mm->src[0] == rht || !ggml_is_quantized(mm->src[0]->type) ||
+            ggml_get_op_params_i32(mm, 1) != 0) {
+        return GGML_CUDA_SRC1_F32;
+    }
+
+    const ggml_tensor * src0 = mm->src[0];
+
+    const int64_t ne10_padded = GGML_PAD(rht->ne[0], MATRIX_ROW_PADDING);
+    const size_t  nbytes_q8_1 = rht->ne[3]*rht->ne[2]*rht->ne[1]*ne10_padded*sizeof(block_q8_1)/QK8_1;
+
+    switch (ggml_cuda_mul_mat_path(src0, rht, mm, cc, warp_size)) {
+        case GGML_CUDA_MM_VEC_Q:
+            nbytes = nbytes_q8_1;
+            return GGML_CUDA_SRC1_Q8_1;
+        case GGML_CUDA_MM_Q:
+            if (blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4)) {
+                return GGML_CUDA_SRC1_F32;
+            }
+            // ggml_cuda_mmq_get_J_max <= min(ne11, 512): the bound costs nothing, the exact value a search per consumer
+            nbytes = nbytes_q8_1 + std::min<int64_t>(rht->ne[1], 512)*sizeof(block_q8_1_mmq);
+            switch (mmq_get_q8_1_ds_layout(src0->type)) {
+                case MMQ_Q8_1_DS_LAYOUT_D4:  return GGML_CUDA_SRC1_Q8_1_MMQ_D4;
+                case MMQ_Q8_1_DS_LAYOUT_DS4: return GGML_CUDA_SRC1_Q8_1_MMQ_DS4;
+                default:                     return GGML_CUDA_SRC1_F32;
+            }
+        default:
+            return GGML_CUDA_SRC1_F32;
+    }
+}
+
+// Decided on the host from the graph alone, so a captured CUDA graph replays the same decision: a change
+// that alters it (batch size, consumers, flags) also changes the node properties and forces a new capture.
+static void ggml_cuda_rht_plan_q8_1(const ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph) {
+    static const bool disabled = (getenv("GGML_CUDA_DISABLE_FUSION") && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"))) ||
+                                 (getenv("GGML_CUDA_RHT_F32") && std::atoi(getenv("GGML_CUDA_RHT_F32")));
+
+    ggml_cuda_src1_fmts.clear();
+    if (disabled) {
+        return;
+    }
+
+    std::unordered_map<const ggml_tensor *, std::vector<const ggml_tensor *>> consumers;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        if (cgraph->nodes[i]->op == GGML_OP_RHT) {
+            consumers[cgraph->nodes[i]];
+        }
+    }
+    if (consumers.empty()) {
+        return;
+    }
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const auto it = consumers.find(cgraph->nodes[i]->src[j]);
+            if (it != consumers.end()) {
+                it->second.push_back(cgraph->nodes[i]);
+            }
+        }
+    }
+
+    const int cc        = ggml_cuda_info().devices[ctx->device].cc;
+    const int warp_size = ggml_cuda_info().devices[ctx->device].warp_size;
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_RHT || (node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            continue;
+        }
+        const std::vector<const ggml_tensor *> & cons = consumers[node];
+        if (cons.empty() || (int) cons.size() != ggml_node_get_use_count(cgraph, i)) {
+            continue;
+        }
+
+        ggml_cuda_src1_fmt fmt    = GGML_CUDA_SRC1_F32;
+        size_t             nbytes = 0;
+        for (const ggml_tensor * mm : cons) {
+            size_t nbytes_mm = 0;
+            const ggml_cuda_src1_fmt fmt_mm = ggml_cuda_rht_consumer_fmt(mm, node, cc, warp_size, nbytes_mm);
+            if (fmt_mm == GGML_CUDA_SRC1_F32 || (fmt != GGML_CUDA_SRC1_F32 && fmt_mm != fmt)) {
+                fmt = GGML_CUDA_SRC1_F32;
+                break;
+            }
+            fmt    = fmt_mm;
+            nbytes = std::max(nbytes, nbytes_mm);
+        }
+        if (fmt != GGML_CUDA_SRC1_F32 && nbytes <= ggml_nbytes(node) && ggml_cuda_rht_write_q8_1(node, fmt, (int) cons.size())) {
+            ggml_cuda_src1_fmts[node] = fmt;
+        }
+    }
 }
 
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
@@ -2405,6 +2547,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
+            break;
+        case GGML_OP_RHT:
+            if (ggml_cuda_get_src1_fmt(dst) != GGML_CUDA_SRC1_F32) {
+                ggml_cuda_rht_q8_1_count++;
+            }
+            ggml_cuda_op_rht(ctx, dst);
             break;
         default:
             return false;
@@ -4115,6 +4263,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            ggml_cuda_rht_plan_q8_1(cuda_ctx, cgraph);
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4196,6 +4346,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(node);
                }
             }
+
+            ggml_cuda_src1_fmts.clear();
         }
 
 #ifdef USE_CUDA_GRAPH
@@ -4959,7 +5111,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     }
                 }
 #endif // GGML_USE_MUSA
-                switch (ggml_get_base_type(a->type)) {
+                switch (a->type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
                     case GGML_TYPE_Q1_0:
@@ -5324,6 +5476,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
+        case GGML_OP_RHT:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[0]->nb[0] == sizeof(float) && ggml_rht_plan(op->ne[0], NULL, NULL);
 
         default:
             return false;
@@ -5486,6 +5641,17 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// for tests: the parts of the decision that depend on the device and on the RHT kernel choice
+static int ggml_backend_cuda_rht_consumer_fmt(ggml_backend_dev_t dev, const ggml_tensor * mm, const ggml_tensor * rht) {
+    const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
+    size_t nbytes = 0;
+    return ggml_cuda_rht_consumer_fmt(mm, rht, ggml_cuda_info().devices[device].cc, ggml_cuda_info().devices[device].warp_size, nbytes);
+}
+
+static bool ggml_backend_cuda_rht_write_q8_1(const ggml_tensor * rht, int fmt, int n_consumers) {
+    return ggml_cuda_rht_write_q8_1(rht, fmt, n_consumers);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -5505,6 +5671,15 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_cuda_rht_q8_1_count") == 0) {
+        return (void *)ggml_backend_cuda_rht_q8_1_count;
+    }
+    if (strcmp(name, "ggml_backend_cuda_rht_consumer_fmt") == 0) {
+        return (void *)ggml_backend_cuda_rht_consumer_fmt;
+    }
+    if (strcmp(name, "ggml_backend_cuda_rht_write_q8_1") == 0) {
+        return (void *)ggml_backend_cuda_rht_write_q8_1;
     }
     return nullptr;
 }
