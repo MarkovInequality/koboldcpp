@@ -3,11 +3,14 @@
 // usage: test-hadamard-quantize <workdir> <model-bf16.gguf>
 //
 // The source is pruned to two layers first, so each quantization takes a few seconds.
+// The imatrix checks set and unset LLAMA_HQ_GPTQ and LLAMA_HQ_GPTQ_DAMP.
 
 #include "llama.h"
+#include "llama-quant-gptq.h"
 #include "ggml.h"
 #include "gguf.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -17,6 +20,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 static int g_failed = 0;
@@ -64,6 +68,11 @@ struct gguf_file {
     ggml_tensor * t(const std::string & name) const { return ggml_get_tensor(ctx, name.c_str()); }
 
     bool has_key(const char * key) const { return gguf_find_key(g, key) >= 0; }
+
+    float f32(const char * key) const {
+        const int64_t k = gguf_find_key(g, key);
+        return k < 0 ? -1.0f : gguf_get_val_f32(g, k);
+    }
 
     uint64_t seed() const {
         const int64_t k = gguf_find_key(g, "hadamard.seed");
@@ -115,6 +124,71 @@ static bool files_identical(const std::string & a, const std::string & b) {
     if (fa) fclose(fa);
     if (fb) fclose(fb);
     return same;
+}
+
+static size_t log_count(const std::string & needle) {
+    size_t n = 0;
+    for (size_t pos = 0; (pos = g_log.find(needle, pos)) != std::string::npos; ++pos) n++;
+    return n;
+}
+
+static void set_env(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) setenv(name, value, 1); else unsetenv(name);
+#endif
+}
+
+// a synthetic imatrix entry per expert: a spread-out floor with two loud channels, as with massive activations
+static std::vector<float> synth_v(int64_t n, int64_t nexp, uint32_t salt) {
+    std::vector<float> v(n*nexp);
+    for (size_t j = 0; j < v.size(); ++j) v[j] = 0.1f + (float) (((j + salt)*2654435761u) % 1000)/100.0f;
+    for (int64_t e = 0; e < nexp; ++e) {
+        v[e*n + 3] = 2000.0f;
+        v[e*n + n/2 + 7*e + 1] = 2000.0f;
+    }
+    return v;
+}
+
+struct imatrix_set {
+    std::vector<std::string> names;
+    std::vector<std::vector<float>> vals;
+    std::vector<llama_model_imatrix_data> data;
+
+    void add(const std::string & name, std::vector<float> v) { names.push_back(name); vals.push_back(std::move(v)); }
+
+    const std::vector<float> & at(const std::string & name) const {
+        for (size_t i = 0; i < names.size(); ++i) if (names[i] == name) return vals[i];
+        static const std::vector<float> none;
+        return none;
+    }
+
+    const llama_model_imatrix_data * get() {
+        data.clear();
+        for (size_t i = 0; i < names.size(); ++i) data.push_back({ names[i].c_str(), vals[i].data(), vals[i].size() });
+        data.push_back({ nullptr, nullptr, 0 });
+        return data.data();
+    }
+};
+
+// the in-sample output error of rotated rows wq against w under H = R*diag(v)*R^T: sum |diag(sqrt(v)) R^T (w - wq)|^2 / sum |diag(sqrt(v)) R^T w|^2
+static double out_err(const std::vector<float> & w, const std::vector<float> & wq, int64_t n, const std::vector<float> & v, uint64_t seed) {
+    double num = 0, den = 0;
+    std::vector<double> d(n), a(n);
+    for (size_t r = 0; r*n < w.size(); ++r) {
+        for (int64_t k = 0; k < n; ++k) {
+            d[k] = (double) w[r*n + k] - wq[r*n + k];
+            a[k] = w[r*n + k];
+        }
+        ggml_rht_inv_f64(d.data(), n, seed);
+        ggml_rht_inv_f64(a.data(), n, seed);
+        for (int64_t k = 0; k < n; ++k) {
+            num += v[k]*d[k]*d[k];
+            den += v[k]*a[k]*a[k];
+        }
+    }
+    return num/den;
 }
 
 // R*w for every row of the first nrows rows
@@ -288,36 +362,83 @@ int main(int argc, char ** argv) {
         check(!c.has_key("hadamard.seed"), "no hadamard.seed without rotated tensors");
     }
 
-    printf("imatrix:\n");
+    printf("imatrix (GPTQ):\n");
+    set_env("LLAMA_HQ_GPTQ", nullptr);
+    set_env("LLAMA_HQ_GPTQ_DAMP", nullptr);
+    imatrix_set im_all, im_part;
+    for (int64_t i = 0; i < gguf_get_n_tensors(srcf.g); ++i) {
+        const ggml_tensor * t = srcf.t(gguf_get_tensor_name(srcf.g, i));
+        if (ggml_n_dims(t) < 2) continue;
+        std::vector<float> v = synth_v(t->ne[0], t->ne[2], (uint32_t) i);
+        if (!strstr(t->name, "attn_q.weight")) im_part.add(t->name, v);
+        im_all.add(t->name, std::move(v));
+    }
+    const std::string hq_im = path("hqq-hq-im.gguf");
     {
-        std::vector<std::string> names;
-        std::vector<std::vector<float>> vals;
-        for (int64_t i = 0; i < gguf_get_n_tensors(srcf.g); ++i) {
-            const ggml_tensor * t = srcf.t(gguf_get_tensor_name(srcf.g, i));
-            if (ggml_n_dims(t) < 2) continue;
-            names.push_back(t->name);
-            std::vector<float> v(t->ne[0]*t->ne[2]);
-            for (size_t j = 0; j < v.size(); ++j) v[j] = 0.1f + (float) ((j*2654435761u) % 1000)/100.0f;
-            vals.push_back(v);
-        }
-        std::vector<llama_model_imatrix_data> im;
-        for (size_t i = 0; i < names.size(); ++i) {
-            im.push_back({ names[i].c_str(), vals[i].data(), vals[i].size() });
-        }
-        im.push_back({ nullptr, nullptr, 0 });
-
-        const std::string hq_im = path("hqq-hq-im.gguf");
-        quantize(src, hq_im, LLAMA_FTYPE_MOSTLY_Q4_K_M, [&](auto & p) { p.hadamard = true; p.imatrix = im.data(); });
-        size_t n_warn = 0;
-        for (size_t pos = 0; (pos = g_log.find("the imatrix is ignored", pos)) != std::string::npos; ++pos) n_warn++;
+        quantize(src, hq_im, LLAMA_FTYPE_MOSTLY_Q4_K_M, [&](auto & p) { p.hadamard = true; p.imatrix = im_all.get(); });
         gguf_file a(hq), b(hq_im);
-        bool same = true;
+        size_t n_hq = 0;
+        bool all_differ = true;
         for (int64_t i = 0; i < gguf_get_n_tensors(a.g); ++i) {
             const ggml_tensor * ta = a.t(gguf_get_tensor_name(a.g, i));
-            if (ggml_is_rotated(ta->type)) same &= same_bytes(ta, b.t(ta->name));
+            if (!ggml_is_rotated(ta->type)) continue;
+            n_hq++;
+            all_differ &= !same_bytes(ta, b.t(ta->name)) && b.t(ta->name)->type == ta->type;
         }
-        check(n_warn == 1, "--imatrix with --hadamard warns once");
-        check(same, "HQ tensors are byte-identical with and without an imatrix");
+        check(all_differ && n_hq > 0, "the imatrix is used (LLAMA_HQ_GPTQ unset): every HQ tensor differs from the uniform one");
+        check(log_count("use the imatrix through GPTQ") == 1 && g_log.find(std::to_string(n_hq) + " HQ tensors use the imatrix through GPTQ (damp 0.01)") != std::string::npos &&
+              log_count("(gptq)") == n_hq, "one info line with the count, and each GPTQ tensor's line says (gptq)");
+        check(b.f32("quantize.hq.gptq_damp") == 0.01f && !a.has_key("quantize.hq.gptq_damp"), "quantize.hq.gptq_damp is written only when GPTQ ran");
+
+        const std::string hq_part = path("hqq-hq-im-part.gguf");
+        quantize(src, hq_part, LLAMA_FTYPE_MOSTLY_Q4_K_M, [&](auto & p) { p.hadamard = true; p.imatrix = im_part.get(); });
+        gguf_file c(hq_part);
+        bool part_ok = true;
+        for (int64_t i = 0; i < gguf_get_n_tensors(a.g); ++i) {
+            const ggml_tensor * ta = a.t(gguf_get_tensor_name(a.g, i));
+            if (!ggml_is_rotated(ta->type)) continue;
+            part_ok &= strstr(ta->name, "attn_q.weight") ? same_bytes(ta, c.t(ta->name)) : same_bytes(b.t(ta->name), c.t(ta->name));
+        }
+        check(part_ok && log_count("2 HQ tensors have no usable imatrix entry") == 1,
+              "tensors without an entry are byte-identical to the uniform ones, with one warning");
+
+        const std::string hq_1t = path("hqq-hq-im-1t.gguf");
+        quantize(src, hq_1t, LLAMA_FTYPE_MOSTLY_Q4_K_M, [&](auto & p) { p.hadamard = true; p.imatrix = im_all.get(); p.nthread = 1; });
+        check(files_identical(hq_im, hq_1t), "the same seed and imatrix give identical files at 1 and 8 threads");
+
+        set_env("LLAMA_HQ_GPTQ", "0");
+        const std::string hq_off = path("hqq-hq-im-off.gguf");
+        quantize(src, hq_off, LLAMA_FTYPE_MOSTLY_Q4_K_M, [&](auto & p) { p.hadamard = true; p.imatrix = im_all.get(); });
+        set_env("LLAMA_HQ_GPTQ", nullptr);
+        gguf_file d(hq_off);
+        bool off_same = true;
+        for (int64_t i = 0; i < gguf_get_n_tensors(a.g); ++i) {
+            const ggml_tensor * ta = a.t(gguf_get_tensor_name(a.g, i));
+            if (ggml_is_rotated(ta->type)) off_same &= same_bytes(ta, d.t(ta->name));
+        }
+        check(off_same && log_count("the imatrix is ignored") == 1 && log_count("(gptq)") == 0 && !d.has_key("quantize.hq.gptq_damp"),
+              "LLAMA_HQ_GPTQ=0: the uniform bytes, one imatrix-ignored warning, no damp key");
+
+        set_env("LLAMA_HQ_GPTQ_DAMP", "0.0001");
+        check(quantize(src, path("hqq-bad.gguf"), LLAMA_FTYPE_MOSTLY_Q4_K_M, [&](auto & p) { p.hadamard = true; p.imatrix = im_all.get(); }) != 0 &&
+              g_log.find("LLAMA_HQ_GPTQ_DAMP") != std::string::npos, "LLAMA_HQ_GPTQ_DAMP=0.0001 is refused");
+        set_env("LLAMA_HQ_GPTQ_DAMP", "0.1");
+        const std::string hq_d = path("hqq-hq-im-damp.gguf");
+        quantize(src, hq_d, LLAMA_FTYPE_MOSTLY_Q4_K_M, [&](auto & p) { p.hadamard = true; p.imatrix = im_all.get(); });
+        set_env("LLAMA_HQ_GPTQ_DAMP", nullptr);
+        gguf_file e(hq_d);
+        check(e.f32("quantize.hq.gptq_damp") == 0.1f && !same_bytes(e.t(q), b.t(q)), "LLAMA_HQ_GPTQ_DAMP=0.1 is used and recorded");
+
+        const std::string hq_copy = path("hqq-hq-im-copy.gguf");
+        quantize(hq_im, hq_copy, LLAMA_FTYPE_MOSTLY_Q4_K_M, [&](auto & p) { p.hadamard = true; p.imatrix = im_all.get(); });
+        gguf_file f(hq_copy);
+        bool copies = true;
+        for (int64_t i = 0; i < gguf_get_n_tensors(b.g); ++i) {
+            const ggml_tensor * tb = b.t(gguf_get_tensor_name(b.g, i));
+            copies &= same_bytes(tb, f.t(tb->name));
+        }
+        check(copies && log_count("(gptq)") == 0, "HQ -> the same HQ type with an imatrix stays a byte copy");
+        check(f.f32("quantize.hq.gptq_damp") == 0.01f, "... and keeps the source's quantize.hq.gptq_damp");
 
         const std::string iq = path("hqq-hq-iq2xxs.gguf");
         check(quantize(src, iq, LLAMA_FTYPE_MOSTLY_IQ2_XXS, [](auto & p) { p.hadamard = true; }) == 0,
@@ -394,6 +515,19 @@ int main(int argc, char ** argv) {
         printf("  (nmse HQ4_XS vs HQ5_K: %.4g)\n", err);
         check(c.t(q)->type == GGML_TYPE_HQ4_XS && err < 0.02 && c.seed() == a.seed(), "... is not re-rotated and keeps the seed");
 
+        const std::string h4g = path("hqq-h5-hq4xs-gptq.gguf");
+        quantize(h5, h4g, LLAMA_FTYPE_MOSTLY_IQ4_XS, [&](auto & p) { p.hadamard = true; p.pure = true; p.imatrix = im_all.get(); });
+        gguf_file g(h4g);
+        const int64_t nrq = srcf.t(q)->ne[1];
+        const std::vector<float> w5all = to_f32(a.t(q), 0, nrq*n_embd);
+        const double e_u = out_err(w5all, to_f32(c.t(q), 0, nrq*n_embd), n_embd, im_all.at(q), a.seed());
+        const double e_g = out_err(w5all, to_f32(g.t(q), 0, nrq*n_embd), n_embd, im_all.at(q), a.seed());
+        int n_seed_keys = 0;
+        for (int64_t i = 0; i < gguf_get_n_kv(g.g); ++i) n_seed_keys += strcmp(gguf_get_key(g.g, i), "hadamard.seed") == 0;
+        printf("  (attn_q output error, HQ5_K -> HQ4_XS: uniform %.4g, GPTQ %.4g)\n", e_u, e_g);
+        check(g.t(q)->type == GGML_TYPE_HQ4_XS && log_count("(gptq)") > 0 && e_g < 0.7*e_u && g.seed() == a.seed() && n_seed_keys == 1,
+              "HQ5_K -> HQ4_XS with an imatrix: GPTQ in the inherited seed's space beats uniform; one seed");
+
         const std::string part = path("hqq-part.gguf"), part2 = path("hqq-part-req.gguf");
         const llama_model_tensor_override only_down[2] = { { "ffn_down", GGML_TYPE_HQ4_K }, { nullptr, GGML_TYPE_COUNT } };
         quantize(src, part, LLAMA_FTYPE_MOSTLY_Q4_K_M, [&](auto & p) {
@@ -458,6 +592,17 @@ int main(int argc, char ** argv) {
         printf("  (nmse HQ source + R*D: %.4g)\n", e2);
         check(e2 < 0.01, "HQ source: the delta is rotated with the file's seed, then added");
 
+        const std::string mim = path("hqq-merge-hq-im.gguf");
+        const int rc_im = quantize(src, mim, LLAMA_FTYPE_MOSTLY_Q4_K_M, [&](auto & p) {
+            p.loras = loras.data(); p.hadamard = true; p.pure = true; p.imatrix = im_all.get(); });
+        gguf_file gi(mim);
+        const int64_t nrq = srcf.t(q)->ne[1];
+        const std::vector<float> want = rotate_rows(add(to_f32(srcf.t(q), 0, nrq*n_embd), lora_delta(lora, q, n_embd, nrq, 0.5f)), n_embd, gi.seed());
+        const double eu = out_err(want, to_f32(g.t(q), 0, nrq*n_embd), n_embd, im_all.at(q), g.seed());
+        const double eg = out_err(want, to_f32(gi.t(q), 0, nrq*n_embd), n_embd, im_all.at(q), gi.seed());
+        printf("  (attn_q output error vs R(W+D): uniform %.4g, GPTQ %.4g)\n", eu, eg);
+        check(rc_im == 0 && log_count("(gptq)") > 0 && eg < 0.7*eu, "--lora with an imatrix: merged, then GPTQ");
+
         std::vector<llama_model_quantize_lora> l2;
         const std::string bad_arch = path("hqq-lora-arch.gguf"), bad_alora = path("hqq-lora-alora.gguf"), bad_name = path("hqq-lora-name.gguf");
         make_lora(srcf, bad_arch, { q }, "llama");
@@ -468,6 +613,75 @@ int main(int argc, char ** argv) {
             l2 = { { p.c_str(), 1.0f }, { nullptr, 0.0f } };
             check(quantize(src, path("hqq-bad.gguf"), LLAMA_FTYPE_MOSTLY_Q4_K_M, [&](auto & pp) { pp.loras = l2.data(); }) != 0,
                   "refuses " + what);
+        }
+    }
+
+    printf("3D experts:\n");
+    {
+        const std::string syn3 = path("hqq-exps.gguf"), o3 = path("hqq-exps-q.gguf");
+        const std::string en = "blk.0.ffn_down_exps.weight";
+        const int64_t nr = 64, nexp = 2;
+        {
+            gguf_context * out = gguf_init_empty();
+            gguf_set_kv(out, srcf.g);
+            ggml_context * ctx = ggml_init({ (size_t) n_embd*nr*nexp*sizeof(float) + 1024*1024, nullptr, false });
+            for (int64_t i = 0; i < gguf_get_n_tensors(srcf.g); ++i) {
+                gguf_add_tensor(out, srcf.t(gguf_get_tensor_name(srcf.g, i)));
+            }
+            ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, nr, nexp);
+            ggml_set_name(w, en.c_str());
+            uint32_t state = 11;
+            for (int64_t j = 0; j < ggml_nelements(w); ++j) {
+                state = state*1664525u + 1013904223u;
+                ((float *) w->data)[j] = 0.02f*(((state >> 8) & 0xffff)/32768.0f - 1.0f);
+            }
+            gguf_add_tensor(out, w);
+            gguf_write_to_file(out, syn3.c_str(), false);
+            gguf_free(out);
+            ggml_free(ctx);
+        }
+        imatrix_set im3;
+        im3.add(en, synth_v(n_embd, nexp, 5));
+        const int rc = quantize(syn3, o3, LLAMA_FTYPE_MOSTLY_Q4_K_M, [&](auto & p) { p.hadamard = true; p.pure = true; p.imatrix = im3.get(); });
+        gguf_file in(syn3), f(o3);
+        const ggml_tensor * t = rc == 0 ? f.t(en) : nullptr;
+        check(t && t->type == GGML_TYPE_HQ4_K && log_count("1 HQ tensors use the imatrix through GPTQ") == 1, "a two-expert 3D tensor is quantized with GPTQ");
+        if (t) {
+            std::vector<std::thread> workers;
+            const size_t rs = ggml_row_size(GGML_TYPE_HQ4_K, n_embd);
+            bool ok = true, other_differs = true;
+            for (int64_t e = 0; e < nexp; ++e) {
+                const float * src_e = (const float *) in.t(en)->data + e*nr*n_embd;
+                auto encode = [&](int64_t ev) {
+                    std::vector<float> rows = rotate_rows(std::vector<float>(src_e, src_e + nr*n_embd), n_embd, f.seed());
+                    std::vector<float> U;
+                    llama_gptq_factor(im3.at(en).data() + ev*n_embd, n_embd, f.seed(), LLAMA_GPTQ_DAMP_DEFAULT, U, workers, 8);
+                    std::vector<uint8_t> qb(nr*rs);
+                    llama_tensor_quantize_gptq(GGML_TYPE_HQ4_K, rows.data(), qb.data(), nr, n_embd, U.data(), workers, 8);
+                    return qb;
+                };
+                const uint8_t * got = (const uint8_t *) t->data + e*nr*rs;
+                ok            &= memcmp(got, encode(e).data(), nr*rs) == 0;
+                other_differs &= memcmp(got, encode(1 - e).data(), nr*rs) != 0;
+            }
+            check(ok, "each expert equals its slice quantized alone with its own imatrix slice");
+            check(other_differs, "... and differs from using the other expert's slice");
+
+            imatrix_set im3z;
+            std::vector<float> vz = im3.at(en);
+            std::fill(vz.begin() + n_embd, vz.end(), 0.0f);
+            im3z.add(en, vz);
+            const std::string o3z = path("hqq-exps-qz.gguf");
+            quantize(syn3, o3z, LLAMA_FTYPE_MOSTLY_Q4_K_M, [&](auto & p) { p.hadamard = true; p.pure = true; p.imatrix = im3z.get(); });
+            gguf_file fz(o3z);
+            const float * src_1 = (const float *) in.t(en)->data + nr*n_embd;
+            std::vector<float> rows1 = rotate_rows(std::vector<float>(src_1, src_1 + nr*n_embd), n_embd, fz.seed());
+            std::vector<uint8_t> u1(nr*rs);
+            ggml_quantize_chunk(GGML_TYPE_HQ4_K, rows1.data(), u1.data(), 0, nr, n_embd, nullptr);
+            const uint8_t * gz = (const uint8_t *) fz.t(en)->data;
+            check(memcmp(gz, t->data, nr*rs) == 0 && memcmp(gz + nr*rs, u1.data(), nr*rs) == 0 &&
+                  log_count("1 experts of GPTQ tensors have an all-zero imatrix slice") == 1,
+                  "an expert with an all-zero imatrix slice gets the uniform bytes, with a warning");
         }
     }
 

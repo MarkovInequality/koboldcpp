@@ -2924,6 +2924,17 @@ extern "C" {
                    int64_t   n_per_row,
                const float * imatrix);
 
+    // HQ types: GPTQ error feedback on nrows rotated rows, which it modifies.
+    // U is the packed upper Cholesky factor of H^-1: row j holds U[j][j..n_per_row-1] at offset j*n - j*(j-1)/2.
+    // The output doesn't depend on how the rows are grouped into calls.
+    GGML_API size_t ggml_quantize_rows_gptq(
+            enum ggml_type   type,
+                     float * rows,
+                      void * dst,
+                   int64_t   nrows,
+                   int64_t   n_per_row,
+               const float * U);
+
     //
     // randomized Hadamard transform (RHT): R = (1/sqrt(n)) * (H_K (x) H_P) * diag(s), n = K*P
     //
@@ -2936,6 +2947,9 @@ extern "C" {
     GGML_API uint64_t ggml_rht_sign_word(uint64_t seed, int64_t n, int64_t k);
     // x = R*x for one row, in place
     GGML_API void     ggml_rht_ref(float * x, int64_t n, uint64_t seed);
+    // the same R in fp64, and its inverse R^T
+    GGML_API void     ggml_rht_ref_f64(double * x, int64_t n, uint64_t seed);
+    GGML_API void     ggml_rht_inv_f64(double * x, int64_t n, uint64_t seed);
 
 #ifdef __cplusplus
     // restrict not standard in C++

@@ -2,6 +2,7 @@
 #include "llama-model.h"
 #include "llama-model-loader.h"
 #include "llama-ext.h"
+#include "llama-quant-gptq.h"
 #include "llama.h"
 
 #include <algorithm>
@@ -9,6 +10,7 @@
 #include <set>
 #include <cmath>
 #include <cstring>
+#include <chrono>
 #include <cinttypes>
 #include <fstream>
 #include <mutex>
@@ -209,6 +211,7 @@ struct tensor_metadata {
     std::string     remapped_imatrix_name;
     bool            allows_quantization;
     bool            requires_imatrix;
+    bool            use_gptq = false;
 };
 
 //
@@ -880,25 +883,6 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
 
 static const uint64_t LLAMA_HADAMARD_SEED_DEFAULT = 0x48512d524854ull;
 
-// runs fn(r) for r in [0, nrows) across the workers
-template <typename F>
-static void llama_parallel_rows(int64_t nrows, std::vector<std::thread> & workers, int nthread, F && fn) {
-    std::atomic<int64_t> next { 0 };
-    auto run = [&]() {
-        for (int64_t r; (r = next++) < nrows; ) {
-            fn(r);
-        }
-    };
-    for (int t = 0; t < std::min<int64_t>(nthread, nrows) - 1; ++t) {
-        workers.emplace_back(run);
-    }
-    run();
-    for (auto & w : workers) {
-        w.join();
-    }
-    workers.clear();
-}
-
 // Delta = scale * L * Rm for one model tensor, per expert: L is [nrows, rank], Rm is [rank, n_per_row]
 struct llama_quant_lora_delta {
     int64_t rank  = 0;
@@ -1138,6 +1122,18 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         }
     }
 
+    // GPTQ for the HQ types with an imatrix: on unless LLAMA_HQ_GPTQ=0; LLAMA_HQ_GPTQ_DAMP for experiments
+    const char * gptq_env = getenv("LLAMA_HQ_GPTQ");
+    const bool   hq_gptq  = !(gptq_env && strcmp(gptq_env, "0") == 0);
+    float gptq_damp = LLAMA_GPTQ_DAMP_DEFAULT;
+    if (const char * damp_env = getenv("LLAMA_HQ_GPTQ_DAMP")) {
+        char * end = nullptr;
+        gptq_damp = strtof(damp_env, &end);
+        if (end == damp_env || *end != '\0' || !std::isfinite(gptq_damp) || !(gptq_damp >= LLAMA_GPTQ_DAMP_MIN)) {
+            throw std::runtime_error(format("LLAMA_HQ_GPTQ_DAMP=%s: needs a number of at least %g", damp_env, LLAMA_GPTQ_DAMP_MIN));
+        }
+    }
+
     // a file holds one seed, so tensors that are already rotated fix it for the whole output
     bool src_rotated = false;
     for (const auto & it : ml.weights_map) {
@@ -1251,7 +1247,13 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     bool will_require_imatrix = false;
     size_t n_rotated_out      = 0;
     size_t n_imatrix_ignored  = 0;
+    size_t n_gptq             = 0;
+    size_t n_gptq_missing     = 0;
+    size_t n_gptq_zero_slices = 0;
+    size_t n_hq_copied        = 0;
     std::set<int64_t> unsupported_widths;
+
+    const size_t max_buf_size = params->max_buf_size ? params->max_buf_size : LLAMA_QUANT_MAX_BUF_SIZE;
 
     //
     // preliminary iteration over all weights
@@ -1305,8 +1307,36 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         }
         if (ggml_is_rotated(metadata[i].target_type)) {
             n_rotated_out++;
-            if (imatrix_data && imatrix_data->count(remap_imatrix(tensor->name, mapped))) {
-                n_imatrix_ignored++;
+            const bool quantized = tensor->type != metadata[i].target_type || lora_deltas.count(orig_names.at(it));
+            n_hq_copied += !quantized;
+            if (imatrix_data && quantized) {
+                const auto im = imatrix_data->find(remap_imatrix(tensor->name, mapped));
+                const int64_t n = tensor->ne[0];
+                if (!hq_gptq) {
+                    n_imatrix_ignored += im != imatrix_data->end();
+                } else if (im != imatrix_data->end() && im->second.size() != (size_t) (n*tensor->ne[2])) {
+                    // the main loop refuses a wrong-size entry, as for every type
+                } else if (im != imatrix_data->end()) {
+                    // usable if some expert's slice isn't all zero and a factor fits in the cap
+                    size_t n_zero = 0;
+                    std::vector<float> vbar;
+                    for (int64_t e = 0; e < tensor->ne[2]; ++e) {
+                        n_zero += !llama_gptq_normalize(im->second.data() + e*n, n, vbar);
+                    }
+                    bool usable = n_zero < (size_t) tensor->ne[2];
+                    if (usable && llama_gptq_build_bytes(n) > max_buf_size) {
+                        LLAMA_LOG_WARN("%s: WARNING: %s: the GPTQ factor for width %" PRId64 " needs %.1f GiB, more than "
+                                       "--max-buffer-size - it uses uniform weights\n", __func__, tensor->name, n,
+                                       llama_gptq_build_bytes(n)/1024.0/1024.0/1024.0);
+                        usable = false;
+                    }
+                    metadata[i].use_gptq = usable;
+                    n_gptq             += usable;
+                    n_gptq_missing     += !usable;
+                    n_gptq_zero_slices += usable ? n_zero : 0;
+                } else {
+                    n_gptq_missing++;
+                }
             }
         }
 
@@ -1333,8 +1363,22 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         LLAMA_LOG_WARN("%s: WARNING: --hadamard had no effect - none of the selected types has an HQ variant\n", __func__);
     }
     if (n_imatrix_ignored > 0) {
-        LLAMA_LOG_WARN("%s: WARNING: the imatrix is ignored for the %zu Hadamard-rotated (HQ) tensors - the HQ "
-                       "quantizers use uniform weights\n", __func__, n_imatrix_ignored);
+        LLAMA_LOG_WARN("%s: WARNING: the imatrix is ignored for the %zu Hadamard-rotated (HQ) tensors (LLAMA_HQ_GPTQ=0) - "
+                       "they use uniform weights\n", __func__, n_imatrix_ignored);
+    }
+    // a source's key still describes the HQ tensors copied from it
+    if (n_gptq > 0) {
+        LLAMA_LOG_INFO("%s: %zu HQ tensors use the imatrix through GPTQ (damp %g)\n", __func__, n_gptq, gptq_damp);
+        gguf_set_val_f32(ctx_outs[0].get(), "quantize.hq.gptq_damp", gptq_damp);
+    } else if (n_hq_copied == 0) {
+        gguf_remove_key(ctx_outs[0].get(), "quantize.hq.gptq_damp");
+    }
+    if (n_gptq_missing > 0) {
+        LLAMA_LOG_WARN("%s: WARNING: %zu HQ tensors have no usable imatrix entry - they use uniform weights\n", __func__, n_gptq_missing);
+    }
+    if (n_gptq_zero_slices > 0) {
+        LLAMA_LOG_WARN("%s: WARNING: %zu experts of GPTQ tensors have an all-zero imatrix slice - they use uniform weights\n",
+                       __func__, n_gptq_zero_slices);
     }
 
     if (n_rotated_out > 0) {
@@ -1385,7 +1429,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     std::vector<no_init<uint8_t>> work;
     std::vector<no_init<float>> f32_conv_buf;
 
-    const size_t max_buf_size = params->max_buf_size ? params->max_buf_size : LLAMA_QUANT_MAX_BUF_SIZE;
+    llama_gptq_cache gptq_cache(max_buf_size);
 
     int cur_split = -1;
     std::ofstream fout;
@@ -1501,7 +1545,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 }
             } else {
                 const float * imatrix = nullptr;
-                if (imatrix_data && !ggml_is_rotated(new_type)) {
+                if (imatrix_data && (!ggml_is_rotated(new_type) || hq_gptq)) {
                     auto it = imatrix_data->find(tm.remapped_imatrix_name);
                     if (it == imatrix_data->end()) {
                         LLAMA_LOG_INFO("\n====== %s: did not find weights for %s\n", __func__, tensor->name);
@@ -1535,8 +1579,9 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     throw std::runtime_error(format("requantizing from type %s is disabled", ggml_type_name(tensor->type)));
                 }
 
-                LLAMA_LOG_INFO("converting to %s .. ", ggml_type_name(new_type));
+                LLAMA_LOG_INFO("converting to %s%s .. ", ggml_type_name(new_type), tm.use_gptq ? " (gptq)" : "");
                 fflush(stdout);
+                double t_factor = 0, t_encode = 0;
 
                 const int64_t n_per_row = tensor->ne[0];
                 const int64_t nrows = tensor->ne[1];
@@ -1557,6 +1602,19 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 new_size = 0;
                 for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
                     const float * imatrix_03 = imatrix ? imatrix + i03 * n_per_row : nullptr;
+
+                    // one factor per expert; an all-zero slice keeps uniform weights
+                    const float * gptq_U = nullptr;
+                    if (tm.use_gptq && imatrix_03) {
+                        GGML_ASSERT(f32_copy);
+                        const auto t0 = std::chrono::steady_clock::now();
+                        llama_gptq_cache::status st;
+                        gptq_U = gptq_cache.get(imatrix_03, n_per_row, hadamard_seed, gptq_damp, workers, nthread, &st);
+                        t_factor += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                        if (st == llama_gptq_cache::FAILED) {
+                            LLAMA_LOG_WARN("\n%s: WARNING: %s: the GPTQ factorization failed - uniform weights\n", __func__, tensor->name);
+                        }
+                    }
 
                     for (int64_t ir = 0; ir < nrows; ir += nrows_slab) {
                         const int64_t nrows_cur = std::min(nrows_slab, nrows - ir);
@@ -1595,11 +1653,24 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                         const int64_t nchunk = (nelements_cur + chunk_size - 1)/chunk_size;
                         const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
 
-                        const size_t size_cur = llama_tensor_quantize_impl(new_type, f32_data, work.data(), chunk_size, nrows_cur, n_per_row, imatrix_03, workers, nthread_use);
+                        size_t size_cur;
+                        if (gptq_U) {
+                            const auto t0 = std::chrono::steady_clock::now();
+                            if (!llama_tensor_quantize_gptq(new_type, (float *) f32_data, work.data(), nrows_cur, n_per_row, gptq_U, workers, nthread)) {
+                                throw std::runtime_error("quantized data validation failed");
+                            }
+                            size_cur = nrows_cur*row_size_dst;
+                            t_encode += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                        } else {
+                            size_cur = llama_tensor_quantize_impl(new_type, f32_data, work.data(), chunk_size, nrows_cur, n_per_row, imatrix_03, workers, nthread_use);
+                        }
 
                         fout.write((const char *) work.data(), size_cur);
                         new_size += size_cur;
                     }
+                }
+                if (tm.use_gptq) {
+                    LLAMA_LOG_INFO("factor %.1f s, encode %.1f s, ", t_factor, t_encode);
                 }
                 LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB\n", tensor_size/1024.0/1024.0, new_size/1024.0/1024.0);
             }

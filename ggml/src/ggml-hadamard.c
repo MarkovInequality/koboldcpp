@@ -266,3 +266,90 @@ void ggml_rht_ref(float * x, int64_t n, uint64_t seed) {
     ggml_rht_stage_chunks(x, n, seed, P, 0, K);
     ggml_rht_stage_mix(x, n, K, P, ggml_rht_matrix_f32(K), 0, P);
 }
+
+// ====================== fp64: the same R, and R^T
+
+static void ggml_rht_signs_f64(double * x, int64_t n, uint64_t seed) {
+    for (int64_t i = 0; i < n; i += 64) {
+        const uint64_t w = ggml_rht_sign_word_impl(seed, n, i >> 6);
+        for (int64_t b = 0; b < MIN(64, n - i); ++b) {
+            if ((w >> b) & 1) {
+                x[i + b] = -x[i + b];
+            }
+        }
+    }
+}
+
+static void ggml_rht_fwht_f64(double * u, int64_t P) {
+    for (int64_t h = 1; h < P; h <<= 1) {
+        for (int64_t i = 0; i < P; i += 2*h) {
+            for (int64_t k = i; k < i + h; ++k) {
+                const double a = u[k];
+                const double b = u[k + h];
+                u[k]     = a + b;
+                u[k + h] = a - b;
+            }
+        }
+    }
+}
+
+#define GGML_RHT_MIX_TILE_F64 16
+
+// x[co*P + j] = scale * sum_c H[co][c] * x[c*P + j], or with H^T
+static void ggml_rht_mix_f64(double * x, int64_t n, int K, int64_t P, bool transpose) {
+    const double scale = 1.0/sqrt((double) n);
+
+    if (K == 1) {
+        for (int64_t j = 0; j < n; ++j) {
+            x[j] *= scale;
+        }
+        return;
+    }
+
+    const float * H = ggml_rht_matrix_f32(K);
+    double tile[GGML_RHT_K_MAX*GGML_RHT_MIX_TILE_F64];
+
+    for (int64_t j = 0; j < P; j += GGML_RHT_MIX_TILE_F64) {
+        const int64_t w = MIN(GGML_RHT_MIX_TILE_F64, P - j);
+        for (int c = 0; c < K; ++c) {
+            memcpy(tile + c*GGML_RHT_MIX_TILE_F64, x + c*P + j, w*sizeof(double));
+        }
+        for (int co = 0; co < K; ++co) {
+            double acc[GGML_RHT_MIX_TILE_F64] = { 0.0 };
+            for (int c = 0; c < K; ++c) {
+                const double   hc = transpose ? H[(size_t) c*K + co] : H[(size_t) co*K + c];
+                const double * t  = tile + c*GGML_RHT_MIX_TILE_F64;
+                for (int64_t k = 0; k < w; ++k) {
+                    acc[k] += hc*t[k];
+                }
+            }
+            for (int64_t k = 0; k < w; ++k) {
+                x[co*P + j + k] = acc[k]*scale;
+            }
+        }
+    }
+}
+
+void ggml_rht_ref_f64(double * x, int64_t n, uint64_t seed) {
+    int     K;
+    int64_t P;
+    GGML_ASSERT(ggml_rht_plan(n, &K, &P));
+
+    ggml_rht_signs_f64(x, n, seed);
+    for (int c = 0; c < K; ++c) {
+        ggml_rht_fwht_f64(x + c*P, P);
+    }
+    ggml_rht_mix_f64(x, n, K, P, false);
+}
+
+void ggml_rht_inv_f64(double * x, int64_t n, uint64_t seed) {
+    int     K;
+    int64_t P;
+    GGML_ASSERT(ggml_rht_plan(n, &K, &P));
+
+    ggml_rht_mix_f64(x, n, K, P, true);
+    for (int c = 0; c < K; ++c) {
+        ggml_rht_fwht_f64(x + c*P, P);
+    }
+    ggml_rht_signs_f64(x, n, seed);
+}

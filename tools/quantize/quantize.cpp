@@ -134,11 +134,11 @@ static void usage(const char * executable) {
     printf("  --pure\n");
     printf("                                      disable k-quant mixtures and quantize all tensors to the same type\n");
     printf("  --hadamard\n");
-    printf("                                      rotate each weight row by a randomized Hadamard transform over the full row\n");
-    printf("                                      and quantize with nearest-neighbour rounding: every chosen Q4_K, Q5_K, IQ2_XXS,\n");
-    printf("                                      IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL or IQ4_XS tensor becomes its HQ variant\n");
-    printf("                                      (hq4_K, ..., hq4_xs); HQ tensors ignore --imatrix. For specific tensors use\n");
-    printf("                                      e.g. --tensor-type ffn_down=hq4_K instead\n");
+    printf("                                      rotate each weight row by a randomized Hadamard transform over the full row:\n");
+    printf("                                      every chosen Q4_K, Q5_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL or\n");
+    printf("                                      IQ4_XS tensor becomes its HQ variant (hq4_K, ..., hq4_xs). With --imatrix, HQ\n");
+    printf("                                      tensors are quantized with GPTQ error feedback, otherwise with nearest-\n");
+    printf("                                      neighbour rounding. For specific tensors use e.g. --tensor-type ffn_down=hq4_K\n");
     printf("  --hadamard-seed N\n");
     printf("                                      seed of the rotation's random signs (default: fixed); a source that already\n");
     printf("                                      has rotated tensors keeps its own seed\n");

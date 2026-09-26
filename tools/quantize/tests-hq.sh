@@ -6,14 +6,15 @@
 # example: tests-hq.sh . models/Qwen3-0.6B-BF16.gguf wikitext-2-raw/wiki.test.raw /tmp/hq
 #
 # Needs the make targets quantize_gguf main test-hadamard test-hadamard-quants test-hadamard-quantize
-# test-hadamard-llama test-hadamard-ppl. With a CUDA build (make LLAMA_CUBLAS=1 maincuda
+# test-hadamard-llama test-hadamard-ppl test-hq-gptq. With a CUDA build (make LLAMA_CUBLAS=1 maincuda
 # test-hadamard-ppl-cuda) set CUDA=1 to run the generation, quality and CUDA-graph steps on the GPU.
 # BIN=<dir> takes the binaries from another directory than the repo root.
+# IMATRIX=<imatrix.gguf> (from upstream llama-imatrix) adds the GPTQ checks for --hadamard --imatrix.
 
 set -eu
 
 if [ $# -lt 3 ]; then
-    sed -n '3,11p' "$0"
+    sed -n '3,12p' "$0"
     exit 1
 fi
 
@@ -68,6 +69,7 @@ echo "== unit tests"
 "$BIN"/test-hadamard > "$WORK"/unit.log
 "$BIN"/test-hadamard-quants >> "$WORK"/unit.log
 "$BIN"/test-hadamard-quantize "$WORK" "$SRC" >> "$WORK"/unit.log 2>&1
+"$BIN"/test-hq-gptq >> "$WORK"/unit.log
 "$QUANTIZE" --pure "$SRC" "$WORK"/pure-q4k.gguf Q4_K > /dev/null 2>&1
 "$QUANTIZE" --pure "$SRC" "$WORK"/pure-iq4nl.gguf IQ4_NL > /dev/null 2>&1
 "$BIN"/test-hadamard-llama "$WORK" "$WORK"/pure-q4k.gguf "$WORK"/pure-iq4nl.gguf >> "$WORK"/unit.log 2>&1
@@ -97,6 +99,36 @@ K_SUM=$(awk -v a="$(field "$T" pure-hq5k.gguf 5)" -v b="$(field "$T" pure-hq4xs.
 K_REQ=$(field "$T" req-hq4xs.gguf 5)
 ratio_le "$K_REQ" "$K_SUM" 1.5 || { echo "FAIL: requantized KL $K_REQ vs HQ5_K + direct HQ4_XS $K_SUM"; exit 1; }
 echo PASS
+
+if [ -n "${IMATRIX:-}" ]; then
+    IM=$(realpath "$IMATRIX")
+    echo "== --hadamard --imatrix: GPTQ"
+    GPTQ_TYPES="Q4_K_M Q5_K_M IQ4_XS IQ3_S IQ2_XXS"
+    MODELS=""
+    for FT in $GPTQ_TYPES; do
+        "$QUANTIZE" --hadamard --imatrix "$IM" "$SRC" "$WORK"/hqg-$FT.gguf $FT > "$WORK"/qg-$FT.log 2>&1
+        "$QUANTIZE" --imatrix "$IM" "$SRC" "$WORK"/im-$FT.gguf $FT > "$WORK"/qi-$FT.log 2>&1
+        grep -q "use the imatrix through GPTQ" "$WORK"/qg-$FT.log || { echo "FAIL: $FT: GPTQ didn't run"; exit 1; }
+        OUT=$(gen "$WORK"/hqg-$FT.gguf)
+        echo "$FT: $OUT"
+        case $FT in
+            Q4_K_M|Q5_K_M|IQ4_XS)
+                echo "$OUT" | grep -q Paris || { echo "FAIL: $FT generation with GPTQ"; exit 1; } ;;
+        esac
+        MODELS="$MODELS $WORK/hq-$FT.gguf $WORK/hqg-$FT.gguf $WORK/im-$FT.gguf"
+    done
+    T=$(quality "$WORK"/ref.kl "$TEXT" "$SRC" $MODELS)
+    echo "$T"
+    for FT in $GPTQ_TYPES; do
+        K_HQ=$(field "$T" hq-$FT.gguf 5); K_G=$(field "$T" hqg-$FT.gguf 5); K_IM=$(field "$T" im-$FT.gguf 5)
+        awk -v a="$K_G" -v b="$K_HQ" 'BEGIN { exit !(a < b) }' || { echo "FAIL: $FT: KL with GPTQ $K_G vs uniform HQ $K_HQ"; exit 1; }
+        case $FT in
+            Q4_K_M|Q5_K_M|IQ4_XS)
+                ratio_le "$K_G" "$K_IM" 1.1 || { echo "FAIL: $FT: KL with GPTQ $K_G vs base + imatrix $K_IM"; exit 1; } ;;
+        esac
+    done
+    echo PASS
+fi
 
 echo "== runtime LoRA and --lora merge"
 python3 - "$SRC" "$WORK"/lora.gguf "$ROOT"/gguf-py <<'EOF'

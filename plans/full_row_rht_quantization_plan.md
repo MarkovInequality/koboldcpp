@@ -313,6 +313,10 @@ overridden by `--hadamard-seed N`, and stored in the GGUF.
 > axis-aligned in the unrotated basis, which a per-coordinate weight in the rotated basis can't
 > protect. See the Implementation record: HQ with uniform weights loses to the imatrix quants, and
 > GPTQ in the rotated space with `H = R·diag(imatrix)·Rᵀ` fixes it.
+>
+> **Superseded (2026-09-26):** `--imatrix` now drives GPTQ error feedback for every HQ type, as
+> implemented in `plans/gptq_rotated_quantizer_plan.md`. The uniform-weight quantizer below is still
+> what HQ types use without an imatrix.
 
 Under the imatrix's own diagonal assumption, the rotated imatrix is
 `diag(R·diag(v)·Rᵀ)ᵢ = Σⱼ R_ij² vⱼ`. Every entry of a full-row RHT has `|R_ij|² = 1/n`, so this is
@@ -1392,7 +1396,7 @@ cost both models far more than the rotation does; it now defines `GGML_CUDA_USE_
 
 ## Future work
 
-- **GPTQ/LDLQ error feedback in the rotated space (highest priority; planned in
+- **GPTQ/LDLQ error feedback in the rotated space (done 2026-09-26, see
   `plans/gptq_rotated_quantizer_plan.md`):** HQ quantizers take
   `--imatrix` again, as a diagonal Hessian `H = R·diag(v)·Rᵀ` (Phase 6 results above). Needs
   `U = chol(H⁻¹)` once per distinct GEMM input per layer (O(n³); n = 17408 needs a blocked

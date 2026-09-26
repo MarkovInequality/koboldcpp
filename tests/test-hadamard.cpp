@@ -308,6 +308,45 @@ static void test_reference() {
     }
 }
 
+static void test_f64() {
+    printf("fp64 transform:\n");
+
+    std::vector<int64_t> ns;
+    for (const auto & [K, rows] : header_orders) {
+        if (K % 8 != 0) {
+            ns.push_back(64*(int64_t) K);
+        }
+    }
+    for (int64_t n : { 1024ll, 2048ll, 3072ll, 2560ll, 4096ll, 5120ll, 6144ll, 9728ll, 17408ll }) {
+        ns.push_back(n);
+    }
+
+    for (int64_t n : ns) {
+        int K; int64_t P;
+        ggml_rht_plan(n, &K, &P);
+        const std::vector<float> x = make_random(n, 11);
+        const std::vector<float> y = rht(x, 4321);
+
+        std::vector<double> xd(x.begin(), x.end());
+        ggml_rht_ref_f64(xd.data(), n, 4321);
+        double err = 0, ny = 0, nx = 0, nxd = 0;
+        for (int64_t i = 0; i < n; ++i) {
+            err += (xd[i] - y[i])*(xd[i] - y[i]);
+            ny  += (double) y[i]*y[i];
+            nx  += (double) x[i]*x[i];
+            nxd += xd[i]*xd[i];
+        }
+        ggml_rht_inv_f64(xd.data(), n, 4321);
+        double inv = 0;
+        for (int64_t i = 0; i < n; ++i) {
+            inv += (xd[i] - x[i])*(xd[i] - x[i]);
+        }
+        const std::string what = "(K, P) = (" + std::to_string(K) + ", " + std::to_string(P) + "): ";
+        check(sqrt(err/ny) < 1e-6, what + "f64 == ggml_rht_ref to fp32 rounding");
+        check(sqrt(inv/nx) < 1e-12 && fabs(sqrt(nxd) - sqrt(nx)) < 1e-12*sqrt(nx), what + "inv(ref(x)) == x, |ref(x)| == |x|");
+    }
+}
+
 static void test_stage_split() {
     printf("stage split:\n");
 
@@ -508,6 +547,7 @@ int main() {
     test_plan();
     test_signs();
     test_reference();
+    test_f64();
     test_stage_split();
     test_types();
     test_validate();

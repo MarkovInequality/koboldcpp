@@ -188,6 +188,13 @@ static inline void get_scale_min_k4(int j, const uint8_t * GGML_RESTRICT q, uint
 
 // ====================== HQ4_K / HQ5_K
 
+// the final code of a K-quant value, at a sub-block's scale d != 0 and min dm
+static inline int hq_k_code(float x, float d, float dm, int nmax) {
+    const float v = (x + dm)/d;
+    const int l = nearest_int(fminf(fmaxf(v, -4194303.f), 4194303.f));
+    return MAX(0, MIN(nmax, l));
+}
+
 static void quantize_row_hq4_K_impl(const float * GGML_RESTRICT x, block_q4_K * GGML_RESTRICT y, int64_t n_per_row) {
     assert(n_per_row % QK_K == 0);
     const int64_t nb = n_per_row / QK_K;
@@ -229,9 +236,7 @@ static void quantize_row_hq4_K_impl(const float * GGML_RESTRICT x, block_q4_K * 
             if (!d) continue;
             const float dm = GGML_FP16_TO_FP32(y[i].dmin) * m;
             for (int ii = 0; ii < 32; ++ii) {
-                int l = nearest_int((x[32*j + ii] + dm)/d);
-                l = MAX(0, MIN(15, l));
-                L[32*j + ii] = l;
+                L[32*j + ii] = hq_k_code(x[32*j + ii], d, dm, 15);
             }
         }
         uint8_t * q = y[i].qs;
@@ -288,9 +293,7 @@ static void quantize_row_hq5_K_impl(const float * GGML_RESTRICT x, block_q5_K * 
             if (!d) continue;
             const float dm = GGML_FP16_TO_FP32(y[i].dmin) * m;
             for (int ii = 0; ii < 32; ++ii) {
-                int l = nearest_int((x[32*j + ii] + dm)/d);
-                l = MAX(0, MIN(31, l));
-                L[32*j + ii] = l;
+                L[32*j + ii] = hq_k_code(x[32*j + ii], d, dm, 31);
             }
         }
 
@@ -321,6 +324,34 @@ static void quantize_row_hq5_K_impl(const float * GGML_RESTRICT x, block_q5_K * 
 
 // ====================== HQ2 (IQ2 grids)
 
+// how a codebook sub-block's signs were set: by hq_signs8, by its complement (the search's scale came out
+// negative), or not at all (the sub-block was skipped, and its stored signs are zero)
+enum { HQ_SIGNS_RULE, HQ_SIGNS_INVERT, HQ_SIGNS_KEEP };
+
+// the sign bits of 8 values (bit i set: x[i] < 0), and |x| in xval; with parity the smallest |x| is
+// flipped too if needed, so that the count of set bits is even (that value's xval becomes negative)
+static inline uint8_t hq_signs8(const float * GGML_RESTRICT x, float * GGML_RESTRICT xval, bool parity) {
+    int nflip = 0;
+    uint8_t s = 0;
+    for (int i = 0; i < 8; ++i) {
+        if (x[i] >= 0) xval[i] = x[i];
+        else {
+            xval[i] = -x[i]; ++nflip; s |= (1 << i);
+        }
+    }
+    if (parity && nflip%2) {
+        int imin = 0; float min = xval[imin];
+        for (int i = 1; i < 8; ++i) {
+            if (xval[i] < min) {
+                min = xval[i]; imin = i;
+            }
+        }
+        xval[imin] = -xval[imin];
+        s ^= (1 << imin);
+    }
+    return s;
+}
+
 static int hq2_find_best_neighbour(const uint16_t * GGML_RESTRICT neighbours, const uint64_t * GGML_RESTRICT grid,
         const float * GGML_RESTRICT xval, float scale, int8_t * GGML_RESTRICT L) {
     int num_neighbors = neighbours[0];
@@ -345,7 +376,8 @@ static int hq2_find_best_neighbour(const uint16_t * GGML_RESTRICT neighbours, co
     return grid_index;
 }
 
-static void quantize_row_hq2_xxs_impl(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t n) {
+// smode: each sub-block's HQ_SIGNS_*
+static void quantize_row_hq2_xxs_impl(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t n, uint8_t * smode) {
 
     const uint64_t * kgrid_q2xs;
     const int      * kmap_q2xs;
@@ -382,31 +414,15 @@ static void quantize_row_hq2_xxs_impl(const float * GGML_RESTRICT x, void * GGML
         for (int ib = 0; ib < QK_K/32; ++ib) {
             const float * xb = xbl + 32*ib;
             for (int k = 0; k < 4; ++k) {
-                int nflip = 0;
-                uint8_t s = 0;
-                for (int i = 0; i < 8; ++i) {
-                    if (xb[8*k + i] >= 0) xval[8*k + i] = xb[8*k + i];
-                    else {
-                        xval[8*k + i] = -xb[8*k + i]; ++nflip; s |= (1 << i);
-                    }
-                }
-                if (nflip%2) {
-                    int imin = 0; float min = xval[8*k+imin];
-                    for (int i = 1; i < 8; ++i) {
-                        if (xval[8*k+i] < min) {
-                            min = xval[8*k+i]; imin = i;
-                        }
-                    }
-                    xval[8*k+imin] = -xval[8*k+imin];
-                    s ^= (1 << imin);
-                }
-                block_signs[k] = s & 127;
+                block_signs[k] = hq_signs8(xb + 8*k, xval + 8*k, true) & 127;
             }
+            smode[ibl*(QK_K/32) + ib] = HQ_SIGNS_RULE;
             float max = xval[0];
             for (int i = 1; i < 32; ++i) max = MAX(max, xval[i]);
             if (max < GROUP_MAX_EPS) {
                 scales[ib] = 0;
                 memset(L, 0, 32);
+                smode[ibl*(QK_K/32) + ib] = HQ_SIGNS_KEEP;
                 continue;
             }
             float scale = make_qp_quants(32, kMaxQ+1, xval, (uint8_t*)L);
@@ -414,6 +430,7 @@ static void quantize_row_hq2_xxs_impl(const float * GGML_RESTRICT x, void * GGML
             if (eff_max <= 0) {
                 scales[ib] = 0;
                 memset(L, 0, 32);
+                smode[ibl*(QK_K/32) + ib] = HQ_SIGNS_KEEP;
                 continue;
             }
             float best = 0;
@@ -470,6 +487,7 @@ static void quantize_row_hq2_xxs_impl(const float * GGML_RESTRICT x, void * GGML
                 if (sumq2 > 0) scale = sumqx/sumq2;
             }
             if (scale < 0) {
+                smode[ibl*(QK_K/32) + ib] = HQ_SIGNS_INVERT;
                 scale = -scale;
                 for (int k = 0; k < 4; ++k) block_signs[k] = (~block_signs[k]) & 127;
             }
@@ -492,6 +510,7 @@ static void quantize_row_hq2_xxs_impl(const float * GGML_RESTRICT x, void * GGML
         }
 
         if (!max_scale) {
+            memset(smode + ibl*(QK_K/32), HQ_SIGNS_KEEP, QK_K/32);
             memset(y[ibl].qs, 0, QK_K/4);
             continue;
         }
@@ -508,7 +527,7 @@ static void quantize_row_hq2_xxs_impl(const float * GGML_RESTRICT x, void * GGML
     }
 }
 
-static void quantize_row_hq2_xs_impl(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t n) {
+static void quantize_row_hq2_xs_impl(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t n, uint8_t * smode) {
 
     const uint64_t * kgrid_q2xs;
     const int      * kmap_q2xs;
@@ -548,31 +567,15 @@ static void quantize_row_hq2_xs_impl(const float * GGML_RESTRICT x, void * GGML_
         for (int ib = 0; ib < QK_K/16; ++ib) {
             const float * xb = xbl + 16*ib;
             for (int k = 0; k < 2; ++k) {
-                int nflip = 0;
-                uint8_t s = 0;
-                for (int i = 0; i < 8; ++i) {
-                    if (xb[8*k + i] >= 0) xval[8*k + i] = xb[8*k + i];
-                    else {
-                        xval[8*k + i] = -xb[8*k + i]; ++nflip; s |= (1 << i);
-                    }
-                }
-                if (nflip%2) {
-                    int imin = 0; float min = xval[8*k+imin];
-                    for (int i = 1; i < 8; ++i) {
-                        if (xval[8*k+i] < min) {
-                            min = xval[8*k+i]; imin = i;
-                        }
-                    }
-                    xval[8*k+imin] = -xval[8*k+imin];
-                    s ^= (1 << imin);
-                }
-                block_signs[k] = s & 127;
+                block_signs[k] = hq_signs8(xb + 8*k, xval + 8*k, true) & 127;
             }
+            smode[ibl*(QK_K/16) + ib] = HQ_SIGNS_RULE;
             float max = xval[0];
             for (int i = 1; i < 16; ++i) max = MAX(max, xval[i]);
             memset(L, 0, 16);
             if (max < GROUP_MAX_EPS) {
                 scales[ib] = 0;
+                smode[ibl*(QK_K/16) + ib] = HQ_SIGNS_KEEP;
                 continue;
             }
             float best = 0;
@@ -636,6 +639,7 @@ static void quantize_row_hq2_xs_impl(const float * GGML_RESTRICT x, void * GGML_
                 if (sumq2 > 0) scale = sumqx/sumq2;
             }
             if (scale < 0) {
+                smode[ibl*(QK_K/16) + ib] = HQ_SIGNS_INVERT;
                 scale = -scale;
                 for (int k = 0; k < 2; ++k) block_signs[k] = (~block_signs[k]) & 127;
             }
@@ -657,6 +661,7 @@ static void quantize_row_hq2_xs_impl(const float * GGML_RESTRICT x, void * GGML_
         }
 
         if (!max_scale) {
+            memset(smode + ibl*(QK_K/16), HQ_SIGNS_KEEP, QK_K/16);
             memset(y[ibl].qs, 0, QK_K/4);
             continue;
         }
@@ -674,7 +679,7 @@ static void quantize_row_hq2_xs_impl(const float * GGML_RESTRICT x, void * GGML_
     }
 }
 
-static void quantize_row_hq2_s_impl(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t n) {
+static void quantize_row_hq2_s_impl(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t n, uint8_t * smode) {
 
     const uint64_t * kgrid_q2xs;
     const int      * kmap_q2xs;
@@ -712,20 +717,15 @@ static void quantize_row_hq2_s_impl(const float * GGML_RESTRICT x, void * GGML_R
         for (int ib = 0; ib < QK_K/16; ++ib) {
             const float * xb = xbl + 16*ib;
             for (int k = 0; k < 2; ++k) {
-                uint8_t s = 0;
-                for (int i = 0; i < 8; ++i) {
-                    if (xb[8*k + i] >= 0) xval[8*k + i] = xb[8*k + i];
-                    else {
-                        xval[8*k + i] = -xb[8*k + i]; s |= (1 << i);
-                    }
-                }
-                block_signs[k] = s;
+                block_signs[k] = hq_signs8(xb + 8*k, xval + 8*k, false);
             }
+            smode[ibl*(QK_K/16) + ib] = HQ_SIGNS_RULE;
             float max = xval[0];
             for (int i = 1; i < 16; ++i) max = MAX(max, xval[i]);
             memset(L, 0, 16);
             if (max < GROUP_MAX_EPS_IQ2_S) {
                 scales[ib] = 0;
+                smode[ibl*(QK_K/16) + ib] = HQ_SIGNS_KEEP;
                 continue;
             }
             float best = 0;
@@ -789,6 +789,7 @@ static void quantize_row_hq2_s_impl(const float * GGML_RESTRICT x, void * GGML_R
                 if (sumq2 > 0) scale = sumqx/sumq2;
             }
             if (scale < 0) {
+                smode[ibl*(QK_K/16) + ib] = HQ_SIGNS_INVERT;
                 scale = -scale;
                 for (int k = 0; k < 2; ++k) block_signs[k] = ~block_signs[k];
             }
@@ -854,7 +855,7 @@ static int hq3_find_best_neighbour(const uint16_t * GGML_RESTRICT neighbours, co
     return grid_index;
 }
 
-static void quantize_row_hq3_xxs_impl(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t n) {
+static void quantize_row_hq3_xxs_impl(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t n, uint8_t * smode) {
 
     const uint32_t * kgrid_q3xs;
     const int      * kmap_q3xs;
@@ -895,31 +896,15 @@ static void quantize_row_hq3_xxs_impl(const float * GGML_RESTRICT x, void * GGML
         for (int ib = 0; ib < QK_K/32; ++ib) {
             const float * xb = xbl + 32*ib;
             for (int k = 0; k < 4; ++k) {
-                int nflip = 0;
-                uint8_t s = 0;
-                for (int i = 0; i < 8; ++i) {
-                    if (xb[8*k + i] >= 0) xval[8*k + i] = xb[8*k + i];
-                    else {
-                        xval[8*k + i] = -xb[8*k + i]; ++nflip; s |= (1 << i);
-                    }
-                }
-                if (nflip%2) {
-                    int imin = 0; float min = xval[8*k+imin];
-                    for (int i = 1; i < 8; ++i) {
-                        if (xval[8*k+i] < min) {
-                            min = xval[8*k+i]; imin = i;
-                        }
-                    }
-                    xval[8*k+imin] = -xval[8*k+imin];
-                    s ^= (1 << imin);
-                }
-                block_signs[k] = s & 127;
+                block_signs[k] = hq_signs8(xb + 8*k, xval + 8*k, true) & 127;
             }
+            smode[ibl*(QK_K/32) + ib] = HQ_SIGNS_RULE;
             float max = xval[0];
             for (int i = 1; i < 32; ++i) max = MAX(max, xval[i]);
             memset(L, 0, 32);
             if (max < GROUP_MAX_EPS_IQ3_XXS) {
                 scales[ib] = 0;
+                smode[ibl*(QK_K/32) + ib] = HQ_SIGNS_KEEP;
                 continue;
             }
             float best = 0;
@@ -984,6 +969,7 @@ static void quantize_row_hq3_xxs_impl(const float * GGML_RESTRICT x, void * GGML
                 if (sumq2 > 0) scale = sumqx/sumq2;
             }
             if (scale < 0) {
+                smode[ibl*(QK_K/32) + ib] = HQ_SIGNS_INVERT;
                 scale = -scale;
                 for (int k = 0; k < 4; ++k) block_signs[k] = (~block_signs[k]) & 127;
             }
@@ -1006,6 +992,7 @@ static void quantize_row_hq3_xxs_impl(const float * GGML_RESTRICT x, void * GGML
         }
 
         if (!max_scale) {
+            memset(smode + ibl*(QK_K/32), HQ_SIGNS_KEEP, QK_K/32);
             memset(y[ibl].qs, 0, sizeof(y[ibl].qs));
             continue;
         }
@@ -1022,7 +1009,7 @@ static void quantize_row_hq3_xxs_impl(const float * GGML_RESTRICT x, void * GGML
     }
 }
 
-static void quantize_row_hq3_s_impl(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t n) {
+static void quantize_row_hq3_s_impl(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t n, uint8_t * smode) {
 
     const uint32_t * kgrid_q3xs;
     const int      * kmap_q3xs;
@@ -1066,20 +1053,15 @@ static void quantize_row_hq3_s_impl(const float * GGML_RESTRICT x, void * GGML_R
         for (int ib = 0; ib < QK_K/block_size; ++ib) {
             const float * xb = xbl + block_size*ib;
             for (int k = 0; k < bs8; ++k) {
-                uint8_t s = 0;
-                for (int i = 0; i < 8; ++i) {
-                    if (xb[8*k + i] >= 0) xval[8*k + i] = xb[8*k + i];
-                    else {
-                        xval[8*k + i] = -xb[8*k + i]; s |= (1 << i);
-                    }
-                }
-                block_signs[k] = s;
+                block_signs[k] = hq_signs8(xb + 8*k, xval + 8*k, false);
             }
+            smode[ibl*(QK_K/32) + ib] = HQ_SIGNS_RULE;
             float max = xval[0];
             for (int i = 1; i < block_size; ++i) max = MAX(max, xval[i]);
             memset(L, 0, block_size);
             if (!max) {
                 scales[ib] = 0;
+                smode[ibl*(QK_K/32) + ib] = HQ_SIGNS_KEEP;
                 continue;
             }
             float best = 0;
@@ -1143,6 +1125,7 @@ static void quantize_row_hq3_s_impl(const float * GGML_RESTRICT x, void * GGML_R
                 if (sumq2 > 0) scale = sumqx/sumq2;
             }
             if (scale < 0) {
+                smode[ibl*(QK_K/32) + ib] = HQ_SIGNS_INVERT;
                 scale = -scale;
                 for (int k = 0; k < bs8; ++k) block_signs[k] = ~block_signs[k];
             }
@@ -1437,9 +1420,10 @@ static void hq3_s_repick(const float * GGML_RESTRICT x, block_iq3_s * GGML_RESTR
 
 // ====================== HQ4_NL / HQ4_XS
 
+// idl[ib]: the inverse scale block ib's codes were chosen with
 static void quantize_row_hq4_nl_impl(const int super_block_size, const int block_size, const float * GGML_RESTRICT x,
         ggml_fp16_t * dh, uint8_t * q4, uint16_t * scales_h, uint8_t * scales_l,
-        float * scales, uint8_t * L) {
+        float * scales, uint8_t * L, float * idl_out) {
 
     const int8_t * values = kvalues_iq4nl;
     const int ntry = 7;
@@ -1507,6 +1491,7 @@ static void quantize_row_hq4_nl_impl(const int super_block_size, const int block
             l = MAX(-32, MIN(31, l));
             float dl = d * l;
             float idl = dl ? 1/dl : 0.f;
+            idl_out[ib] = idl;
             uint8_t * Lb = L + ib*block_size;
             const float * xb = x + ib*block_size;
             for (int j = 0; j < block_size; ++j) {
@@ -1522,6 +1507,7 @@ static void quantize_row_hq4_nl_impl(const int super_block_size, const int block
     } else {
         dh[0] = GGML_FP32_TO_FP16(scales[0]);
         float id = scales[0] ? 1/scales[0] : 0;
+        idl_out[0] = id;
         for (int j = 0; j < super_block_size; ++j) {
             L[j] = best_index_int8(16, values, id*x[j]);
         }
@@ -1534,65 +1520,525 @@ static void quantize_row_hq4_nl_impl(const int super_block_size, const int block
     }
 }
 
-static void quantize_row_hq4_nl(const float * GGML_RESTRICT x, block_iq4_nl * GGML_RESTRICT y, int64_t n) {
-    GGML_ASSERT(n%QK4_NL == 0);
-    uint8_t L[QK4_NL];
-    uint16_t unused_h;
-    float scale;
-    for (int64_t ib = 0; ib < n/QK4_NL; ++ib) {
-        quantize_row_hq4_nl_impl(QK4_NL, 32, x + QK4_NL*ib, &y[ib].d, y[ib].qs, &unused_h, NULL, &scale, L);
+// ====================== the HQ driver
+//
+// Rows are encoded one scale unit at a time (the 256-value super-block; the 32-value block for HQ4_NL)
+// by the _impls above. Without a factor that's all, apart from the codebook re-pick. With the packed
+// upper Cholesky factor U of H^-1, GPTQ error feedback goes in between: each element is re-picked in
+// order at its unit's scales, and its error is fed at once into the rest of its lazy block of 256
+// columns, and into the columns after the block once the block is done.
+
+#define HQ_GPTQ_ROWS 32
+
+#if (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__)) && !defined(__AVX2__)
+#define HQ_AVX2_CLONE
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#define HQ_INLINE inline __attribute__((always_inline))
+#else
+#define HQ_INLINE inline
+#endif
+
+typedef struct {
+    float   idl[QK_K/32];   // IQ4: the inverse scale each 32-block's codes were chosen with
+    uint8_t smode[QK_K/16]; // codebook types: how each sub-block's signs were set (HQ_SIGNS_*)
+} hq_unit_info;
+
+static void hq_encode_unit(enum ggml_type type, const float * GGML_RESTRICT x, void * GGML_RESTRICT y,
+                           hq_unit_info * info, const hq_dec_grid * dg, bool repick) {
+    uint8_t L[QK_K];
+    float   scales[QK_K/32];
+    switch (type) {
+        case GGML_TYPE_HQ4_K: quantize_row_hq4_K_impl(x, y, QK_K); break;
+        case GGML_TYPE_HQ5_K: quantize_row_hq5_K_impl(x, y, QK_K); break;
+        case GGML_TYPE_HQ4_XS:
+            {
+                block_iq4_xs * b = y;
+                quantize_row_hq4_nl_impl(QK_K, 32, x, &b->d, b->qs, &b->scales_h, b->scales_l, scales, L, info->idl);
+            } break;
+        case GGML_TYPE_HQ4_NL:
+            {
+                block_iq4_nl * b = y;
+                uint16_t unused_h;
+                quantize_row_hq4_nl_impl(QK4_NL, 32, x, &b->d, b->qs, &unused_h, NULL, scales, L, info->idl);
+            } break;
+        case GGML_TYPE_HQ2_XXS:
+            quantize_row_hq2_xxs_impl(x, y, QK_K, info->smode);
+            if (repick) hq2_xxs_repick(x, y, QK_K, dg);
+            break;
+        case GGML_TYPE_HQ2_XS:
+            quantize_row_hq2_xs_impl(x, y, QK_K, info->smode);
+            if (repick) hq2_xs_repick(x, y, QK_K, dg);
+            break;
+        case GGML_TYPE_HQ2_S:
+            quantize_row_hq2_s_impl(x, y, QK_K, info->smode);
+            if (repick) hq2_s_repick(x, y, QK_K, dg);
+            break;
+        case GGML_TYPE_HQ3_XXS:
+            quantize_row_hq3_xxs_impl(x, y, QK_K, info->smode);
+            if (repick) hq3_xxs_repick(x, y, QK_K, dg);
+            break;
+        case GGML_TYPE_HQ3_S:
+            quantize_row_hq3_s_impl(x, y, QK_K, info->smode);
+            if (repick) hq3_s_repick(x, y, QK_K, dg);
+            break;
+        default: GGML_ABORT("fatal error");
     }
 }
 
-static void quantize_row_hq4_xs(const float * GGML_RESTRICT x, block_iq4_xs * GGML_RESTRICT y, int64_t n) {
-    GGML_ASSERT(n%QK_K == 0);
-    uint8_t L[QK_K];
-    float scales[QK_K/32];
-    for (int64_t ibl = 0; ibl < n/QK_K; ++ibl) {
-        quantize_row_hq4_nl_impl(QK_K, 32, x + QK_K*ibl, &y[ibl].d, y[ibl].qs, &y[ibl].scales_h, y[ibl].scales_l, scales, L);
+// the codes of one unit of an element-wise type, one per value
+static void hq_get_codes(enum ggml_type type, const void * GGML_RESTRICT y, uint8_t * GGML_RESTRICT L, int unit) {
+    if (type == GGML_TYPE_HQ4_K || type == GGML_TYPE_HQ5_K) {
+        const uint8_t * qs = type == GGML_TYPE_HQ4_K ? ((const block_q4_K *) y)->qs : ((const block_q5_K *) y)->qs;
+        for (int j = 0; j < QK_K; ++j) {
+            const uint8_t q = qs[(j/64)*32 + j%32];
+            L[j] = j%64 < 32 ? q & 0xF : q >> 4;
+        }
+        if (type == GGML_TYPE_HQ5_K) {
+            const uint8_t * qh = ((const block_q5_K *) y)->qh;
+            for (int j = 0; j < QK_K; ++j) {
+                L[j] |= ((qh[j%32] >> (2*(j/64) + (j%64)/32)) & 1) << 4;
+            }
+        }
+    } else {
+        const uint8_t * qs = type == GGML_TYPE_HQ4_XS ? ((const block_iq4_xs *) y)->qs : ((const block_iq4_nl *) y)->qs;
+        for (int j = 0; j < unit; ++j) {
+            const uint8_t q = qs[16*(j/32) + j%16];
+            L[j] = j%32 < 16 ? q & 0xF : q >> 4;
+        }
     }
+}
+
+static void hq_set_codes(enum ggml_type type, void * GGML_RESTRICT y, const uint8_t * GGML_RESTRICT L, int unit) {
+    if (type == GGML_TYPE_HQ4_K || type == GGML_TYPE_HQ5_K) {
+        uint8_t * qs = type == GGML_TYPE_HQ4_K ? ((block_q4_K *) y)->qs : ((block_q5_K *) y)->qs;
+        for (int j = 0; j < QK_K; j += 64) {
+            for (int l = 0; l < 32; ++l) {
+                qs[j/2 + l] = (L[j + l] & 0xF) | ((L[j + l + 32] & 0xF) << 4);
+            }
+        }
+        if (type == GGML_TYPE_HQ5_K) {
+            uint8_t * qh = ((block_q5_K *) y)->qh;
+            memset(qh, 0, QK_K/8);
+            for (int j = 0; j < QK_K; ++j) {
+                qh[j%32] |= (L[j] >> 4) << (2*(j/64) + (j%64)/32);
+            }
+        }
+    } else {
+        uint8_t * qs = type == GGML_TYPE_HQ4_XS ? ((block_iq4_xs *) y)->qs : ((block_iq4_nl *) y)->qs;
+        for (int i = 0; i < unit/32; ++i) {
+            for (int j = 0; j < 16; ++j) {
+                qs[16*i + j] = L[32*i + j] | (L[32*i + 16 + j] << 4);
+            }
+        }
+    }
+}
+
+// U[j][k] = hq_urow(U, n, j)[k]
+static inline const float * hq_urow(const float * U, int64_t n, int64_t j) {
+    return U + ((size_t) j*n - (size_t) j*(j - 1)/2 - (size_t) j);
+}
+
+// the element-wise step over one unit [j0, j0 + unit): each code at the unit's scales with the rule its
+// _impl used, its error fed into the rest of the block [.., b1) and kept in e (indexed from b0)
+static void hq_gptq_elements(enum ggml_type type, float * GGML_RESTRICT x, void * GGML_RESTRICT y, const hq_unit_info * info,
+                             int64_t j0, int unit, int64_t b0, int64_t b1, const float * GGML_RESTRICT U, int64_t n,
+                             float * GGML_RESTRICT e) {
+    uint8_t L[QK_K];
+    float   d[QK_K/32];
+    float   dm[QK_K/32] = { 0 };
+    const bool kq = type == GGML_TYPE_HQ4_K || type == GGML_TYPE_HQ5_K;
+    const int nmax = type == GGML_TYPE_HQ5_K ? 31 : 15;
+
+    hq_get_codes(type, y, L, unit);
+    if (kq) {
+        const block_q4_K * b4 = y;
+        const block_q5_K * b5 = y;
+        const float    dd     = GGML_FP16_TO_FP32(type == GGML_TYPE_HQ4_K ? b4->d    : b5->d);
+        const float    dmin   = GGML_FP16_TO_FP32(type == GGML_TYPE_HQ4_K ? b4->dmin : b5->dmin);
+        const uint8_t * scales = type == GGML_TYPE_HQ4_K ? b4->scales : b5->scales;
+        for (int ib = 0; ib < QK_K/32; ++ib) {
+            uint8_t sc, m;
+            get_scale_min_k4(ib, scales, &sc, &m);
+            d[ib]  = dd * sc;
+            dm[ib] = dmin * m;
+        }
+    } else if (type == GGML_TYPE_HQ4_XS) {
+        const block_iq4_xs * b = y;
+        for (int ib = 0; ib < QK_K/32; ++ib) {
+            const int ls = ((b->scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((b->scales_h >> 2*ib) & 3) << 4);
+            d[ib] = GGML_FP16_TO_FP32(b->d) * (ls - 32);
+        }
+    } else {
+        d[0] = GGML_FP16_TO_FP32(((const block_iq4_nl *) y)->d);
+    }
+
+    for (int i = 0; i < unit; ++i) {
+        const int64_t j  = j0 + i;
+        const int     ib = i/32;
+        float xh;
+        if (kq) {
+            if (d[ib]) {
+                L[i] = hq_k_code(x[j], d[ib], dm[ib], nmax);
+            }
+            xh = d[ib]*L[i] - dm[ib];
+        } else {
+            L[i] = best_index_int8(16, kvalues_iq4nl, info->idl[ib]*x[j]);
+            xh = d[ib]*kvalues_iq4nl[L[i]];
+        }
+        const float * uj  = hq_urow(U, n, j);
+        const float   err = (x[j] - xh)/uj[j];
+        e[j - b0] = err;
+        for (int64_t k = j + 1; k < b1; ++k) {
+            x[k] -= err*uj[k];
+        }
+    }
+    hq_set_codes(type, y, L, unit);
+}
+
+// ---- the codebook types, one 8-value sign group g (0..31) of a super-block at a time
+
+static bool hq_parity_signs(enum ggml_type type) {
+    return type == GGML_TYPE_HQ2_XXS || type == GGML_TYPE_HQ2_XS || type == GGML_TYPE_HQ3_XXS;
+}
+
+// the scale of group g, as dequantize_row_iq* computes it
+static float hq_cb_db(enum ggml_type type, const void * GGML_RESTRICT vy, int g) {
+    const int ib32 = g/4, l = g%4;
+    switch (type) {
+        case GGML_TYPE_HQ2_XXS:
+            {
+                const block_iq2_xxs * y = vy;
+                uint32_t aux32[2];
+                memcpy(aux32, y->qs + 4*ib32, 2*sizeof(uint32_t));
+                return GGML_FP16_TO_FP32(y->d) * (0.5f + (aux32[1] >> 28)) * 0.25f;
+            }
+        case GGML_TYPE_HQ2_XS:
+            {
+                const block_iq2_xs * y = vy;
+                return GGML_FP16_TO_FP32(y->d) * (0.5f + ((y->scales[ib32] >> 4*(l/2)) & 0xf)) * 0.25f;
+            }
+        case GGML_TYPE_HQ2_S:
+            {
+                const block_iq2_s * y = vy;
+                return GGML_FP16_TO_FP32(y->d) * (0.5f + ((y->scales[ib32] >> 4*(l/2)) & 0xf)) * 0.25f;
+            }
+        case GGML_TYPE_HQ3_XXS:
+            {
+                const block_iq3_xxs * y = vy;
+                uint32_t aux32;
+                memcpy(&aux32, y->qs + QK_K/4 + 4*ib32, sizeof(uint32_t));
+                return GGML_FP16_TO_FP32(y->d) * (0.5f + (aux32 >> 28)) * 0.5f;
+            }
+        case GGML_TYPE_HQ3_S:
+            {
+                const block_iq3_s * y = vy;
+                return GGML_FP16_TO_FP32(y->d) * (1 + 2*((y->scales[ib32/2] >> 4*(ib32%2)) & 0xf));
+            }
+        default: GGML_ABORT("fatal error");
+    }
+}
+
+// the stored sign bits of group g: 7 for the parity types, else 8
+static uint8_t hq_cb_get_signs(enum ggml_type type, const void * GGML_RESTRICT vy, int g) {
+    const int ib32 = g/4, l = g%4;
+    switch (type) {
+        case GGML_TYPE_HQ2_XXS:
+            {
+                uint32_t aux32;
+                memcpy(&aux32, ((const block_iq2_xxs *) vy)->qs + 4*ib32 + 2, sizeof(uint32_t));
+                return (aux32 >> 7*l) & 127;
+            }
+        case GGML_TYPE_HQ2_XS:  return ((const block_iq2_xs *) vy)->qs[g] >> 9;
+        case GGML_TYPE_HQ2_S:   return ((const block_iq2_s *) vy)->qs[QK_K/8 + g];
+        case GGML_TYPE_HQ3_XXS:
+            {
+                uint32_t aux32;
+                memcpy(&aux32, ((const block_iq3_xxs *) vy)->qs + QK_K/4 + 4*ib32, sizeof(uint32_t));
+                return (aux32 >> 7*l) & 127;
+            }
+        case GGML_TYPE_HQ3_S:   return ((const block_iq3_s *) vy)->signs[g];
+        default: GGML_ABORT("fatal error");
+    }
+}
+
+static void hq_cb_set_signs(enum ggml_type type, void * GGML_RESTRICT vy, int g, uint8_t s) {
+    const int ib32 = g/4, l = g%4;
+    switch (type) {
+        case GGML_TYPE_HQ2_XXS:
+            {
+                uint16_t * q = ((block_iq2_xxs *) vy)->qs + 4*ib32 + 2;
+                uint32_t aux32;
+                memcpy(&aux32, q, sizeof(uint32_t));
+                aux32 = (aux32 & ~(127u << 7*l)) | ((uint32_t) (s & 127) << 7*l);
+                memcpy(q, &aux32, sizeof(uint32_t));
+            } break;
+        case GGML_TYPE_HQ2_XS:
+            {
+                uint16_t * q = ((block_iq2_xs *) vy)->qs + g;
+                *q = (uint16_t) ((*q & 511) | ((s & 127) << 9));
+            } break;
+        case GGML_TYPE_HQ2_S: ((block_iq2_s *) vy)->qs[QK_K/8 + g] = s; break;
+        case GGML_TYPE_HQ3_XXS:
+            {
+                uint8_t * q = ((block_iq3_xxs *) vy)->qs + QK_K/4 + 4*ib32;
+                uint32_t aux32;
+                memcpy(&aux32, q, sizeof(uint32_t));
+                aux32 = (aux32 & ~(127u << 7*l)) | ((uint32_t) (s & 127) << 7*l);
+                memcpy(q, &aux32, sizeof(uint32_t));
+            } break;
+        case GGML_TYPE_HQ3_S: ((block_iq3_s *) vy)->signs[g] = s; break;
+        default: GGML_ABORT("fatal error");
+    }
+}
+
+// grid point m of group g (one for IQ2, two for IQ3)
+static int hq_cb_get_code(enum ggml_type type, const void * GGML_RESTRICT vy, int g, int m) {
+    const int ib32 = g/4, l = g%4;
+    switch (type) {
+        case GGML_TYPE_HQ2_XXS: return ((const uint8_t *) (((const block_iq2_xxs *) vy)->qs + 4*ib32))[l];
+        case GGML_TYPE_HQ2_XS:  return ((const block_iq2_xs *) vy)->qs[g] & 511;
+        case GGML_TYPE_HQ2_S:
+            {
+                const block_iq2_s * y = vy;
+                return y->qs[g] | ((y->qh[ib32] << (8 - 2*l)) & 0x300);
+            }
+        case GGML_TYPE_HQ3_XXS: return ((const block_iq3_xxs *) vy)->qs[2*g + m];
+        case GGML_TYPE_HQ3_S:
+            {
+                const block_iq3_s * y = vy;
+                const int k = 2*l + m;
+                return y->qs[8*ib32 + k] | (((y->qh[ib32] >> k) & 1) << 8);
+            }
+        default: GGML_ABORT("fatal error");
+    }
+}
+
+static void hq_cb_set_code(enum ggml_type type, void * GGML_RESTRICT vy, int g, int m, int idx) {
+    const int ib32 = g/4, l = g%4;
+    switch (type) {
+        case GGML_TYPE_HQ2_XXS: ((uint8_t *) (((block_iq2_xxs *) vy)->qs + 4*ib32))[l] = (uint8_t) idx; break;
+        case GGML_TYPE_HQ2_XS:
+            {
+                uint16_t * q = ((block_iq2_xs *) vy)->qs + g;
+                *q = (uint16_t) ((*q & ~511) | idx);
+            } break;
+        case GGML_TYPE_HQ2_S:
+            {
+                block_iq2_s * y = vy;
+                y->qs[g] = idx & 255;
+                y->qh[ib32] = (y->qh[ib32] & ~(3 << 2*l)) | ((idx >> 8) << 2*l);
+            } break;
+        case GGML_TYPE_HQ3_XXS: ((block_iq3_xxs *) vy)->qs[2*g + m] = (uint8_t) idx; break;
+        case GGML_TYPE_HQ3_S:
+            {
+                block_iq3_s * y = vy;
+                const int k = 2*l + m;
+                y->qs[8*ib32 + k] = idx & 255;
+                y->qh[ib32] = (y->qh[ib32] & ~(1 << k)) | ((idx >> 8) << k);
+            } break;
+        default: GGML_ABORT("fatal error");
+    }
+}
+
+// the group step over one super-block [j0, j0 + QK_K) [QuIP#'s g-block LDLQ, g = 8]: each group's
+// signs by its sub-block's rule on the current values, its codes by the exact search at the group's
+// scale, then e with U_gg^T e = x_g - xhat_g fed into the rest of the block [.., b1) and kept in e
+static void hq_gptq_groups(enum ggml_type type, float * GGML_RESTRICT x, void * GGML_RESTRICT y, const hq_unit_info * info,
+                           const hq_dec_grid * dg, int64_t j0, int64_t b0, int64_t b1, const float * GGML_RESTRICT U, int64_t n,
+                           float * GGML_RESTRICT e) {
+    const bool parity = hq_parity_signs(type);
+    const int  sub    = type == GGML_TYPE_HQ2_XS || type == GGML_TYPE_HQ2_S ? 16 : 32;
+    const int  gs     = dg->gs;
+
+    for (int g = 0; g < QK_K/8; ++g) {
+        const int64_t jg = j0 + 8*g;
+        float * xg = x + jg;
+
+        uint8_t s;
+        const int mode = info->smode[8*g/sub];
+        if (mode == HQ_SIGNS_KEEP) {
+            s = hq_cb_get_signs(type, y, g);
+        } else {
+            float xval[8];
+            s = hq_signs8(xg, xval, parity);
+            if (mode == HQ_SIGNS_INVERT) {
+                s = ~s;
+            }
+            hq_cb_set_signs(type, y, g, s);
+        }
+        if (parity) {
+            s = ksigns_iq2xs[s & 127];
+        }
+
+        float xh[8] = { 0 };
+        const float db = hq_cb_db(type, y, g);
+        if (db > 0) {
+            float xs[8];
+            for (int i = 0; i < 8; ++i) {
+                xs[i] = s & kmask_iq2xs[i] ? -xg[i] : xg[i];
+            }
+            for (int m = 0; m < 8/gs; ++m) {
+                const int idx = hq_repick(dg, xs + gs*m, db, hq_cb_get_code(type, y, g, m));
+                hq_cb_set_code(type, y, g, m, idx);
+                for (int i = 0; i < gs; ++i) {
+                    const int k = gs*m + i;
+                    xh[k] = db * dg->grid[gs*idx + i] * (s & kmask_iq2xs[k] ? -1.f : 1.f);
+                }
+            }
+        }
+
+        float eg[8];
+        for (int a = 0; a < 8; ++a) {
+            float acc = xg[a] - xh[a];
+            for (int b = 0; b < a; ++b) {
+                acc -= hq_urow(U, n, jg + b)[jg + a]*eg[b];
+            }
+            eg[a] = acc/hq_urow(U, n, jg + a)[jg + a];
+            e[jg + a - b0] = eg[a];
+        }
+        for (int a = 0; a < 8; ++a) {
+            const float * ua = hq_urow(U, n, jg + a);
+            for (int64_t k = jg + 8; k < b1; ++k) {
+                x[k] -= eg[a]*ua[k];
+            }
+        }
+    }
+}
+
+// x[r][k] -= sum_jj e[r][jj]*u[jj][k] for k in [b1, n) and r < nr; e holds zero rows up to a multiple of 4
+static HQ_INLINE void hq_gptq_update_body(float * GGML_RESTRICT x, int64_t n, int nr, const float * GGML_RESTRICT e,
+                                          const float * const * u, int64_t nb, int64_t b1) {
+    for (int64_t k = b1; k < n; k += 16) {
+        for (int r = 0; r < nr; r += 4) {
+            const float * e0 = e + (r + 0)*QK_K;
+            const float * e1 = e + (r + 1)*QK_K;
+            const float * e2 = e + (r + 2)*QK_K;
+            const float * e3 = e + (r + 3)*QK_K;
+            float out[4][16];
+#if defined(__GNUC__) || defined(__clang__)
+            typedef float hq_v8 __attribute__((vector_size(32)));
+            hq_v8 a00 = { 0 }, a01 = { 0 }, a10 = { 0 }, a11 = { 0 }, a20 = { 0 }, a21 = { 0 }, a30 = { 0 }, a31 = { 0 };
+            for (int64_t jj = 0; jj < nb; ++jj) {
+                hq_v8 u0, u1;
+                memcpy(&u0, u[jj] + k,     sizeof(u0));
+                memcpy(&u1, u[jj] + k + 8, sizeof(u1));
+                a00 += e0[jj]*u0; a01 += e0[jj]*u1;
+                a10 += e1[jj]*u0; a11 += e1[jj]*u1;
+                a20 += e2[jj]*u0; a21 += e2[jj]*u1;
+                a30 += e3[jj]*u0; a31 += e3[jj]*u1;
+            }
+            memcpy(out[0], &a00, 32); memcpy(out[0] + 8, &a01, 32);
+            memcpy(out[1], &a10, 32); memcpy(out[1] + 8, &a11, 32);
+            memcpy(out[2], &a20, 32); memcpy(out[2] + 8, &a21, 32);
+            memcpy(out[3], &a30, 32); memcpy(out[3] + 8, &a31, 32);
+#else
+            memset(out, 0, sizeof(out));
+            for (int64_t jj = 0; jj < nb; ++jj) {
+                for (int l = 0; l < 16; ++l) {
+                    out[0][l] += e0[jj]*u[jj][k + l];
+                    out[1][l] += e1[jj]*u[jj][k + l];
+                    out[2][l] += e2[jj]*u[jj][k + l];
+                    out[3][l] += e3[jj]*u[jj][k + l];
+                }
+            }
+#endif
+            for (int i = 0; i < 4 && r + i < nr; ++i) {
+                float * xr = x + (r + i)*n + k;
+                for (int l = 0; l < 16; ++l) {
+                    xr[l] -= out[i][l];
+                }
+            }
+        }
+    }
+}
+
+static void hq_gptq_update_default(float * x, int64_t n, int nr, const float * e, const float * const * u, int64_t nb, int64_t b1) {
+    hq_gptq_update_body(x, n, nr, e, u, nb, b1);
+}
+
+#ifdef HQ_AVX2_CLONE
+__attribute__((target("avx2,fma")))
+static void hq_gptq_update_avx2(float * x, int64_t n, int nr, const float * e, const float * const * u, int64_t nb, int64_t b1) {
+    hq_gptq_update_body(x, n, nr, e, u, nb, b1);
+}
+#endif
+
+static void hq_gptq_update(float * x, int64_t n, int nr, const float * e, const float * const * u, int64_t nb, int64_t b1) {
+#ifdef HQ_AVX2_CLONE
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+        hq_gptq_update_avx2(x, n, nr, e, u, nb, b1);
+        return;
+    }
+#endif
+    hq_gptq_update_default(x, n, nr, e, u, nb, b1);
+}
+
+static bool hq_is_elementwise(enum ggml_type type) {
+    return type == GGML_TYPE_HQ4_K || type == GGML_TYPE_HQ5_K || type == GGML_TYPE_HQ4_XS || type == GGML_TYPE_HQ4_NL;
+}
+
+// U == NULL: the uniform quantizer, which doesn't write x
+static size_t hq_quantize(enum ggml_type type, float * GGML_RESTRICT x, void * GGML_RESTRICT dst, int64_t nrows, int64_t n,
+                          const float * GGML_RESTRICT U) {
+    GGML_ASSERT(ggml_is_rotated(type));
+    ggml_quantize_init(type);
+
+    const int    unit      = type == GGML_TYPE_HQ4_NL ? QK4_NL : QK_K;
+    const size_t row_size  = ggml_row_size(type, n);
+    const size_t unit_size = ggml_row_size(type, unit);
+    GGML_ASSERT(n % unit == 0);
+
+    hq_dec_grid  dg;
+    hq_unit_info info;
+    hq_dec_grid_for(&dg, type);
+
+    if (!U) {
+        for (int64_t r = 0; r < nrows; ++r) {
+            for (int64_t u0 = 0; u0 < n; u0 += unit) {
+                hq_encode_unit(type, x + r*n + u0, (char *) dst + r*row_size + (u0/unit)*unit_size, &info, &dg, true);
+            }
+        }
+        return nrows*row_size;
+    }
+
+    float e[HQ_GPTQ_ROWS*QK_K];
+    const float * u[QK_K];
+    for (int64_t r0 = 0; r0 < nrows; r0 += HQ_GPTQ_ROWS) {
+        const int nr = (int) MIN(HQ_GPTQ_ROWS, nrows - r0);
+        memset(e, 0, sizeof(e));
+        for (int64_t b0 = 0; b0 < n; b0 += QK_K) {
+            const int64_t b1 = MIN(n, b0 + QK_K);
+            for (int r = 0; r < nr; ++r) {
+                float * xr = x + (r0 + r)*n;
+                char  * yr = (char *) dst + (r0 + r)*row_size;
+                for (int64_t u0 = b0; u0 < b1; u0 += unit) {
+                    void * yu = yr + (u0/unit)*unit_size;
+                    hq_encode_unit(type, xr + u0, yu, &info, &dg, false);
+                    if (hq_is_elementwise(type)) {
+                        hq_gptq_elements(type, xr, yu, &info, u0, unit, b0, b1, U, n, e + r*QK_K);
+                    } else {
+                        hq_gptq_groups(type, xr, yu, &info, &dg, u0, b0, b1, U, n, e + r*QK_K);
+                    }
+                }
+            }
+            if (b1 < n) {
+                for (int64_t j = b0; j < b1; ++j) {
+                    u[j - b0] = hq_urow(U, n, j);
+                }
+                hq_gptq_update(x + r0*n, n, nr, e, u, b1 - b0, b1);
+            }
+        }
+    }
+    return nrows*row_size;
 }
 
 size_t quantize_hq(enum ggml_type type, const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row) {
-    GGML_ASSERT(ggml_is_rotated(type));
+    return hq_quantize(type, (float *) src, dst, nrows, n_per_row, NULL);
+}
 
-    const size_t row_size = ggml_row_size(type, n_per_row);
-
-    hq_dec_grid dg;
-    hq_dec_grid_for(&dg, type);
-
-    char * qrow = (char *) dst;
-    for (int64_t row = 0; row < nrows; ++row) {
-        switch (type) {
-            case GGML_TYPE_HQ4_K: quantize_row_hq4_K_impl(src, (block_q4_K *) qrow, n_per_row); break;
-            case GGML_TYPE_HQ5_K: quantize_row_hq5_K_impl(src, (block_q5_K *) qrow, n_per_row); break;
-            case GGML_TYPE_HQ2_XXS:
-                quantize_row_hq2_xxs_impl(src, qrow, n_per_row);
-                hq2_xxs_repick(src, (block_iq2_xxs *) qrow, n_per_row, &dg);
-                break;
-            case GGML_TYPE_HQ2_XS:
-                quantize_row_hq2_xs_impl(src, qrow, n_per_row);
-                hq2_xs_repick(src, (block_iq2_xs *) qrow, n_per_row, &dg);
-                break;
-            case GGML_TYPE_HQ2_S:
-                quantize_row_hq2_s_impl(src, qrow, n_per_row);
-                hq2_s_repick(src, (block_iq2_s *) qrow, n_per_row, &dg);
-                break;
-            case GGML_TYPE_HQ3_XXS:
-                quantize_row_hq3_xxs_impl(src, qrow, n_per_row);
-                hq3_xxs_repick(src, (block_iq3_xxs *) qrow, n_per_row, &dg);
-                break;
-            case GGML_TYPE_HQ3_S:
-                quantize_row_hq3_s_impl(src, qrow, n_per_row);
-                hq3_s_repick(src, (block_iq3_s *) qrow, n_per_row, &dg);
-                break;
-            case GGML_TYPE_HQ4_NL: quantize_row_hq4_nl(src, (block_iq4_nl *) qrow, n_per_row); break;
-            case GGML_TYPE_HQ4_XS: quantize_row_hq4_xs(src, (block_iq4_xs *) qrow, n_per_row); break;
-            default: GGML_ABORT("fatal error");
-        }
-        src  += n_per_row;
-        qrow += row_size;
-    }
-
-    return nrows * row_size;
+size_t ggml_quantize_rows_gptq(enum ggml_type type, float * rows, void * dst, int64_t nrows, int64_t n_per_row, const float * U) {
+    GGML_ASSERT(U);
+    return hq_quantize(type, rows, dst, nrows, n_per_row, U);
 }

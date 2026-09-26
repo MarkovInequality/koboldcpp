@@ -131,6 +131,11 @@ python convert_hf_to_gguf.py --mmproj --outfile mmproj-gemma-4-E2B-it-Q8_0.gguf 
 ```
 
 ```bash
+# the same with an importance matrix: the HQ tensors are quantized with GPTQ error feedback
+./llama-quantize --hadamard --imatrix imatrix.gguf input-model-f16.gguf q4_k_m 8
+```
+
+```bash
 # rotate only the ffn_down tensors, leaving everything else unrotated
 ./llama-quantize --tensor-type "ffn_down=hq4_K" input-model-f16.gguf q4_k_m 8
 ```
@@ -217,11 +222,46 @@ y = (W·Rᵀ)·(R·x) = W·x
 
 There are no HQ file types: `--hadamard` maps each tensor type the chosen mix picks to its HQ variant, so `--hadamard IQ3_XS` gives HQ3_S / HQ3_XXS / HQ4_K tensors, and leaves types without an HQ variant (Q6_K, Q8_0, ...) as they are. Individual tensors can be selected with `--tensor-type`, e.g. `--tensor-type "ffn_down=hq4_K"`.
 
-HQ types are quantized with **nearest-neighbour rounding (uniform weights)** and **ignore `--imatrix`** (with one warning), so the IQ2 HQ types run without one. The unrotated types in the same mix still use the imatrix.
+### With an imatrix: GPTQ
+
+**With `--imatrix`, HQ tensors are quantized with GPTQ error feedback** in the rotated space; without one, with nearest-neighbour rounding (uniform weights). The IQ2 HQ types don't require an imatrix, but they need one to be useful.
+
+GPTQ uses the imatrix `v` as a diagonal Hessian of the unrotated inputs, rotated along with the rows: `H = R·(diag(v/mean(v)) + 0.01·I)·Rᵀ`. The rotation spreads the few loud input channels over every coordinate, so no per-coordinate weight can protect them, but `H` keeps them in its off-diagonal. The quantizer picks each value in turn (for the IQ2/IQ3 grids, each group of 8) with the type's usual scales and rounding rules, and feeds its error into the values not yet quantized, so that the errors cancel along the loud directions. The file format and inference are unchanged.
+
+* **Getting an imatrix:** this fork has no imatrix tool. Use upstream llama.cpp's `llama-imatrix` on the unrotated model; the same file serves the unrotated and the HQ types.
+* **Cost:** one Cholesky factorization of `H⁻¹` per distinct input width and imatrix entry (tensors that share an input, such as q/k/v and gate/up, reuse it), in fp64 on the CPU: `n³/3` flops, about 8 s at `n = 17408` on 8 cores. Encoding adds about `n²` multiply-adds per weight row. The factorization needs `10·n²` bytes (3 GB at `n = 17408`); a tensor whose factor would exceed `--max-buffer-size` (default 8 GiB, enough up to `n ≈ 29 000`) keeps uniform weights, with a warning. The factors and their cache are capped by `--max-buffer-size` separately from the tensor buffers, so peak memory can reach about twice it.
+* **Tensors without an imatrix entry** use uniform weights, with one warning that counts them, and so do the experts of a 3D tensor whose imatrix slice is all zero. The unrotated types in the same mix use the imatrix as usual.
+* **Metadata:** `quantize.hq.gptq_damp` records the damping when GPTQ ran, and is kept when HQ tensors are copied from a file that has it; nothing reads it.
+* **Developer switches:** `LLAMA_HQ_GPTQ=0` turns GPTQ off (HQ tensors then ignore the imatrix, byte-identical to a run without one), and `LLAMA_HQ_GPTQ_DAMP=<x>` sets the damping (default 0.01, at least 0.001).
 
 ### Measured quality
 
-Qwen3-4B, wikitext-2 test (80 windows of 512 tokens, the second half of each scored, 20 400 tokens), against the BF16 model. KL is the mean KL divergence to the BF16 model's next-token distribution (lower is better); the imatrix comes from upstream `llama-imatrix` on wikitext-2's training split. Single types use `--pure --token-embedding-type q6_K`.
+KL is the mean KL divergence to the BF16 model's next-token distribution (lower is better), over 80 windows of 512 tokens with the second half of each scored. The imatrix comes from upstream `llama-imatrix` on wikitext-2's training split (100 × 512 tokens). Single types use `--pure --token-embedding-type q6_K`. "—": the type needs an imatrix.
+
+**Qwen3-0.6B, with GPTQ.** Each cell is KL on wikitext-2 test / on `tech-eval`, 210 KB of this repo's docs and C++ that lies outside the imatrix's domain. The embedding is 26 % of this model's parameters, which is why the bpw is high.
+
+| type | bpw | plain | imatrix | HQ | HQ + GPTQ (`--hadamard --imatrix`) |
+| ---- | --: | ----: | ------: | -: | ---------------------------------: |
+| Q5_K | 5.78 | 0.0499 / 0.0364 | 0.0301 / 0.0239 | 0.0471 / 0.0347 | **0.0175 / 0.0141** |
+| Q4_K | 5.04 | 0.1886 / 0.1375 | 0.0863 / 0.0723 | 0.1685 / 0.1176 | **0.0541 / 0.0455** |
+| IQ4_NL | 5.04 | 0.1433 / 0.1048 | 0.0943 / 0.0760 | 0.1772 / 0.1385 | **0.0542 / 0.0471** |
+| IQ4_XS | 4.86 | 0.1486 / 0.1062 | 0.0972 / 0.0778 | 0.1870 / 0.1427 | **0.0579 / 0.0489** |
+| IQ3_S | 4.26 | 2.668 / 1.806 | 0.3299 / 0.2490 | 0.7997 / 0.4844 | **0.1805 / 0.1523** |
+| IQ3_XXS | 3.98 | — | 0.5249 / 0.4327 | 1.541 / 1.005 | **0.3325 / 0.2832** |
+| IQ2_S | 3.61 | — | 1.880 / 1.425 | 3.951 / 3.628 | **0.6471 / 0.5829** |
+| IQ2_XS | 3.43 | — | 2.117 / 2.192 | 7.339 / 6.701 | **1.063 / 0.933** |
+| IQ2_XXS | 3.24 | — | 3.243 / 4.029 | 9.144 / 10.73 | **1.555 / 1.401** |
+
+| mix | bpw | plain | imatrix | `--hadamard` | `--hadamard --imatrix` |
+| --- | --: | ----: | ------: | -----------: | ---------------------: |
+| Q4_K_M | 5.25 | 0.1105 / 0.0818 | 0.0672 / 0.0572 | 0.1067 / 0.0781 | **0.0440 / 0.0363** |
+| IQ4_XS | 4.86–4.88 | 0.1453 / 0.1053 | 0.0972 / 0.0778 | 0.1505 / 0.1156 | **0.0579 / 0.0489** |
+| IQ3_XS | 4.12 | — | 0.4180 / 0.3240 | 0.9310 / 0.6595 | **0.2301 / 0.1938** |
+| IQ2_XXS | 3.00 | — | 3.367 / 3.973 | 10.96 / 11.32 | **1.394 / 1.344** |
+
+Quantizing with GPTQ took 1.3–1.6× as long as uniform HQ (Q4_K_M: 8.8 s against 6.7 s on 8 threads).
+
+**Qwen3-4B, without GPTQ** (wikitext-2 test, 20 400 tokens scored; measured before GPTQ went in, so the HQ column is uniform weights):
 
 | type | bpw | KL plain | KL imatrix | KL HQ | PPL plain / imatrix / HQ |
 | ---- | --: | -------: | ---------: | ----: | ------------------------ |
@@ -246,11 +286,11 @@ Qwen3-4B, wikitext-2 test (80 windows of 512 tokens, the second half of each sco
 
 **What this means:**
 
-* **With an imatrix, use the unrotated imatrix quants.** They beat the HQ types at every width measured.
-* **Without an imatrix, `--hadamard` helps the K-quants and IQ3_S:** `--hadamard Q4_K_M` cuts KL by 19 % against plain Q4_K_M at the same size, HQ5_K and HQ4_K beat Q5_K and Q4_K, and HQ3_S more than halves IQ3_S's KL.
-* **Don't use HQ4_XS / HQ4_NL** (worse than the plain IQ4 types even without an imatrix) or **the HQ2 types** (unusable).
+* **With an imatrix, use `--hadamard --imatrix`.** On Qwen3-0.6B, HQ + GPTQ beats the unrotated types with the same imatrix at every type and mix: KL is 35–45 % lower at 3–6 bits and 50–66 % lower at 2 bits, on in-domain and out-of-domain text alike. A prototype of the same quantizer measured 32–38 % on Qwen3-4B.
+* **Without an imatrix, `--hadamard` helps the K-quants and IQ3_S:** `--hadamard Q4_K_M` cuts KL by 19 % on Qwen3-4B against plain Q4_K_M at the same size, HQ5_K and HQ4_K beat Q5_K and Q4_K, and HQ3_S more than halves IQ3_S's KL.
+* **Without an imatrix, don't use HQ4_XS / HQ4_NL** (worse than the plain IQ4 types) or **the HQ2 types** (unusable). With an imatrix, all of them beat their unrotated counterparts.
 
-Why: a few input channels of an LLM carry most of the activation energy (attention-sink / massive activations, e.g. four channels at ±1000–5000 in a couple of `ffn_down` inputs). Plain quantization happens to be accurate in exactly those weight columns — for IQ4 especially — while the rotation spreads each of them over the whole row, where nearest-neighbour rounding gives them only average accuracy. An imatrix can't be applied per rotated column to fix this; what does fix it is error feedback (GPTQ-style) in the rotated space using the imatrix as a diagonal Hessian, which a prototype measured at 32–38 % *below* the imatrix quants' KL (HQ4_XS 0.038 vs IQ4_XS + imatrix 0.061). That quantizer isn't implemented yet.
+Why uniform HQ needs GPTQ: a few input channels of an LLM carry most of the activation energy (attention-sink / massive activations, e.g. four channels at ±1000–5000 in a couple of `ffn_down` inputs). Plain quantization happens to be accurate in exactly those weight columns — for IQ4 especially — while the rotation spreads each of them over the whole row, where nearest-neighbour rounding gives them only average accuracy. An imatrix can't be applied per rotated column to fix this; error feedback in the rotated space, with the imatrix as a diagonal Hessian, does (see "With an imatrix: GPTQ" above).
 
 ### Speed
 
@@ -294,7 +334,7 @@ The HQ tests are separate programs, built with make. `maincuda`, `test-backend-o
 
 ```bash
 make LLAMA_CUBLAS=1 -j$(nproc) quantize_gguf main maincuda test-hadamard test-hadamard-quants test-hadamard-quantize \
-    test-hadamard-llama test-hadamard-llama-cuda test-hadamard-ppl test-hadamard-ppl-cuda test-backend-ops bench-rht
+    test-hq-gptq test-hadamard-llama test-hadamard-llama-cuda test-hadamard-ppl test-hadamard-ppl-cuda test-backend-ops bench-rht
 ```
 
 Some take a small model and a text file: a BF16 GGUF of Qwen3-0.6B (e.g. `Qwen3-0.6B-BF16.gguf` from `unsloth/Qwen3-0.6B-GGUF`) and wikitext-2's `wiki.test.raw` (in `wikitext-2-raw-v1.zip` from `ggml-org/ci` on Hugging Face). Every program exits non-zero on a failure; the `test-hadamard*` ones print PASS/FAIL per check.
@@ -303,7 +343,8 @@ Some take a small model and a text file: a BF16 GGUF of Qwen3-0.6B (e.g. `Qwen3-
 | ------- | -------------- | ---------- |
 | `test-hadamard` | The rotation itself: every Hadamard matrix (`H·Hᵀ = K·I`, the set of orders, row orientation), the width rule, the random signs (golden vectors), the transform against a dense `R` built from its definition, thread safety, that every way of splitting the work gives the same bytes, the HQ types' traits, pairing and names, row validation, and the CPU op with 1, 4 and 16 threads. | `./test-hadamard` |
 | `test-hadamard-quants` | The HQ quantizers: the base quantizers are unchanged (output hashes), HQ output decodes with the base type's kernels, no imatrix is needed or used, first-use initialization, determinism across threads, and a quantize → dequantize → un-rotate round trip. Also reports MSE against the base quantizers and how often the IQ2/IQ3 neighbour search differs from an exhaustive one. About a minute. | `./test-hadamard-quants` |
-| `test-hadamard-quantize` | The quantizer tool, through `llama_model_quantize` on a two-layer copy of the model: stored rows are `R·w` with the file's seed; the same seed gives identical files, any thread count gives identical files, and `--hadamard-seed` changes only the HQ tensors and the key; `hadamard.seed` is the only HQ metadata; the imatrix is ignored with one warning; unsupported widths keep their type (and an explicit HQ type for one is refused); the refusals (HQ token embeddings, a missing seed, a conflicting seed, HQ → unrotated); the requantize rules; and the `--lora` merge math and its refusals. About a minute. | `./test-hadamard-quantize <workdir> <Qwen3-0.6B-BF16.gguf>` |
+| `test-hadamard-quantize` | The quantizer tool, through `llama_model_quantize` on a two-layer copy of the model: stored rows are `R·w` with the file's seed; the same seed gives identical files, any thread count gives identical files, and `--hadamard-seed` changes only the HQ tensors and the key; `hadamard.seed` is the only HQ metadata without an imatrix; with a synthetic imatrix, GPTQ runs by default (one info line, `quantize.hq.gptq_damp`), tensors without an entry get the uniform bytes with one warning, `LLAMA_HQ_GPTQ=0` gives the uniform bytes, `LLAMA_HQ_GPTQ_DAMP` is checked and recorded, files are identical across thread counts, and HQ → the same HQ stays a copy; unsupported widths keep their type (and an explicit HQ type for one is refused); the refusals (HQ token embeddings, a missing seed, a conflicting seed, HQ → unrotated); the requantize rules, including GPTQ in the source's seed; the `--lora` merge math, with and without an imatrix, and its refusals; and per-expert factors for a 3D tensor. About a minute. | `./test-hadamard-quantize <workdir> <Qwen3-0.6B-BF16.gguf>` |
+| `test-hq-gptq` | GPTQ for the HQ types: the fp64 factor of `H⁻¹` (`U·H·Uᵀ = I` for widths up to 17 408 and several imatrix shapes, the worst case at the damping floor, the refusals, the same bytes for any thread count, and its timing), the factor cache (hits, LRU eviction, the memory cap), `quantize_hq`'s output unchanged for all nine types (hashes recorded before GPTQ went in), a scaled identity factor giving the uniform bytes, and for every type: the output error under `H` against uniform rounding, valid output that decodes with the base type's kernels, sign parity, and the same bytes for any row grouping and thread count. About a minute; `--quick` skips the factor sweep. | `./test-hq-gptq [--quick]` |
 | `test-hadamard-llama` | Loading and running HQ models. It takes plain quantizations and relabels their eligible tensors as HQ (the data isn't rotated; that doesn't matter here). Checks: HQ tensors load as their base type with the same bytes and buffer types (including the CPU repack), the loader still reports the HQ types, a saved model round-trips with its types and seed, one rotation per distinct rotated activation, no Hadamard graph inputs, the LoRA branch uses the unrotated input, the graph guard refuses every misuse of a rotated weight (wrong input, GET_ROWS, ADD, writes, views), a missing seed and a rotated `token_embd` are refused, and a model with an RPC device (an in-process server on 127.0.0.1:50931) is refused. The `-cuda` build also loads a real HQ model on the GPU and compares its logits with the CPU's. | `./quantize_gguf --pure <model-bf16.gguf> pure-q4k.gguf Q4_K`, then `./test-hadamard-llama <workdir> pure-q4k.gguf [more plain quantizations]` (same for `-cuda`) |
 | `test-backend-ops` | Upstream's backend test harness plus this fork's cases (`make_test_cases_fork`): the RHT op on CUDA against the CPU for every kernel, Hadamard order and width class, row counts, strides and 3D inputs; that CUDA accepts every width the rule accepts; and the graphs where the rotation writes the matmuls' 8-bit input directly, including every case that must fall back. | `./test-backend-ops -o RHT -b CUDA0`, also `-o MUL_MAT` and `-o MUL_MAT_ID`; repeat with `GGML_CUDA_DISABLE_FUSION=1` (all fusion off) and `GGML_CUDA_RHT_F32=1` (only the direct 8-bit output off) |
 | `bench-rht` | The CUDA kernels against the reference transform for every width class, the 8-bit outputs byte for byte against `quantize.cu`, and the device sign generator; then timings as CSV: µs per rotation in a CUDA graph for decode, and bandwidth against a copy for 512 rows. | `./bench-rht`; `--sweep` adds the kernel variants, `--once` launches each once for `ncu`, `-n N[,N...]`, `-r ROWS`, `-k A\|B` restrict the shapes |
@@ -316,7 +357,7 @@ tools/quantize/tests-hq.sh . Qwen3-0.6B-BF16.gguf wikitext-2-raw/wiki.test.raw /
 CUDA=1 tools/quantize/tests-hq.sh . Qwen3-0.6B-BF16.gguf wikitext-2-raw/wiki.test.raw /tmp/hq   # GPU
 ```
 
-`BIN=<dir>` takes the binaries from another directory than the repo root, and `CHUNKS=N` sets the number of windows for the KL checks (default 20).
+`BIN=<dir>` takes the binaries from another directory than the repo root, and `CHUNKS=N` sets the number of windows for the KL checks (default 20). `IMATRIX=<imatrix.gguf>` adds the GPTQ step: Q4_K_M, Q5_K_M, IQ4_XS, IQ3_S and IQ2_XXS with `--hadamard --imatrix` must beat uniform HQ by KL, and the first three must answer "Paris" and come within 10 % of the unrotated mix with the same imatrix.
 
 ## Background information on llama-quantize
 

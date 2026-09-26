@@ -60,6 +60,7 @@ models-mnt
 /maincuda
 /quantize_gguf
 /test-hadamard*
+/test-hq-gptq
 /test-backend-ops
 /bench-rht
 /ggml/src/ggml-cuda/**/*.d
