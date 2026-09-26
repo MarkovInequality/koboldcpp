@@ -332,6 +332,21 @@ int main(int argc, char ** argv) {
             n_hadamard_keys += strncmp(gguf_get_key(f.g, i), "hadamard.", 9) == 0;
         }
         check(n_hadamard_keys == 1 && !f.has_key("general.merged_loras"), "no other hadamard.* key, no general.merged_loras without --lora");
+        bool has_hq6 = false;
+        for (int64_t i = 0; i < gguf_get_n_tensors(f.g); ++i) {
+            has_hq6 |= f.t(gguf_get_tensor_name(f.g, i))->type == GGML_TYPE_HQ6_K;
+        }
+        check(has_hq6, "the mix's Q6_K tensors become HQ6_K");
+    }
+    const std::string hq40 = path("hqq-hq40.gguf");
+    {
+        check(quantize(src, hq40, LLAMA_FTYPE_MOSTLY_Q4_0, [](auto & p) { p.hadamard = true; }) == 0, "--hadamard Q4_0");
+        gguf_file f(hq40);
+        const std::vector<float> w  = to_f32(srcf.t(q), 0, 64*n_embd);
+        const std::vector<float> wq = to_f32(f.t(q), 0, 64*n_embd);
+        const double err_rot = nmse(wq, rotate_rows(w, n_embd, f.seed()));
+        printf("  (HQ4_0 nmse vs R*w: %.4g)\n", err_rot);
+        check(f.t(q)->type == GGML_TYPE_HQ4_0 && err_rot < 0.01 && !ggml_is_rotated(f.t(emb)->type), "attn_q is HQ4_0 and stores R*w");
     }
 
     printf("seed:\n");
@@ -443,6 +458,16 @@ int main(int argc, char ** argv) {
         const std::string iq = path("hqq-hq-iq2xxs.gguf");
         check(quantize(src, iq, LLAMA_FTYPE_MOSTLY_IQ2_XXS, [](auto & p) { p.hadamard = true; }) == 0,
               "--hadamard IQ2_XXS runs without an imatrix");
+
+        const std::string hq40im = path("hqq-hq40-im.gguf");
+        quantize(src, hq40im, LLAMA_FTYPE_MOSTLY_Q4_0, [&](auto & p) { p.hadamard = true; p.imatrix = im_all.get(); });
+        gguf_file u(hq40), g(hq40im);
+        const int64_t nrq = srcf.t(q)->ne[1];
+        const std::vector<float> want = rotate_rows(to_f32(srcf.t(q), 0, nrq*n_embd), n_embd, g.seed());
+        const double eu = out_err(want, to_f32(u.t(q), 0, nrq*n_embd), n_embd, im_all.at(q), u.seed());
+        const double eg = out_err(want, to_f32(g.t(q), 0, nrq*n_embd), n_embd, im_all.at(q), g.seed());
+        printf("  (HQ4_0 attn_q output error: uniform %.4g, GPTQ %.4g)\n", eu, eg);
+        check(g.t(q)->type == GGML_TYPE_HQ4_0 && log_count("(gptq)") > 0 && eg < 0.7*eu, "--hadamard --imatrix Q4_0: GPTQ beats uniform HQ4_0");
     }
 
     printf("unsupported widths:\n");
@@ -481,6 +506,30 @@ int main(int argc, char ** argv) {
         const int rc2 = quantize(syn, path("hqq-syn-q2.gguf"), LLAMA_FTYPE_MOSTLY_Q4_K_M, [&](auto & p) { p.tt_overrides = tto; });
         check(rc2 != 0 && g_log.find("no supported Hadamard rotation") != std::string::npos,
               "an explicit --tensor-type ...=hq4_K for that width is refused");
+    }
+
+    printf("output.weight without token_embd:\n");
+    {
+        // CodeShell-style: the embeddings come from output.weight, so it must stay unrotated
+        const std::string noemb = path("hqq-noemb.gguf"), o = path("hqq-noemb-q.gguf");
+        gguf_context * out = gguf_init_empty();
+        gguf_set_kv(out, srcf.g);
+        for (int64_t i = 0; i < gguf_get_n_tensors(srcf.g); ++i) {
+            ggml_tensor * t = srcf.t(gguf_get_tensor_name(srcf.g, i));
+            if (strcmp(t->name, "token_embd.weight") == 0) {
+                ggml_set_name(t, "output.weight");
+                gguf_add_tensor(out, t);
+                ggml_set_name(t, "token_embd.weight");
+            } else {
+                gguf_add_tensor(out, t);
+            }
+        }
+        gguf_write_to_file(out, noemb.c_str(), false);
+        gguf_free(out);
+        const int rc = quantize(noemb, o, LLAMA_FTYPE_MOSTLY_Q4_K_M, [](auto & p) { p.hadamard = true; });
+        gguf_file f(o);
+        check(rc == 0 && f.g && !ggml_is_rotated(f.t("output.weight")->type) && ggml_is_rotated(f.t(q)->type),
+              "--hadamard leaves output.weight unrotated when there's no token_embd");
     }
 
     printf("refusals:\n");

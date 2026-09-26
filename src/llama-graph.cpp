@@ -1511,16 +1511,24 @@ ggml_tensor * llm_graph_context::build_cvec(
 }
 
 ggml_tensor * llm_graph_context::rotate_input_if_rotated(ggml_tensor * w, ggml_tensor * cur) const {
-    if (!hq_model || !hq_model->is_rotated(w)) {
+    // a draft can use tensors of the model in ctx_other (EAGLE3/DFlash borrow its output), rotated with that model's seed
+    const llama_model * owner = hq_model && hq_model->is_rotated(w) ? hq_model : nullptr;
+    if (!owner && cparams.ctx_other) {
+        const llama_model * other = llama_get_model(cparams.ctx_other);
+        if (other && other->is_rotated(w)) {
+            owner = other;
+        }
+    }
+    if (!owner) {
         return cur;
     }
 
-    auto & cur_rot = hadamard_rot_cache[cur];
+    auto & cur_rot = hadamard_rot_cache[{ cur, owner->hadamard_seed }];
     if (!cur_rot) {
         // RHT is F32-only; a model feeding F16 here needs a ggml_cast to F32 first
         GGML_ASSERT(cur->type == GGML_TYPE_F32);
         ggml_tensor * x = ggml_is_contiguous_rows(cur) ? cur : ggml_cont(ctx0, cur);
-        cur_rot = ggml_rht(ctx0, x, hq_model->hadamard_seed);
+        cur_rot = ggml_rht(ctx0, x, owner->hadamard_seed);
     }
 
     return cur_rot;

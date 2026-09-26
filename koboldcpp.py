@@ -1562,7 +1562,7 @@ def dump_gguf_metadata(file_path): #if you're gonna copy this into your own proj
         fptr = 0
         dt_table = ["u8","i8","u16","i16","u32","i32","f32","bool","str","arr","u64","i64","f64"] #13 types, else error
         tt_table = ["f32","f16","q4_0","q4_1","q4_2","q4_3","q5_0","q5_1","q8_0","q8_1","q2_k","q3_k","q4_k","q5_k","q6_k","q8_k","iq2_xxs","iq2_xs","iq3_xxs","iq1_s","iq4_nl","iq3_s","iq2_s","iq4_xs","i8","i16","i32","i64","f64","iq1_m","bf16","q4_0_4_4","q4_0_4_8","q4_0_8_8","tq1_0","tq2_0","iq4_nl_4_4","iq4_nl_4_8","iq4_nl_8_8","mxfp4","nvfp4","q1_0","unknown","unknown","unknown","unknown"]
-        hq_table = {150:"hq4_k",151:"hq5_k",152:"hq2_xxs",153:"hq2_xs",154:"hq2_s",155:"hq3_xxs",156:"hq3_s",157:"hq4_nl",158:"hq4_xs"} # this fork's Hadamard-rotated types
+        hq_table = {150:"hq4_k",151:"hq5_k",152:"hq2_xxs",153:"hq2_xs",154:"hq2_s",155:"hq3_xxs",156:"hq3_s",157:"hq4_nl",158:"hq4_xs",159:"hq4_0",160:"hq4_1",161:"hq5_0",162:"hq5_1",163:"hq8_0",164:"hq2_k",165:"hq3_k",166:"hq6_k"} # this fork's Hadamard-rotated types
         def read_data(datatype):
             nonlocal fptr, data, dt_table
             if datatype=="u32":

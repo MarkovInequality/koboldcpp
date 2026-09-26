@@ -22,6 +22,8 @@ This plan makes `--imatrix` drive GPTQ error feedback in the rotated space, with
    space. It's **on by default** and applies to **all nine HQ types**:
    - element-wise grids: HQ4_K, HQ5_K, HQ4_XS, HQ4_NL
    - codebook grids: HQ3_S, HQ3_XXS, HQ2_S, HQ2_XS, HQ2_XXS
+   - *(Added 2026-09-26: the element-wise HQ4_0, HQ4_1, HQ5_0, HQ5_1, HQ8_0, HQ2_K, HQ3_K and
+     HQ6_K; see "The new HQ types" in the Implementation record.)*
 2. **The file format, inference, the types and `hadamard.seed` stay as they are.** Only the choice
    of codes changes, so GPTQ-made files load in any build that loads HQ files.
 3. **The uniform-weight HQ quantizer runs bit for bit as today** in three cases: without
@@ -628,6 +630,28 @@ against base + imatrix.
 | Q4_K_M (mix) | 6.7 s | 8.8 s |
 
 GPTQ costs 1.3–1.6× uniform HQ, well inside the 3× target; the prototype took 24.4 s for HQ4_K.
+
+### The new HQ types (2026-09-26)
+
+HQ variants of Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K and Q6_K were added, following
+`plans/full_row_rht_quantization_plan.md` ("Addendum"). All eight are element-wise, so GPTQ covers
+them with the §3.1 step. Changes to the driver:
+- **`hq_get_levels`** describes a unit's decode per scale of 16 or 32 values, as symmetric
+  (`d·(code + lmin)`) or affine (`d·code + m`); the IQ4 types keep their table lookup.
+  - The step picks each code with the helper the type's `_impl` uses in its final pass:
+    `hq_s_code` for Q4_0/Q5_0/Q8_0/Q3_K/Q6_K, `hq_k_code` for Q4_1/Q5_1/Q2_K/Q4_K/Q5_K.
+  - Where a scale is 0, it keeps the `_impl`'s code.
+- **`hq_get_codes` / `hq_set_codes`** cover all twelve element-wise layouts.
+- **The unit is the type's block** (`ggml_blck_size`): 32 values for the legacy types, as for HQ4_NL.
+- The §3.3 equivalence holds bitwise for all seventeen types, and the pre-existing types' uniform
+  output is unchanged (the recorded hashes).
+
+**Results** (tables in the addendum's Implementation record):
+- On Qwen3-0.6B, HQ + GPTQ beats base + imatrix for every new type and mix by 30–68 % KL, on both
+  texts.
+- GPTQ in-sample output error is 0.13–0.25× uniform.
+- Cost is a roughly fixed 3–7 s per 0.6B run, up to 5× the fastest uniform quantizers (HQ3_K
+  1.5 → 8.3 s).
 
 ## Future work
 

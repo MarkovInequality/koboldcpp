@@ -1255,6 +1255,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
     const size_t max_buf_size = params->max_buf_size ? params->max_buf_size : LLAMA_QUANT_MAX_BUF_SIZE;
 
+    // without token_embd, some architectures (CodeShell) read the embeddings from output.weight
+    bool has_token_embd = false;
+    for (const auto * it : tensors) {
+        has_token_embd |= std::strcmp(ggml_get_name(it->tensor), "token_embd.weight") == 0;
+    }
+
     //
     // preliminary iteration over all weights
     //
@@ -1274,7 +1280,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         if (metadata[i].allows_quantization) {
             ggml_type type = llama_tensor_get_type(qs, params, tensor, default_type, metadata[i]);
             const bool explicit_hq = ggml_is_rotated(type) && !ggml_is_rotated(tensor->type);
-            const bool embd        = metadata[i].category == tensor_category::TOKEN_EMBD;
+            const bool embd        = metadata[i].category == tensor_category::TOKEN_EMBD ||
+                                     (!has_token_embd && metadata[i].category == tensor_category::OUTPUT);
 
             if (params->hadamard && !embd) {
                 type = ggml_get_rotated_type(type);

@@ -77,12 +77,12 @@ grep -c PASS "$WORK"/unit.log | sed 's/^/checks passed: /'
 echo PASS
 
 echo "== quantize with --hadamard and generate"
-for FT in Q4_K_M Q5_K_M IQ4_XS IQ3_S IQ3_XS IQ2_XXS; do
+for FT in Q8_0 Q4_K_M Q5_K_M Q4_0 IQ4_XS Q3_K_M IQ3_S IQ3_XS Q2_K IQ2_XXS; do
     "$QUANTIZE" --hadamard "$SRC" "$WORK"/hq-$FT.gguf $FT > "$WORK"/q-$FT.log 2>&1
     OUT=$(gen "$WORK"/hq-$FT.gguf)
     echo "$FT: $OUT"
     case $FT in
-        Q4_K_M|Q5_K_M|IQ4_XS)
+        Q8_0|Q4_K_M|Q5_K_M|Q4_0|IQ4_XS)
             echo "$OUT" | grep -q Paris || { echo "FAIL: $FT generation"; exit 1; } ;;
     esac
 done
@@ -103,7 +103,7 @@ echo PASS
 if [ -n "${IMATRIX:-}" ]; then
     IM=$(realpath "$IMATRIX")
     echo "== --hadamard --imatrix: GPTQ"
-    GPTQ_TYPES="Q4_K_M Q5_K_M IQ4_XS IQ3_S IQ2_XXS"
+    GPTQ_TYPES="Q8_0 Q4_K_M Q5_K_M Q4_0 IQ4_XS Q3_K_M IQ3_S Q2_K IQ2_XXS"
     MODELS=""
     for FT in $GPTQ_TYPES; do
         "$QUANTIZE" --hadamard --imatrix "$IM" "$SRC" "$WORK"/hqg-$FT.gguf $FT > "$WORK"/qg-$FT.log 2>&1
@@ -112,7 +112,7 @@ if [ -n "${IMATRIX:-}" ]; then
         OUT=$(gen "$WORK"/hqg-$FT.gguf)
         echo "$FT: $OUT"
         case $FT in
-            Q4_K_M|Q5_K_M|IQ4_XS)
+            Q8_0|Q4_K_M|Q5_K_M|Q4_0|IQ4_XS|Q3_K_M)
                 echo "$OUT" | grep -q Paris || { echo "FAIL: $FT generation with GPTQ"; exit 1; } ;;
         esac
         MODELS="$MODELS $WORK/hq-$FT.gguf $WORK/hqg-$FT.gguf $WORK/im-$FT.gguf"
@@ -123,7 +123,7 @@ if [ -n "${IMATRIX:-}" ]; then
         K_HQ=$(field "$T" hq-$FT.gguf 5); K_G=$(field "$T" hqg-$FT.gguf 5); K_IM=$(field "$T" im-$FT.gguf 5)
         awk -v a="$K_G" -v b="$K_HQ" 'BEGIN { exit !(a < b) }' || { echo "FAIL: $FT: KL with GPTQ $K_G vs uniform HQ $K_HQ"; exit 1; }
         case $FT in
-            Q4_K_M|Q5_K_M|IQ4_XS)
+            Q8_0|Q4_K_M|Q5_K_M|Q4_0|IQ4_XS|Q3_K_M)
                 ratio_le "$K_G" "$K_IM" 1.1 || { echo "FAIL: $FT: KL with GPTQ $K_G vs base + imatrix $K_IM"; exit 1; } ;;
         esac
     done

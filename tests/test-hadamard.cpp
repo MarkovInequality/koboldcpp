@@ -411,7 +411,11 @@ static const std::vector<std::pair<ggml_type, ggml_type>> hq_pairs = {
     { GGML_TYPE_IQ2_XXS, GGML_TYPE_HQ2_XXS }, { GGML_TYPE_IQ2_XS,  GGML_TYPE_HQ2_XS  },
     { GGML_TYPE_IQ2_S,   GGML_TYPE_HQ2_S   }, { GGML_TYPE_IQ3_XXS, GGML_TYPE_HQ3_XXS },
     { GGML_TYPE_IQ3_S,   GGML_TYPE_HQ3_S   }, { GGML_TYPE_IQ4_NL,  GGML_TYPE_HQ4_NL  },
-    { GGML_TYPE_IQ4_XS,  GGML_TYPE_HQ4_XS  },
+    { GGML_TYPE_IQ4_XS,  GGML_TYPE_HQ4_XS  }, { GGML_TYPE_Q4_0,    GGML_TYPE_HQ4_0   },
+    { GGML_TYPE_Q4_1,    GGML_TYPE_HQ4_1   }, { GGML_TYPE_Q5_0,    GGML_TYPE_HQ5_0   },
+    { GGML_TYPE_Q5_1,    GGML_TYPE_HQ5_1   }, { GGML_TYPE_Q8_0,    GGML_TYPE_HQ8_0   },
+    { GGML_TYPE_Q2_K,    GGML_TYPE_HQ2_K   }, { GGML_TYPE_Q3_K,    GGML_TYPE_HQ3_K   },
+    { GGML_TYPE_Q6_K,    GGML_TYPE_HQ6_K   },
 };
 
 static void test_types() {
@@ -421,8 +425,12 @@ static void test_types() {
         { GGML_TYPE_HQ4_K, "hq4_K" }, { GGML_TYPE_HQ5_K, "hq5_K" }, { GGML_TYPE_HQ2_XXS, "hq2_xxs" },
         { GGML_TYPE_HQ2_XS, "hq2_xs" }, { GGML_TYPE_HQ2_S, "hq2_s" }, { GGML_TYPE_HQ3_XXS, "hq3_xxs" },
         { GGML_TYPE_HQ3_S, "hq3_s" }, { GGML_TYPE_HQ4_NL, "hq4_nl" }, { GGML_TYPE_HQ4_XS, "hq4_xs" },
+        { GGML_TYPE_HQ4_0, "hq4_0" }, { GGML_TYPE_HQ4_1, "hq4_1" }, { GGML_TYPE_HQ5_0, "hq5_0" },
+        { GGML_TYPE_HQ5_1, "hq5_1" }, { GGML_TYPE_HQ8_0, "hq8_0" }, { GGML_TYPE_HQ2_K, "hq2_K" },
+        { GGML_TYPE_HQ3_K, "hq3_K" }, { GGML_TYPE_HQ6_K, "hq6_K" },
     };
-    check(GGML_TYPE_COUNT == 159 && GGML_TYPE_HQ4_K == 150 && GGML_TYPE_HQ4_XS == 158, "indices 150..158, GGML_TYPE_COUNT == 159");
+    check(GGML_TYPE_COUNT == 167 && GGML_TYPE_HQ4_K == 150 && GGML_TYPE_HQ4_XS == 158 && GGML_TYPE_HQ4_0 == 159 &&
+          GGML_TYPE_HQ6_K == 166, "indices 150..166, GGML_TYPE_COUNT == 167");
 
     for (const auto & [base, hq] : hq_pairs) {
         const ggml_type_traits * tb = ggml_get_type_traits(base);
@@ -462,7 +470,7 @@ static void test_types() {
         }
         others &= is_base || ggml_get_rotated_type(type) == type;
     }
-    check(others, "every non-HQ type is its own base; only the nine bases have a rotated type");
+    check(others, "every non-HQ type is its own base; only the seventeen bases have a rotated type");
 }
 
 static void test_validate() {
@@ -479,9 +487,12 @@ static void test_validate() {
         const bool valid = ggml_validate_row_data(base, row.data(), row.size()) &&
                            ggml_validate_row_data(hq,   row.data(), row.size());
 
+        // the fp16 scale d: first in most blocks, last in Q3_K/Q6_K's, before dmin in Q2_K's
+        const size_t ts = ggml_type_size(base);
+        const size_t d_offs = base == GGML_TYPE_Q2_K ? ts - 4 : base == GGML_TYPE_Q3_K || base == GGML_TYPE_Q6_K ? ts - 2 : 0;
         std::vector<uint8_t> bad = row;
         const uint16_t nan16 = 0x7e00;
-        memcpy(bad.data(), &nan16, sizeof(nan16));
+        memcpy(bad.data() + d_offs, &nan16, sizeof(nan16));
         const bool rejected = !ggml_validate_row_data(base, bad.data(), bad.size()) &&
                               !ggml_validate_row_data(hq,   bad.data(), bad.size());
 

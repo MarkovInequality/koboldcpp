@@ -245,9 +245,13 @@ static void test_cache() {
 // ====================== the encoder
 
 static const ggml_type all_types[] = { GGML_TYPE_HQ4_K, GGML_TYPE_HQ5_K, GGML_TYPE_HQ4_XS, GGML_TYPE_HQ4_NL,
-    GGML_TYPE_HQ3_S, GGML_TYPE_HQ3_XXS, GGML_TYPE_HQ2_S, GGML_TYPE_HQ2_XS, GGML_TYPE_HQ2_XXS };
+    GGML_TYPE_HQ3_S, GGML_TYPE_HQ3_XXS, GGML_TYPE_HQ2_S, GGML_TYPE_HQ2_XS, GGML_TYPE_HQ2_XXS,
+    GGML_TYPE_HQ4_0, GGML_TYPE_HQ4_1, GGML_TYPE_HQ5_0, GGML_TYPE_HQ5_1, GGML_TYPE_HQ8_0,
+    GGML_TYPE_HQ2_K, GGML_TYPE_HQ3_K, GGML_TYPE_HQ6_K };
 
-static const ggml_type elementwise_types[] = { GGML_TYPE_HQ4_K, GGML_TYPE_HQ5_K, GGML_TYPE_HQ4_XS, GGML_TYPE_HQ4_NL };
+static const ggml_type elementwise_types[] = { GGML_TYPE_HQ4_K, GGML_TYPE_HQ5_K, GGML_TYPE_HQ4_XS, GGML_TYPE_HQ4_NL,
+    GGML_TYPE_HQ4_0, GGML_TYPE_HQ4_1, GGML_TYPE_HQ5_0, GGML_TYPE_HQ5_1, GGML_TYPE_HQ8_0,
+    GGML_TYPE_HQ2_K, GGML_TYPE_HQ3_K, GGML_TYPE_HQ6_K };
 
 static const ggml_type codebook_types[] = { GGML_TYPE_HQ3_S, GGML_TYPE_HQ3_XXS, GGML_TYPE_HQ2_S, GGML_TYPE_HQ2_XS, GGML_TYPE_HQ2_XXS };
 
@@ -256,7 +260,7 @@ static bool parity_signs(ggml_type type) {
 }
 
 static std::vector<int64_t> widths(ggml_type type) {
-    if (type == GGML_TYPE_HQ4_NL) {
+    if (ggml_blck_size(type) == 32) {
         return { 96, 800, 2048 };
     }
     return { 256, 768, 2048 };
@@ -288,8 +292,8 @@ static uint64_t fnv1a(uint64_t h, const void * p, size_t n) {
     return h;
 }
 
-// quantize_hq's output before the shared driver, 8 hash_rows rows for seeds 1..3, on x86-64 with FMA
-// (other builds may round differently)
+// quantize_hq's output, 8 hash_rows rows for seeds 1..3, on x86-64 with FMA (other builds may round
+// differently): for the first nine types recorded before the shared driver, for the rest when they were added
 static const struct { ggml_type type; int64_t n; uint64_t hash; } hq_hashes[] = {
     { GGML_TYPE_HQ4_K,    256, 0xd1892cd3bf0805f4ull },
     { GGML_TYPE_HQ4_K,    768, 0xd29cca2c9a9313b6ull },
@@ -318,6 +322,30 @@ static const struct { ggml_type type; int64_t n; uint64_t hash; } hq_hashes[] = 
     { GGML_TYPE_HQ2_XXS,   256, 0xf48122f2ac589e4full },
     { GGML_TYPE_HQ2_XXS,   768, 0xed64bcccf16b3f03ull },
     { GGML_TYPE_HQ2_XXS,  2048, 0x49a31d04927f93a3ull },
+    { GGML_TYPE_HQ4_0,      96, 0xf260c492f1e8d1d9ull },
+    { GGML_TYPE_HQ4_0,     800, 0x85b063452c2d726dull },
+    { GGML_TYPE_HQ4_0,    2048, 0x5be01b090e9d6b64ull },
+    { GGML_TYPE_HQ4_1,      96, 0x659414e5ece8ea10ull },
+    { GGML_TYPE_HQ4_1,     800, 0x622d4e18279b6280ull },
+    { GGML_TYPE_HQ4_1,    2048, 0xeb90288e8730c09aull },
+    { GGML_TYPE_HQ5_0,      96, 0xb4a6f76052bbce04ull },
+    { GGML_TYPE_HQ5_0,     800, 0xe8cfb78b697b5f7full },
+    { GGML_TYPE_HQ5_0,    2048, 0x5c18868a01c2bfadull },
+    { GGML_TYPE_HQ5_1,      96, 0xea814a89f2bdc466ull },
+    { GGML_TYPE_HQ5_1,     800, 0x23ed6394073dd097ull },
+    { GGML_TYPE_HQ5_1,    2048, 0x705da62e15fe0ce6ull },
+    { GGML_TYPE_HQ8_0,      96, 0x33c7ba3b22c475f1ull },
+    { GGML_TYPE_HQ8_0,     800, 0xcf2e714238a42e35ull },
+    { GGML_TYPE_HQ8_0,    2048, 0x4b004a53f513a649ull },
+    { GGML_TYPE_HQ2_K,     256, 0xbb81c28c6bac2fb6ull },
+    { GGML_TYPE_HQ2_K,     768, 0x236e1978e39247b8ull },
+    { GGML_TYPE_HQ2_K,    2048, 0x9675e5dbfc88c8c1ull },
+    { GGML_TYPE_HQ3_K,     256, 0x66c020c44bb989f5ull },
+    { GGML_TYPE_HQ3_K,     768, 0x4797ccc925f3abe5ull },
+    { GGML_TYPE_HQ3_K,    2048, 0xe9453e4ebdeb910cull },
+    { GGML_TYPE_HQ6_K,     256, 0xb899178405b4306dull },
+    { GGML_TYPE_HQ6_K,     768, 0x0bbaaa14d66ad5d6ull },
+    { GGML_TYPE_HQ6_K,    2048, 0x83103140a87292b7ull },
 };
 
 static std::vector<uint8_t> quantize_uniform(ggml_type type, const std::vector<float> & x, int64_t n) {
@@ -388,7 +416,7 @@ static std::vector<float> gauss_rows(int64_t nrows, int64_t n, uint64_t seed) {
 }
 
 static void test_hashes() {
-    printf("quantize_hq output is unchanged (hashes recorded before the shared driver):\n");
+    printf("quantize_hq output is unchanged (recorded hashes):\n");
     for (ggml_type type : all_types) {
         bool ok = true;
         std::string ns;
@@ -432,7 +460,7 @@ static void test_encoder(const std::vector<ggml_type> & types, double max_ratio)
     const uint64_t seed = 0x48512d524854ull;
 
     for (ggml_type type : types) {
-        const int64_t n = type == GGML_TYPE_HQ4_NL ? 800 : 2048;
+        const int64_t n = ggml_blck_size(type) == 32 ? 800 : 2048;
         const int64_t nrows = 64;
         const std::vector<float> v = spiky_v(n, 3);
         std::vector<float> vbar, U;

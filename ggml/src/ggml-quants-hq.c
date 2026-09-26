@@ -177,6 +177,55 @@ static float make_qp_quants(int n, int nmax, const float * GGML_RESTRICT x, uint
     return suml2 > 0.0f ? sumlx / suml2 : 0.0f;
 }
 
+// make_qx_quants with uniform weights: the codes l + nmax in L, the least-squares scale returned
+static float hq_make_qx_quants(int n, int nmax, const float * GGML_RESTRICT x, int8_t * GGML_RESTRICT L) {
+    float max = 0;
+    float amax = 0;
+    for (int i = 0; i < n; ++i) {
+        float ax = fabsf(x[i]);
+        if (ax > amax) { amax = ax; max = x[i]; }
+    }
+    if (amax < GROUP_MAX_EPS) {
+        for (int i = 0; i < n; ++i) {
+            L[i] = 0;
+        }
+        return 0.f;
+    }
+    float iscale = -nmax / max;
+    float sumlx = 0;
+    float suml2 = 0;
+    for (int i = 0; i < n; ++i) {
+        int l = nearest_int(iscale * x[i]);
+        l = MAX(-nmax, MIN(nmax-1, l));
+        L[i] = l + nmax;
+        sumlx += x[i]*l;
+        suml2 += l*l;
+    }
+    float scale = suml2 ? sumlx/suml2 : 0.0f;
+    float best = scale * sumlx;
+    for (int is = -9; is <= 9; ++is) {
+        if (is == 0) {
+            continue;
+        }
+        iscale = -(nmax + 0.1f*is) / max;
+        sumlx = suml2 = 0;
+        for (int i = 0; i < n; ++i) {
+            int l = nearest_int(iscale * x[i]);
+            l = MAX(-nmax, MIN(nmax-1, l));
+            sumlx += x[i]*l;
+            suml2 += l*l;
+        }
+        if (suml2 > 0 && sumlx*sumlx > best*suml2) {
+            for (int i = 0; i < n; ++i) {
+                int l = nearest_int(iscale * x[i]);
+                L[i] = nmax + MAX(-nmax, MIN(nmax-1, l));
+            }
+            scale = sumlx/suml2; best = scale*sumlx;
+        }
+    }
+    return scale;
+}
+
 static inline void get_scale_min_k4(int j, const uint8_t * GGML_RESTRICT q, uint8_t * GGML_RESTRICT d, uint8_t * GGML_RESTRICT m) {
     if (j < 4) {
         *d = q[j] & 63; *m = q[j + 4] & 63;
@@ -188,11 +237,18 @@ static inline void get_scale_min_k4(int j, const uint8_t * GGML_RESTRICT q, uint
 
 // ====================== HQ4_K / HQ5_K
 
-// the final code of a K-quant value, at a sub-block's scale d != 0 and min dm
+// the final code of an affine value (d*l - dm), at a scale d != 0
 static inline int hq_k_code(float x, float d, float dm, int nmax) {
     const float v = (x + dm)/d;
     const int l = nearest_int(fminf(fmaxf(v, -4194303.f), 4194303.f));
     return MAX(0, MIN(nmax, l));
+}
+
+// the final level of a symmetric value (d*l), at a scale d != 0
+static inline int hq_s_code(float x, float d, int lmin, int lmax) {
+    const float v = x/d;
+    const int l = nearest_int(fminf(fmaxf(v, -4194303.f), 4194303.f));
+    return MAX(lmin, MIN(lmax, l));
 }
 
 static void quantize_row_hq4_K_impl(const float * GGML_RESTRICT x, block_q4_K * GGML_RESTRICT y, int64_t n_per_row) {
@@ -1520,10 +1576,377 @@ static void quantize_row_hq4_nl_impl(const int super_block_size, const int block
     }
 }
 
+// ====================== code layouts of the element-wise types
+
+// the codes of one unit (the type's block), one per value: HQ4_K/HQ5_K/HQ2_K/HQ3_K/HQ6_K as 0..nmax,
+// the IQ4 types as table indices, HQ4_0/HQ5_0/HQ8_0 as level + 8/16/128, HQ4_1/HQ5_1 as 0..nmax
+static void hq_get_codes(enum ggml_type type, const void * GGML_RESTRICT y, uint8_t * GGML_RESTRICT L, int unit) {
+    switch (type) {
+        case GGML_TYPE_HQ4_K:
+        case GGML_TYPE_HQ5_K:
+            {
+                const uint8_t * qs = type == GGML_TYPE_HQ4_K ? ((const block_q4_K *) y)->qs : ((const block_q5_K *) y)->qs;
+                for (int j = 0; j < QK_K; ++j) {
+                    const uint8_t q = qs[(j/64)*32 + j%32];
+                    L[j] = j%64 < 32 ? q & 0xF : q >> 4;
+                }
+                if (type == GGML_TYPE_HQ5_K) {
+                    const uint8_t * qh = ((const block_q5_K *) y)->qh;
+                    for (int j = 0; j < QK_K; ++j) {
+                        L[j] |= ((qh[j%32] >> (2*(j/64) + (j%64)/32)) & 1) << 4;
+                    }
+                }
+            } break;
+        case GGML_TYPE_HQ4_XS:
+        case GGML_TYPE_HQ4_NL:
+        case GGML_TYPE_HQ4_0:
+        case GGML_TYPE_HQ4_1:
+        case GGML_TYPE_HQ5_0:
+        case GGML_TYPE_HQ5_1:
+            {
+                const uint8_t * qs =
+                    type == GGML_TYPE_HQ4_XS ? ((const block_iq4_xs *) y)->qs :
+                    type == GGML_TYPE_HQ4_NL ? ((const block_iq4_nl *) y)->qs :
+                    type == GGML_TYPE_HQ4_0  ? ((const block_q4_0 *) y)->qs :
+                    type == GGML_TYPE_HQ4_1  ? ((const block_q4_1 *) y)->qs :
+                    type == GGML_TYPE_HQ5_0  ? ((const block_q5_0 *) y)->qs : ((const block_q5_1 *) y)->qs;
+                for (int j = 0; j < unit; ++j) {
+                    const uint8_t q = qs[16*(j/32) + j%16];
+                    L[j] = j%32 < 16 ? q & 0xF : q >> 4;
+                }
+                if (type == GGML_TYPE_HQ5_0 || type == GGML_TYPE_HQ5_1) {
+                    uint32_t qh;
+                    memcpy(&qh, type == GGML_TYPE_HQ5_0 ? ((const block_q5_0 *) y)->qh : ((const block_q5_1 *) y)->qh, sizeof(qh));
+                    for (int j = 0; j < QK5_0; ++j) {
+                        L[j] |= ((qh >> j) & 1) << 4;
+                    }
+                }
+            } break;
+        case GGML_TYPE_HQ8_0:
+            for (int j = 0; j < QK8_0; ++j) {
+                L[j] = (uint8_t) (((const block_q8_0 *) y)->qs[j] + 128);
+            }
+            break;
+        case GGML_TYPE_HQ2_K:
+        case GGML_TYPE_HQ3_K:
+            {
+                const uint8_t * qs = type == GGML_TYPE_HQ2_K ? ((const block_q2_K *) y)->qs : ((const block_q3_K *) y)->qs;
+                for (int j = 0; j < QK_K; ++j) {
+                    L[j] = (qs[32*(j/128) + j%32] >> 2*((j%128)/32)) & 3;
+                }
+                if (type == GGML_TYPE_HQ3_K) {
+                    const uint8_t * hmask = ((const block_q3_K *) y)->hmask;
+                    for (int j = 0; j < QK_K; ++j) {
+                        L[j] |= ((hmask[j%32] >> (j/32)) & 1) << 2;
+                    }
+                }
+            } break;
+        case GGML_TYPE_HQ6_K:
+            {
+                const block_q6_K * b = y;
+                for (int j = 0; j < QK_K; ++j) {
+                    const int c = j/128, l = j%32, q = (j%128)/32;
+                    const int lo = (b->ql[64*c + l + 32*(q%2)] >> 4*(q/2)) & 0xF;
+                    const int hi = (b->qh[32*c + l] >> 2*q) & 3;
+                    L[j] = (uint8_t) (lo | (hi << 4));
+                }
+            } break;
+        default: GGML_ABORT("fatal error");
+    }
+}
+
+static void hq_set_codes(enum ggml_type type, void * GGML_RESTRICT y, const uint8_t * GGML_RESTRICT L, int unit) {
+    switch (type) {
+        case GGML_TYPE_HQ4_K:
+        case GGML_TYPE_HQ5_K:
+            {
+                uint8_t * qs = type == GGML_TYPE_HQ4_K ? ((block_q4_K *) y)->qs : ((block_q5_K *) y)->qs;
+                for (int j = 0; j < QK_K; j += 64) {
+                    for (int l = 0; l < 32; ++l) {
+                        qs[j/2 + l] = (L[j + l] & 0xF) | ((L[j + l + 32] & 0xF) << 4);
+                    }
+                }
+                if (type == GGML_TYPE_HQ5_K) {
+                    uint8_t * qh = ((block_q5_K *) y)->qh;
+                    memset(qh, 0, QK_K/8);
+                    for (int j = 0; j < QK_K; ++j) {
+                        qh[j%32] |= (L[j] >> 4) << (2*(j/64) + (j%64)/32);
+                    }
+                }
+            } break;
+        case GGML_TYPE_HQ4_XS:
+        case GGML_TYPE_HQ4_NL:
+        case GGML_TYPE_HQ4_0:
+        case GGML_TYPE_HQ4_1:
+        case GGML_TYPE_HQ5_0:
+        case GGML_TYPE_HQ5_1:
+            {
+                uint8_t * qs =
+                    type == GGML_TYPE_HQ4_XS ? ((block_iq4_xs *) y)->qs :
+                    type == GGML_TYPE_HQ4_NL ? ((block_iq4_nl *) y)->qs :
+                    type == GGML_TYPE_HQ4_0  ? ((block_q4_0 *) y)->qs :
+                    type == GGML_TYPE_HQ4_1  ? ((block_q4_1 *) y)->qs :
+                    type == GGML_TYPE_HQ5_0  ? ((block_q5_0 *) y)->qs : ((block_q5_1 *) y)->qs;
+                for (int i = 0; i < unit/32; ++i) {
+                    for (int j = 0; j < 16; ++j) {
+                        qs[16*i + j] = (L[32*i + j] & 0xF) | ((L[32*i + 16 + j] & 0xF) << 4);
+                    }
+                }
+                if (type == GGML_TYPE_HQ5_0 || type == GGML_TYPE_HQ5_1) {
+                    uint32_t qh = 0;
+                    for (int j = 0; j < QK5_0; ++j) {
+                        qh |= (uint32_t) ((L[j] >> 4) & 1) << j;
+                    }
+                    memcpy(type == GGML_TYPE_HQ5_0 ? ((block_q5_0 *) y)->qh : ((block_q5_1 *) y)->qh, &qh, sizeof(qh));
+                }
+            } break;
+        case GGML_TYPE_HQ8_0:
+            for (int j = 0; j < QK8_0; ++j) {
+                ((block_q8_0 *) y)->qs[j] = (int8_t) (L[j] - 128);
+            }
+            break;
+        case GGML_TYPE_HQ2_K:
+        case GGML_TYPE_HQ3_K:
+            {
+                uint8_t * qs = type == GGML_TYPE_HQ2_K ? ((block_q2_K *) y)->qs : ((block_q3_K *) y)->qs;
+                for (int j = 0; j < QK_K; j += 128) {
+                    for (int l = 0; l < 32; ++l) {
+                        qs[j/4 + l] = (L[j + l] & 3) | ((L[j + l + 32] & 3) << 2) | ((L[j + l + 64] & 3) << 4) | ((L[j + l + 96] & 3) << 6);
+                    }
+                }
+                if (type == GGML_TYPE_HQ3_K) {
+                    uint8_t * hmask = ((block_q3_K *) y)->hmask;
+                    memset(hmask, 0, QK_K/8);
+                    for (int j = 0; j < QK_K; ++j) {
+                        hmask[j%32] |= ((L[j] >> 2) & 1) << (j/32);
+                    }
+                }
+            } break;
+        case GGML_TYPE_HQ6_K:
+            {
+                uint8_t * ql = ((block_q6_K *) y)->ql;
+                uint8_t * qh = ((block_q6_K *) y)->qh;
+                for (int j = 0; j < QK_K; j += 128) {
+                    for (int l = 0; l < 32; ++l) {
+                        ql[l +  0] = (L[j + l +  0] & 0xF) | ((L[j + l + 64] & 0xF) << 4);
+                        ql[l + 32] = (L[j + l + 32] & 0xF) | ((L[j + l + 96] & 0xF) << 4);
+                        qh[l] = (L[j + l] >> 4) | ((L[j + l + 32] >> 4) << 2) | ((L[j + l + 64] >> 4) << 4) | ((L[j + l + 96] >> 4) << 6);
+                    }
+                    ql += 64;
+                    qh += 32;
+                }
+            } break;
+        default: GGML_ABORT("fatal error");
+    }
+}
+
+// ====================== HQ4_0 / HQ4_1 / HQ5_0 / HQ5_1 / HQ8_0
+//
+// The base _impls' scale searches with uniform weights (Q8_0's scale is absmax/127, as in its base).
+// Unlike the base quantizers, every code is then re-picked at the stored fp16 scale, as the K-quant
+// _impls do, so a code never decodes worse than the one the search chose.
+
+static void quantize_row_hq4_0_impl(const float * GGML_RESTRICT x, block_q4_0 * GGML_RESTRICT y, int64_t n) {
+    int8_t  Lq[QK4_0];
+    uint8_t L[QK4_0];
+    for (int64_t ib = 0; ib < n/QK4_0; ++ib) {
+        const float * xb = x + QK4_0*ib;
+        y[ib].d = GGML_FP32_TO_FP16(hq_make_qx_quants(QK4_0, 8, xb, Lq));
+        const float d = GGML_FP16_TO_FP32(y[ib].d);
+        for (int j = 0; j < QK4_0; ++j) {
+            L[j] = d ? hq_s_code(xb[j], d, -8, 7) + 8 : Lq[j];
+        }
+        hq_set_codes(GGML_TYPE_HQ4_0, y + ib, L, QK4_0);
+    }
+}
+
+static void quantize_row_hq5_0_impl(const float * GGML_RESTRICT x, block_q5_0 * GGML_RESTRICT y, int64_t n) {
+    int8_t  Lq[QK5_0];
+    uint8_t L[QK5_0];
+    for (int64_t ib = 0; ib < n/QK5_0; ++ib) {
+        const float * xb = x + QK5_0*ib;
+        y[ib].d = GGML_FP32_TO_FP16(hq_make_qx_quants(QK5_0, 16, xb, Lq));
+        const float d = GGML_FP16_TO_FP32(y[ib].d);
+        for (int j = 0; j < QK5_0; ++j) {
+            L[j] = d ? hq_s_code(xb[j], d, -16, 15) + 16 : Lq[j];
+        }
+        hq_set_codes(GGML_TYPE_HQ5_0, y + ib, L, QK5_0);
+    }
+}
+
+static void quantize_row_hq8_0_impl(const float * GGML_RESTRICT x, block_q8_0 * GGML_RESTRICT y, int64_t n) {
+    uint8_t L[QK8_0];
+    for (int64_t ib = 0; ib < n/QK8_0; ++ib) {
+        const float * xb = x + QK8_0*ib;
+        float amax = 0;
+        for (int j = 0; j < QK8_0; ++j) {
+            amax = MAX(amax, fabsf(xb[j]));
+        }
+        y[ib].d = GGML_FP32_TO_FP16(amax/127);
+        const float d = GGML_FP16_TO_FP32(y[ib].d);
+        for (int j = 0; j < QK8_0; ++j) {
+            L[j] = d ? hq_s_code(xb[j], d, -128, 127) + 128 : 128;
+        }
+        hq_set_codes(GGML_TYPE_HQ8_0, y + ib, L, QK8_0);
+    }
+}
+
+static void quantize_row_hq4_1_impl(const float * GGML_RESTRICT x, block_q4_1 * GGML_RESTRICT y, int64_t n) {
+    uint8_t L[QK4_1], Laux[QK4_1];
+    for (int64_t ib = 0; ib < n/QK4_1; ++ib) {
+        const float * xb = x + QK4_1*ib;
+        float min;
+        const float scale = make_qkx3_quants(QK4_1, 15, xb, L, &min, Laux, -0.9f, 0.05f, 36);
+        y[ib].d = GGML_FP32_TO_FP16(scale);
+        y[ib].m = GGML_FP32_TO_FP16(-min);
+        const float d = GGML_FP16_TO_FP32(y[ib].d);
+        const float m = GGML_FP16_TO_FP32(y[ib].m);
+        if (d) {
+            for (int j = 0; j < QK4_1; ++j) {
+                L[j] = hq_k_code(xb[j], d, -m, 15);
+            }
+        }
+        hq_set_codes(GGML_TYPE_HQ4_1, y + ib, L, QK4_1);
+    }
+}
+
+static void quantize_row_hq5_1_impl(const float * GGML_RESTRICT x, block_q5_1 * GGML_RESTRICT y, int64_t n) {
+    uint8_t L[QK5_1], Laux[QK5_1];
+    for (int64_t ib = 0; ib < n/QK5_1; ++ib) {
+        const float * xb = x + QK5_1*ib;
+        float min;
+        const float scale = make_qkx3_quants(QK5_1, 31, xb, L, &min, Laux, -0.9f, 0.05f, 36);
+        y[ib].d = GGML_FP32_TO_FP16(scale);
+        y[ib].m = GGML_FP32_TO_FP16(-min);
+        const float d = GGML_FP16_TO_FP32(y[ib].d);
+        const float m = GGML_FP16_TO_FP32(y[ib].m);
+        if (d) {
+            for (int j = 0; j < QK5_1; ++j) {
+                L[j] = hq_k_code(xb[j], d, -m, 31);
+            }
+        }
+        hq_set_codes(GGML_TYPE_HQ5_1, y + ib, L, QK5_1);
+    }
+}
+
+// ====================== HQ2_K / HQ3_K / HQ6_K
+//
+// The base _impls with uniform weights: the same searches, and the same final pass that re-picks every
+// code at the stored sub-block scales.
+
+static void quantize_row_hq2_K_impl(const float * GGML_RESTRICT x, block_q2_K * GGML_RESTRICT y, int64_t n) {
+    uint8_t L[QK_K];
+    uint8_t Laux[16];
+    uint8_t Ls[QK_K/16], Lm[QK_K/16];
+    float   mins[QK_K/16];
+    float   scales[QK_K/16];
+
+    for (int64_t i = 0; i < n/QK_K; ++i) {
+        for (int j = 0; j < QK_K/16; ++j) {
+            scales[j] = make_qkx3_quants(16, 3, x + 16*j, L + 16*j, &mins[j], Laux, -0.9f, 0.05f, 36);
+        }
+        y[i].d    = GGML_FP32_TO_FP16(make_qp_quants(QK_K/16, 15, scales, Ls));
+        y[i].dmin = GGML_FP32_TO_FP16(make_qp_quants(QK_K/16, 15, mins,   Lm));
+        for (int j = 0; j < QK_K/16; ++j) {
+            y[i].scales[j] = Ls[j] | (Lm[j] << 4);
+        }
+        const float dd   = GGML_FP16_TO_FP32(y[i].d);
+        const float dmin = GGML_FP16_TO_FP32(y[i].dmin);
+        for (int j = 0; j < QK_K/16; ++j) {
+            const float d = dd * (y[i].scales[j] & 0xF);
+            if (!d) continue;
+            const float m = dmin * (y[i].scales[j] >> 4);
+            for (int ii = 0; ii < 16; ++ii) {
+                L[16*j + ii] = hq_k_code(x[16*j + ii], d, m, 3);
+            }
+        }
+        hq_set_codes(GGML_TYPE_HQ2_K, y + i, L, QK_K);
+        x += QK_K;
+    }
+}
+
+// the signed 6-bit scale of sub-block j
+static inline int hq_q3_K_scale(const uint8_t * GGML_RESTRICT scales, int j) {
+    const int sc = j < 8 ? scales[j] & 0xF : scales[j-8] >> 4;
+    return (sc | (((scales[8 + j%4] >> (2*(j/4))) & 3) << 4)) - 32;
+}
+
+static void quantize_row_hq3_K_impl(const float * GGML_RESTRICT x, block_q3_K * GGML_RESTRICT y, int64_t n) {
+    int8_t  Lq[QK_K];
+    uint8_t L[QK_K];
+    float   scales[QK_K/16];
+    int8_t  Ls[QK_K/16];
+
+    for (int64_t i = 0; i < n/QK_K; ++i) {
+        for (int j = 0; j < QK_K/16; ++j) {
+            scales[j] = hq_make_qx_quants(16, 4, x + 16*j, Lq + 16*j);
+        }
+        memset(y[i].scales, 0, 12);
+        const float d_block = hq_make_qx_quants(QK_K/16, 32, scales, Ls);
+        for (int j = 0; j < QK_K/16; ++j) {
+            int l = Ls[j];
+            if (j < 8) {
+                y[i].scales[j] = l & 0xF;
+            } else {
+                y[i].scales[j-8] |= ((l & 0xF) << 4);
+            }
+            l >>= 4;
+            y[i].scales[j%4 + 8] |= (l << (2*(j/4)));
+        }
+        y[i].d = GGML_FP32_TO_FP16(d_block);
+        for (int j = 0; j < QK_K/16; ++j) {
+            const float d = GGML_FP16_TO_FP32(y[i].d) * hq_q3_K_scale(y[i].scales, j);
+            for (int ii = 0; ii < 16; ++ii) {
+                L[16*j + ii] = d ? hq_s_code(x[16*j + ii], d, -4, 3) + 4 : Lq[16*j + ii];
+            }
+        }
+        hq_set_codes(GGML_TYPE_HQ3_K, y + i, L, QK_K);
+        x += QK_K;
+    }
+}
+
+static void quantize_row_hq6_K_impl(const float * GGML_RESTRICT x, block_q6_K * GGML_RESTRICT y, int64_t n) {
+    int8_t  Lq[QK_K];
+    uint8_t L[QK_K];
+    float   scales[QK_K/16];
+
+    for (int64_t i = 0; i < n/QK_K; ++i) {
+        float max_scale = 0;
+        float max_abs_scale = 0;
+        for (int ib = 0; ib < QK_K/16; ++ib) {
+            const float scale = hq_make_qx_quants(16, 32, x + 16*ib, Lq + 16*ib);
+            scales[ib] = scale;
+            const float abs_scale = fabsf(scale);
+            if (abs_scale > max_abs_scale) {
+                max_abs_scale = abs_scale;
+                max_scale = scale;
+            }
+        }
+        if (max_abs_scale < GROUP_MAX_EPS) {
+            memset(&y[i], 0, sizeof(block_q6_K));
+            x += QK_K;
+            continue;
+        }
+        const float iscale = -128.f/max_scale;
+        y[i].d = GGML_FP32_TO_FP16(1/iscale);
+        for (int ib = 0; ib < QK_K/16; ++ib) {
+            y[i].scales[ib] = MIN(127, nearest_int(iscale*scales[ib]));
+        }
+        for (int j = 0; j < QK_K/16; ++j) {
+            const float d = GGML_FP16_TO_FP32(y[i].d) * y[i].scales[j];
+            for (int ii = 0; ii < 16; ++ii) {
+                L[16*j + ii] = d ? hq_s_code(x[16*j + ii], d, -32, 31) + 32 : Lq[16*j + ii];
+            }
+        }
+        hq_set_codes(GGML_TYPE_HQ6_K, y + i, L, QK_K);
+        x += QK_K;
+    }
+}
+
 // ====================== the HQ driver
 //
-// Rows are encoded one scale unit at a time (the 256-value super-block; the 32-value block for HQ4_NL)
-// by the _impls above. Without a factor that's all, apart from the codebook re-pick. With the packed
+// Rows are encoded one unit at a time, the type's block (the 256-value super-block; the 32-value block for
+// HQ4_NL and the legacy types), by the _impls above. Without a factor that's all, apart from the codebook re-pick. With the packed
 // upper Cholesky factor U of H^-1, GPTQ error feedback goes in between: each element is re-picked in
 // order at its unit's scales, and its error is fed at once into the rest of its lazy block of 256
 // columns, and into the columns after the block once the block is done.
@@ -1563,6 +1986,14 @@ static void hq_encode_unit(enum ggml_type type, const float * GGML_RESTRICT x, v
                 uint16_t unused_h;
                 quantize_row_hq4_nl_impl(QK4_NL, 32, x, &b->d, b->qs, &unused_h, NULL, scales, L, info->idl);
             } break;
+        case GGML_TYPE_HQ4_0: quantize_row_hq4_0_impl(x, y, QK4_0); break;
+        case GGML_TYPE_HQ4_1: quantize_row_hq4_1_impl(x, y, QK4_1); break;
+        case GGML_TYPE_HQ5_0: quantize_row_hq5_0_impl(x, y, QK5_0); break;
+        case GGML_TYPE_HQ5_1: quantize_row_hq5_1_impl(x, y, QK5_1); break;
+        case GGML_TYPE_HQ8_0: quantize_row_hq8_0_impl(x, y, QK8_0); break;
+        case GGML_TYPE_HQ2_K: quantize_row_hq2_K_impl(x, y, QK_K); break;
+        case GGML_TYPE_HQ3_K: quantize_row_hq3_K_impl(x, y, QK_K); break;
+        case GGML_TYPE_HQ6_K: quantize_row_hq6_K_impl(x, y, QK_K); break;
         case GGML_TYPE_HQ2_XXS:
             quantize_row_hq2_xxs_impl(x, y, QK_K, info->smode);
             if (repick) hq2_xxs_repick(x, y, QK_K, dg);
@@ -1587,57 +2018,92 @@ static void hq_encode_unit(enum ggml_type type, const float * GGML_RESTRICT x, v
     }
 }
 
-// the codes of one unit of an element-wise type, one per value
-static void hq_get_codes(enum ggml_type type, const void * GGML_RESTRICT y, uint8_t * GGML_RESTRICT L, int unit) {
-    if (type == GGML_TYPE_HQ4_K || type == GGML_TYPE_HQ5_K) {
-        const uint8_t * qs = type == GGML_TYPE_HQ4_K ? ((const block_q4_K *) y)->qs : ((const block_q5_K *) y)->qs;
-        for (int j = 0; j < QK_K; ++j) {
-            const uint8_t q = qs[(j/64)*32 + j%32];
-            L[j] = j%64 < 32 ? q & 0xF : q >> 4;
-        }
-        if (type == GGML_TYPE_HQ5_K) {
-            const uint8_t * qh = ((const block_q5_K *) y)->qh;
-            for (int j = 0; j < QK_K; ++j) {
-                L[j] |= ((qh[j%32] >> (2*(j/64) + (j%64)/32)) & 1) << 4;
-            }
-        }
-    } else {
-        const uint8_t * qs = type == GGML_TYPE_HQ4_XS ? ((const block_iq4_xs *) y)->qs : ((const block_iq4_nl *) y)->qs;
-        for (int j = 0; j < unit; ++j) {
-            const uint8_t q = qs[16*(j/32) + j%16];
-            L[j] = j%32 < 16 ? q & 0xF : q >> 4;
-        }
-    }
-}
-
-static void hq_set_codes(enum ggml_type type, void * GGML_RESTRICT y, const uint8_t * GGML_RESTRICT L, int unit) {
-    if (type == GGML_TYPE_HQ4_K || type == GGML_TYPE_HQ5_K) {
-        uint8_t * qs = type == GGML_TYPE_HQ4_K ? ((block_q4_K *) y)->qs : ((block_q5_K *) y)->qs;
-        for (int j = 0; j < QK_K; j += 64) {
-            for (int l = 0; l < 32; ++l) {
-                qs[j/2 + l] = (L[j + l] & 0xF) | ((L[j + l + 32] & 0xF) << 4);
-            }
-        }
-        if (type == GGML_TYPE_HQ5_K) {
-            uint8_t * qh = ((block_q5_K *) y)->qh;
-            memset(qh, 0, QK_K/8);
-            for (int j = 0; j < QK_K; ++j) {
-                qh[j%32] |= (L[j] >> 4) << (2*(j/64) + (j%64)/32);
-            }
-        }
-    } else {
-        uint8_t * qs = type == GGML_TYPE_HQ4_XS ? ((block_iq4_xs *) y)->qs : ((block_iq4_nl *) y)->qs;
-        for (int i = 0; i < unit/32; ++i) {
-            for (int j = 0; j < 16; ++j) {
-                qs[16*i + j] = L[32*i + j] | (L[32*i + 16 + j] << 4);
-            }
-        }
-    }
-}
-
 // U[j][k] = hq_urow(U, n, j)[k]
 static inline const float * hq_urow(const float * U, int64_t n, int64_t j) {
     return U + ((size_t) j*n - (size_t) j*(j - 1)/2 - (size_t) j);
+}
+
+// how an element-wise unit decodes: per scale (sub values), d*(code + lmin) for a symmetric type, d*code + m for
+// an affine one (lmin = 0); the IQ4 types decode d*kvalues_iq4nl[code]
+typedef struct {
+    int   sub;
+    int   lmin, lmax;
+    bool  affine;
+    float d[QK_K/16];
+    float m[QK_K/16];
+} hq_levels;
+
+static void hq_get_levels(enum ggml_type type, const void * GGML_RESTRICT vy, hq_levels * lv) {
+    lv->affine = false;
+    lv->lmin   = 0;
+    switch (type) {
+        case GGML_TYPE_HQ4_K:
+        case GGML_TYPE_HQ5_K:
+            {
+                const block_q4_K * b4 = vy;
+                const block_q5_K * b5 = vy;
+                const float     dd     = GGML_FP16_TO_FP32(type == GGML_TYPE_HQ4_K ? b4->d    : b5->d);
+                const float     dmin   = GGML_FP16_TO_FP32(type == GGML_TYPE_HQ4_K ? b4->dmin : b5->dmin);
+                const uint8_t * scales = type == GGML_TYPE_HQ4_K ? b4->scales : b5->scales;
+                lv->sub = 32; lv->affine = true; lv->lmax = type == GGML_TYPE_HQ4_K ? 15 : 31;
+                for (int ib = 0; ib < QK_K/32; ++ib) {
+                    uint8_t sc, m;
+                    get_scale_min_k4(ib, scales, &sc, &m);
+                    lv->d[ib] = dd * sc;
+                    lv->m[ib] = -(dmin * m);
+                }
+            } break;
+        case GGML_TYPE_HQ4_XS:
+            {
+                const block_iq4_xs * b = vy;
+                lv->sub = 32;
+                for (int ib = 0; ib < QK_K/32; ++ib) {
+                    const int ls = ((b->scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((b->scales_h >> 2*ib) & 3) << 4);
+                    lv->d[ib] = GGML_FP16_TO_FP32(b->d) * (ls - 32);
+                }
+            } break;
+        case GGML_TYPE_HQ4_NL: lv->sub = 32; lv->d[0] = GGML_FP16_TO_FP32(((const block_iq4_nl *) vy)->d); break;
+        case GGML_TYPE_HQ4_0:  lv->sub = 32; lv->lmin = -8;   lv->lmax = 7;   lv->d[0] = GGML_FP16_TO_FP32(((const block_q4_0 *) vy)->d); break;
+        case GGML_TYPE_HQ5_0:  lv->sub = 32; lv->lmin = -16;  lv->lmax = 15;  lv->d[0] = GGML_FP16_TO_FP32(((const block_q5_0 *) vy)->d); break;
+        case GGML_TYPE_HQ8_0:  lv->sub = 32; lv->lmin = -128; lv->lmax = 127; lv->d[0] = GGML_FP16_TO_FP32(((const block_q8_0 *) vy)->d); break;
+        case GGML_TYPE_HQ4_1:
+        case GGML_TYPE_HQ5_1:
+            {
+                const block_q4_1 * b4 = vy;
+                const block_q5_1 * b5 = vy;
+                lv->sub = 32; lv->affine = true; lv->lmax = type == GGML_TYPE_HQ4_1 ? 15 : 31;
+                lv->d[0] = GGML_FP16_TO_FP32(type == GGML_TYPE_HQ4_1 ? b4->d : b5->d);
+                lv->m[0] = GGML_FP16_TO_FP32(type == GGML_TYPE_HQ4_1 ? b4->m : b5->m);
+            } break;
+        case GGML_TYPE_HQ2_K:
+            {
+                const block_q2_K * b = vy;
+                const float dd   = GGML_FP16_TO_FP32(b->d);
+                const float dmin = GGML_FP16_TO_FP32(b->dmin);
+                lv->sub = 16; lv->affine = true; lv->lmax = 3;
+                for (int j = 0; j < QK_K/16; ++j) {
+                    lv->d[j] = dd * (b->scales[j] & 0xF);
+                    lv->m[j] = -(dmin * (b->scales[j] >> 4));
+                }
+            } break;
+        case GGML_TYPE_HQ3_K:
+            {
+                const block_q3_K * b = vy;
+                lv->sub = 16; lv->lmin = -4; lv->lmax = 3;
+                for (int j = 0; j < QK_K/16; ++j) {
+                    lv->d[j] = GGML_FP16_TO_FP32(b->d) * hq_q3_K_scale(b->scales, j);
+                }
+            } break;
+        case GGML_TYPE_HQ6_K:
+            {
+                const block_q6_K * b = vy;
+                lv->sub = 16; lv->lmin = -32; lv->lmax = 31;
+                for (int j = 0; j < QK_K/16; ++j) {
+                    lv->d[j] = GGML_FP16_TO_FP32(b->d) * b->scales[j];
+                }
+            } break;
+        default: GGML_ABORT("fatal error");
+    }
 }
 
 // the element-wise step over one unit [j0, j0 + unit): each code at the unit's scales with the rule its
@@ -1645,47 +2111,31 @@ static inline const float * hq_urow(const float * U, int64_t n, int64_t j) {
 static void hq_gptq_elements(enum ggml_type type, float * GGML_RESTRICT x, void * GGML_RESTRICT y, const hq_unit_info * info,
                              int64_t j0, int unit, int64_t b0, int64_t b1, const float * GGML_RESTRICT U, int64_t n,
                              float * GGML_RESTRICT e) {
-    uint8_t L[QK_K];
-    float   d[QK_K/32];
-    float   dm[QK_K/32] = { 0 };
-    const bool kq = type == GGML_TYPE_HQ4_K || type == GGML_TYPE_HQ5_K;
-    const int nmax = type == GGML_TYPE_HQ5_K ? 31 : 15;
+    uint8_t   L[QK_K];
+    hq_levels lv;
+    const bool iq4 = type == GGML_TYPE_HQ4_XS || type == GGML_TYPE_HQ4_NL;
 
     hq_get_codes(type, y, L, unit);
-    if (kq) {
-        const block_q4_K * b4 = y;
-        const block_q5_K * b5 = y;
-        const float    dd     = GGML_FP16_TO_FP32(type == GGML_TYPE_HQ4_K ? b4->d    : b5->d);
-        const float    dmin   = GGML_FP16_TO_FP32(type == GGML_TYPE_HQ4_K ? b4->dmin : b5->dmin);
-        const uint8_t * scales = type == GGML_TYPE_HQ4_K ? b4->scales : b5->scales;
-        for (int ib = 0; ib < QK_K/32; ++ib) {
-            uint8_t sc, m;
-            get_scale_min_k4(ib, scales, &sc, &m);
-            d[ib]  = dd * sc;
-            dm[ib] = dmin * m;
-        }
-    } else if (type == GGML_TYPE_HQ4_XS) {
-        const block_iq4_xs * b = y;
-        for (int ib = 0; ib < QK_K/32; ++ib) {
-            const int ls = ((b->scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((b->scales_h >> 2*ib) & 3) << 4);
-            d[ib] = GGML_FP16_TO_FP32(b->d) * (ls - 32);
-        }
-    } else {
-        d[0] = GGML_FP16_TO_FP32(((const block_iq4_nl *) y)->d);
-    }
+    hq_get_levels(type, y, &lv);
 
     for (int i = 0; i < unit; ++i) {
         const int64_t j  = j0 + i;
-        const int     ib = i/32;
+        const int     sb = i/lv.sub;
+        const float   d  = lv.d[sb];
         float xh;
-        if (kq) {
-            if (d[ib]) {
-                L[i] = hq_k_code(x[j], d[ib], dm[ib], nmax);
+        if (iq4) {
+            L[i] = best_index_int8(16, kvalues_iq4nl, info->idl[sb]*x[j]);
+            xh = d*kvalues_iq4nl[L[i]];
+        } else if (lv.affine) {
+            if (d) {
+                L[i] = hq_k_code(x[j], d, -lv.m[sb], lv.lmax);
             }
-            xh = d[ib]*L[i] - dm[ib];
+            xh = d*L[i] + lv.m[sb];
         } else {
-            L[i] = best_index_int8(16, kvalues_iq4nl, info->idl[ib]*x[j]);
-            xh = d[ib]*kvalues_iq4nl[L[i]];
+            if (d) {
+                L[i] = hq_s_code(x[j], d, lv.lmin, lv.lmax) - lv.lmin;
+            }
+            xh = d*(L[i] + lv.lmin);
         }
         const float * uj  = hq_urow(U, n, j);
         const float   err = (x[j] - xh)/uj[j];
@@ -1976,7 +2426,16 @@ static void hq_gptq_update(float * x, int64_t n, int nr, const float * e, const 
 }
 
 static bool hq_is_elementwise(enum ggml_type type) {
-    return type == GGML_TYPE_HQ4_K || type == GGML_TYPE_HQ5_K || type == GGML_TYPE_HQ4_XS || type == GGML_TYPE_HQ4_NL;
+    switch (type) {
+        case GGML_TYPE_HQ2_XXS:
+        case GGML_TYPE_HQ2_XS:
+        case GGML_TYPE_HQ2_S:
+        case GGML_TYPE_HQ3_XXS:
+        case GGML_TYPE_HQ3_S:
+            return false;
+        default:
+            return true;
+    }
 }
 
 // U == NULL: the uniform quantizer, which doesn't write x
@@ -1985,7 +2444,7 @@ static size_t hq_quantize(enum ggml_type type, float * GGML_RESTRICT x, void * G
     GGML_ASSERT(ggml_is_rotated(type));
     ggml_quantize_init(type);
 
-    const int    unit      = type == GGML_TYPE_HQ4_NL ? QK4_NL : QK_K;
+    const int    unit      = (int) ggml_blck_size(type);
     const size_t row_size  = ggml_row_size(type, n);
     const size_t unit_size = ggml_row_size(type, unit);
     GGML_ASSERT(n % unit == 0);

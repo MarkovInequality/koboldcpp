@@ -448,7 +448,15 @@ extern "C" {
         GGML_TYPE_HQ3_S   = 156,
         GGML_TYPE_HQ4_NL  = 157,
         GGML_TYPE_HQ4_XS  = 158,
-        GGML_TYPE_COUNT   = 159,
+        GGML_TYPE_HQ4_0   = 159,
+        GGML_TYPE_HQ4_1   = 160,
+        GGML_TYPE_HQ5_0   = 161,
+        GGML_TYPE_HQ5_1   = 162,
+        GGML_TYPE_HQ8_0   = 163,
+        GGML_TYPE_HQ2_K   = 164,
+        GGML_TYPE_HQ3_K   = 165,
+        GGML_TYPE_HQ6_K   = 166,
+        GGML_TYPE_COUNT   = 167,
     };
 
     // precision
@@ -785,8 +793,8 @@ extern "C" {
     "use ggml_row_size() instead");
 
     GGML_API const char * ggml_type_name(enum ggml_type type);
-    // Q4_K, Q5_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS <-> their HQ variants;
-    // every other type maps to itself
+    // Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
+    // IQ3_S, IQ4_NL, IQ4_XS <-> their HQ variants; every other type maps to itself
     GGML_API enum ggml_type ggml_get_rotated_type(enum ggml_type type);
     GGML_API enum ggml_type ggml_get_base_type   (enum ggml_type type);
     GGML_API bool           ggml_is_rotated      (enum ggml_type type);

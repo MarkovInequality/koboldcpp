@@ -1051,7 +1051,7 @@ struct llm_graph_context {
     // R*cur if w is rotated, else cur; each activation is rotated once for all its consumers
     ggml_tensor * rotate_input_if_rotated(ggml_tensor * w, ggml_tensor * cur) const;
 
-    mutable std::map<ggml_tensor *, ggml_tensor *> hadamard_rot_cache;
+    mutable std::map<std::pair<ggml_tensor *, uint64_t>, ggml_tensor *> hadamard_rot_cache; // (input, seed)
 
     //
     // common

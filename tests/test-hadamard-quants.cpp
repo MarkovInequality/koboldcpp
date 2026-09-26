@@ -43,7 +43,19 @@ static const hq_pair k_pairs[] = {
     { GGML_TYPE_HQ3_S,   GGML_TYPE_IQ3_S   },
     { GGML_TYPE_HQ4_NL,  GGML_TYPE_IQ4_NL  },
     { GGML_TYPE_HQ4_XS,  GGML_TYPE_IQ4_XS  },
+    { GGML_TYPE_HQ4_0,   GGML_TYPE_Q4_0    },
+    { GGML_TYPE_HQ4_1,   GGML_TYPE_Q4_1    },
+    { GGML_TYPE_HQ5_0,   GGML_TYPE_Q5_0    },
+    { GGML_TYPE_HQ5_1,   GGML_TYPE_Q5_1    },
+    { GGML_TYPE_HQ8_0,   GGML_TYPE_Q8_0    },
+    { GGML_TYPE_HQ2_K,   GGML_TYPE_Q2_K    },
+    { GGML_TYPE_HQ3_K,   GGML_TYPE_Q3_K    },
+    { GGML_TYPE_HQ6_K,   GGML_TYPE_Q6_K    },
 };
+
+static bool is_legacy(ggml_type base) {
+    return base == GGML_TYPE_Q4_0 || base == GGML_TYPE_Q4_1 || base == GGML_TYPE_Q5_0 || base == GGML_TYPE_Q5_1 || base == GGML_TYPE_Q8_0;
+}
 
 static int n_threads() {
     const unsigned n = std::thread::hardware_concurrency();
@@ -473,10 +485,10 @@ static float group_err(const grid_desc & gd, const group_code & c, const float *
 // ---------------------------------------------------------------------------------------------
 
 // Each HQ quantizer is its base quantizer with uniform weights. The base quantizer given the
-// imatrix qw = 1/sqrt(sigma2 + x^2) sees weights of 1 +- 1 ulp, so it makes the same choices
-// except at near-ties (0-3 blocks of 512 when this was written). The grid types then re-pick
-// their codes at the stored scale, so there only scales and signs must match, and no re-picked
-// code may decode worse than the base quantizer's.
+// imatrix qw = 1/sqrt(sigma2 + x^2) sees weights of 1 +- 1 ulp (Q6_K's takes the imatrix as its weights,
+// so it gets ones), so it makes the same choices except at near-ties (0-3 blocks of 512 when this was
+// written). The grid types and the legacy types then re-pick their codes at the stored scale, so there
+// only the scales (and signs) must match, and no re-picked code may decode worse than the base's.
 static void test_copy_fidelity() {
     printf("copy fidelity (base quantizer with a weight-cancelling imatrix):\n");
     const int64_t n = 4096, nrows = 32;
@@ -484,29 +496,51 @@ static void test_copy_fidelity() {
     rotate_rows(x, n, 3);
     for (const hq_pair & p : k_pairs) {
         const ggml_type b = p.base;
-        const int group = b == GGML_TYPE_IQ4_NL ? 32 : QK_K;
-        const float sigma_mul = b == GGML_TYPE_IQ2_XXS || b == GGML_TYPE_IQ2_XS ? 1.0f : 2.0f;
+        const bool legacy = is_legacy(b);
+        const int group = b == GGML_TYPE_IQ4_NL || legacy ? 32 : QK_K;
+        // the legacy _impls take sigma2 over the whole row
+        const int64_t sgroup = legacy ? n : group;
+        const float sigma_mul = b == GGML_TYPE_IQ2_XXS || b == GGML_TYPE_IQ2_XS || b == GGML_TYPE_Q2_K || legacy ? 1.0f : 2.0f;
         const size_t rs = ggml_row_size(b, n);
         const size_t bs = ggml_type_size(b)*(group/ggml_blck_size(b));
+        // the scale bytes that lead a legacy block: d, or d and m
+        const size_t hdr = b == GGML_TYPE_Q4_1 || b == GGML_TYPE_Q5_1 ? 4 : 2;
         std::vector<uint8_t> qb(rs), qh(rs);
-        std::vector<float> qw(n);
+        std::vector<float> qw(n), yb(n), yh(n);
         const grid_desc * gd = find_grid(p.hq);
         std::vector<group_code> cb, ch;
         int64_t same = 0, total = 0, repicked = 0, worse = 0;
         for (int64_t r = 0; r < nrows; ++r) {
             const float * xr = x.data() + r*n;
-            for (int64_t g = 0; g < n; g += group) {
+            for (int64_t g = 0; g < n; g += sgroup) {
                 float sumx2 = 0;
-                for (int i = 0; i < group; ++i) {
+                for (int64_t i = 0; i < sgroup; ++i) {
                     sumx2 += xr[g + i]*xr[g + i];
                 }
-                const float sigma2 = sigma_mul*sumx2/group;
-                for (int i = 0; i < group; ++i) {
-                    qw[g + i] = 1.0f/sqrtf(sigma2 + xr[g + i]*xr[g + i]);
+                const float sigma2 = sigma_mul*sumx2/sgroup;
+                for (int64_t i = 0; i < sgroup; ++i) {
+                    qw[g + i] = b == GGML_TYPE_Q6_K ? 1.0f : 1.0f/sqrtf(sigma2 + xr[g + i]*xr[g + i]);
                 }
             }
             ggml_quantize_chunk(b,    xr, qb.data(), 0, 1, n, qw.data());
             ggml_quantize_chunk(p.hq, xr, qh.data(), 0, 1, n, nullptr);
+            if (legacy) {
+                ggml_get_type_traits(b)->to_float(qb.data(), yb.data(), n);
+                ggml_get_type_traits(b)->to_float(qh.data(), yh.data(), n);
+                for (size_t o = 0; o < rs; o += bs) {
+                    total++;
+                    if (memcmp(qb.data() + o, qh.data() + o, hdr) != 0) {
+                        continue;
+                    }
+                    same++;
+                    const int64_t i0 = (int64_t) (o/bs)*group;
+                    for (int64_t i = i0; i < i0 + group; ++i) {
+                        repicked += yh[i] != yb[i];
+                        worse    += std::fabs(xr[i] - yh[i]) > std::fabs(xr[i] - yb[i]);
+                    }
+                }
+                continue;
+            }
             if (!gd) {
                 for (size_t o = 0; o < rs; o += bs) {
                     same += memcmp(qb.data() + o, qh.data() + o, bs) == 0;
@@ -535,7 +569,10 @@ static void test_copy_fidelity() {
         }
         const double frac = (double) same/(double) total;
         char buf[160];
-        if (gd) {
+        if (legacy) {
+            snprintf(buf, sizeof(buf), "%s: %.2f%% of blocks match %s's scale; %lld codes re-picked, %lld worse",
+                     ggml_type_name(p.hq), 100.0*frac, ggml_type_name(b), (long long) repicked, (long long) worse);
+        } else if (gd) {
             snprintf(buf, sizeof(buf), "%s: %.2f%% of blocks match %s but for codes; %lld re-picked, %lld worse",
                      ggml_type_name(p.hq), 100.0*frac, ggml_type_name(b), (long long) repicked, (long long) worse);
         } else {
@@ -791,13 +828,16 @@ static void test_round_trip() {
         { GGML_TYPE_HQ2_XXS, 0.1450 }, { GGML_TYPE_HQ2_XS,  0.1100 }, { GGML_TYPE_HQ2_S,   0.0760 },
         { GGML_TYPE_HQ3_XXS, 0.0410 }, { GGML_TYPE_HQ3_S,   0.0230 },
         { GGML_TYPE_HQ4_NL,  0.0071 }, { GGML_TYPE_HQ4_XS,  0.0072 },
+        { GGML_TYPE_HQ4_0,   0.0082 }, { GGML_TYPE_HQ4_1,   0.0061 }, { GGML_TYPE_HQ5_0,   0.0020 },
+        { GGML_TYPE_HQ5_1,   0.0014 }, { GGML_TYPE_HQ8_0,   0.00004 },
+        { GGML_TYPE_HQ2_K,   0.0870 }, { GGML_TYPE_HQ3_K,   0.0260 }, { GGML_TYPE_HQ6_K,   0.00038 },
     };
     for (const tol & tl : tols) {
         const std::vector<uint8_t> q = quantize(tl.t, xr, n, nullptr, n_threads());
         const std::vector<float> yr = dequantize(tl.t, q, nrows, n);
         const double rel_rot = mse(xr, yr)/w2;
         const double rel     = mse(w, unrotate(yr))/w2;
-        snprintf(buf, sizeof(buf), "%s: rel MSE %.5f <= %.4f (rotated domain %.5f)", ggml_type_name(tl.t), rel, tl.max_rel, rel_rot);
+        snprintf(buf, sizeof(buf), "%s: rel MSE %.5f <= %.4g (rotated domain %.5f)", ggml_type_name(tl.t), rel, tl.max_rel, rel_rot);
         check(rel <= tl.max_rel && std::fabs(rel - rel_rot) <= 1e-3*rel_rot, buf);
     }
 }

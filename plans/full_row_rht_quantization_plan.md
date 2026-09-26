@@ -32,6 +32,10 @@ and the quality results — which did not come out as expected (HQ loses to imat
 Out of scope: other base types (Q2_K, Q3_K, Q6_K, Q8_0, IQ1), LDLQ/GPTQ error feedback, and
 collecting an imatrix in rotated space (see Future work).
 
+> **Extended (2026-09-26):** the legacy types and the rest of the K-quants got HQ variants too
+> (HQ4_0, HQ4_1, HQ5_0, HQ5_1, HQ8_0, HQ2_K, HQ3_K, HQ6_K); see "Addendum: HQ variants of the
+> remaining integer types" near the end. GPTQ is in `plans/gptq_rotated_quantizer_plan.md`.
+
 ## Current state and what this replaces
 
 The fork currently has **ConvRot**: `Q4R_K`/`Q5R_K` (type indices 150/151), which apply a
@@ -70,6 +74,8 @@ The rotation itself, its graph inputs and its imatrix handling are replaced.
 | IQ2_XXS / IQ2_XS / IQ2_S | `HQ2_XXS` / `HQ2_XS` / `HQ2_S` | `hq2_xxs` / `hq2_xs` / `hq2_s` | 152–154 |
 | IQ3_XXS / IQ3_S | `HQ3_XXS` / `HQ3_S` | `hq3_xxs` / `hq3_s` | 155–156 |
 | IQ4_NL / IQ4_XS | `HQ4_NL` / `HQ4_XS` | `hq4_nl` / `hq4_xs` | 157–158 |
+| Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 (addendum) | `HQ4_0` / `HQ4_1` / `HQ5_0` / `HQ5_1` / `HQ8_0` | `hq4_0` / `hq4_1` / `hq5_0` / `hq5_1` / `hq8_0` | 159–163 |
+| Q2_K / Q3_K / Q6_K (addendum) | `HQ2_K` / `HQ3_K` / `HQ6_K` | `hq2_K` / `hq3_K` / `hq6_K` | 164–166 |
 
 - "HQ" stands for Hadamard quant. The i-quant variants drop the `I` because they don't use an
   imatrix. "The HQ i-quants" means the seven types with IQ bases.
@@ -1429,8 +1435,180 @@ cost both models far more than the rotation does; it now defines `GGML_CUDA_USE_
   would be limited by the adds rather than memory (§2).
 - **ROCm and MUSA verification on real hardware:** run the RHT and Q8_1 `test-backend-ops` cases
   and a perplexity check, then drop "unverified" from the README.
-- **More base types** (Q2_K/Q3_K/Q6_K, IQ1).
+- **More base types:** IQ1_S/IQ1_M (grid types with a delta), TQ1_0/TQ2_0 (ternary) and
+  MXFP4/NVFP4. Q2_K/Q3_K/Q6_K and the legacy types are done (Addendum).
 - **Perplexity/KL and throughput on Qwen3.8-27B** (HQ4_K + HQ4_XS).
+
+## Addendum: HQ variants of the remaining integer types (2026-09-26)
+
+Status: implemented 2026-09-26. The user asked for HQ variants of the remaining quant types "like
+Q4_0 or Q5_1, all the way up to Q8", taking an imatrix, in the style of the existing ones, and chose
+the scope: the legacy types plus the rest of the K-quants.
+
+### Types
+
+| base | HQ type | `type_name` | index | block |
+|---|---|---|---|---|
+| Q4_0 | `HQ4_0` | `hq4_0` | 159 | 32 |
+| Q4_1 | `HQ4_1` | `hq4_1` | 160 | 32 |
+| Q5_0 | `HQ5_0` | `hq5_0` | 161 | 32 |
+| Q5_1 | `HQ5_1` | `hq5_1` | 162 | 32 |
+| Q8_0 | `HQ8_0` | `hq8_0` | 163 | 32 |
+| Q2_K | `HQ2_K` | `hq2_K` | 164 | 256 |
+| Q3_K | `HQ3_K` | `hq3_K` | 165 | 256 |
+| Q6_K | `HQ6_K` | `hq6_K` | 166 | 256 |
+
+- `GGML_TYPE_COUNT` becomes 167.
+- **Everything else follows §1–§9 unchanged.** Each new type has:
+  - the base's block layout and `to_float`, and `from_float_ref = NULL`
+  - no `type_traits_cpu` row
+  - a `GGML_ROTATED_TYPE_PAIRS` entry
+  - a case in `ggml_quantize_chunk` that calls `quantize_hq`
+- **No backend, loader or tool change.** The loader, the saver, `tensor_type_fallback`, the ftype
+  guess and the CUDA Q8_1 emission all go through `ggml_get_base_type` / `ggml_is_quantized`.
+  `koboldcpp.py`'s GGUF dump table lists the new names.
+- **Old builds of this fork can't load the new types:** their `GGML_TYPE_COUNT` is 159.
+- **`--hadamard` maps more of every mix.** The Q6_K tensors of Q4_K_M/Q5_K_M (some `attn_v` and
+  `ffn_down`), the Q2_K/Q3_K tensors of the low-bit mixes, and the legacy fallback types for widths
+  that aren't a multiple of 256 all become HQ now. `--hadamard Q4_K_M` therefore no longer gives the
+  same file as before this addendum; the tables below re-measure every mix. Types without an HQ
+  variant are IQ1_S/IQ1_M, TQ1_0/TQ2_0, MXFP4/NVFP4, Q1_0/Q2_0 and the float types.
+
+### Uniform-weight quantizers (§8.2, Phase 3)
+
+Each is a copy of its base `_impl` with uniform weights, in `ggml-quants-hq.c`, as before:
+
+| HQ type | scale search | final codes |
+|---|---|---|
+| HQ4_0 / HQ5_0 | `make_qx_quants` with `w = 1` (`hq_make_qx_quants`), nmax 8 / 16 | nearest level at the stored fp16 `d` |
+| HQ4_1 / HQ5_1 | `make_qkx3_quants` (the uniform copy), nmax 15 / 31 | nearest level at the stored `d`, `m` |
+| HQ8_0 | absmax/127, as Q8_0 (its base has no search) | nearest level at the stored `d` |
+| HQ2_K | `make_qkx3_quants` per 16 values, then `make_qp_quants` for the 4-bit scales and mins | the base's final pass at the stored sub-block scales |
+| HQ3_K | `make_qx_quants` per 16 values, then again for the 6-bit scales | the base's final pass |
+| HQ6_K | `make_qx_quants` per 16 values, int8 scales from the largest | the base's final pass |
+
+- **One deliberate difference from the base quantizers:** the legacy `_impl`s upstream keep the
+  codes their search rounded at the unrounded scale. The HQ versions re-pick every code at the stored
+  fp16 scale, as all K-quant `_impl`s already do. That's never worse per value, and the GPTQ step's
+  code rule (below) is then a function of the stored block alone, with no side channel.
+- **Weights:** the base `_impl`s weight by `qw·sqrt(σ² + x²)` with the imatrix, or by `x²` without
+  one (Q3_K, Q6_K). §8.2's reasoning applies unchanged: uniform weights for rotated data.
+- **Shared rule helpers:** `hq_k_code` (affine: `nearest_int((x + dm)/d)`) and `hq_s_code`
+  (symmetric: `nearest_int(x/d)` in `[lmin, lmax]`). The `_impl`s' final passes and the GPTQ step
+  both use them, so the two can't drift apart.
+- **Code layouts:** `hq_get_codes` / `hq_set_codes` read and write one unit's codes for every
+  element-wise type. The new `_impl`s pack their codes with `hq_set_codes`.
+
+### GPTQ (`plans/gptq_rotated_quantizer_plan.md` §3.1)
+
+All eight are element-wise types, so the element step covers them with one generalization:
+- `hq_get_levels` describes a unit's decode as symmetric (`d·(code + lmin)`) or affine
+  (`d·code + m`), per scale of 16 or 32 values.
+- The step picks each code with `hq_s_code` or `hq_k_code` at the stored scale. It keeps the
+  `_impl`'s code where the scale is 0, as for HQ4_K.
+- The legacy types' unit is their 32-value block, as for HQ4_NL. The lazy block stays at 256
+  columns, and the driver takes the unit from `ggml_blck_size`.
+
+### Tests
+
+- **`test-hadamard`:** the traits, pairing, names and indices 159–166, and row validation. The
+  NaN-scale check now poisons `d` where each block keeps it: last in Q3_K/Q6_K, before `dmin` in
+  Q2_K.
+- **`test-hadamard-quants`**, for all eight:
+  - format compatibility, the imatrix ignored by `ggml_quantize_chunk`, and determinism
+  - **copy fidelity** against the base with a weight-cancelling imatrix. For the legacy types that's
+    the row-level σ² their `_impl`s use; Q6_K's base takes the imatrix as its weights, so it gets
+    ones. For the legacy types, the same scales and no value decoding worse, since the codes are
+    re-picked.
+  - **MSE against the base quantizer:** at most 1.01×
+  - the round-trip tolerance
+- **`test-hq-gptq`:** the new types' `quantize_hq` hashes (recorded when they were added); the
+  scaled-identity equivalence; and error reduction, decoding and grouping and thread invariance.
+- **`test-hadamard-quantize`:**
+  - `--hadamard Q4_K_M` now has HQ6_K tensors
+  - `--hadamard Q4_0` stores `R·w`
+  - `--hadamard --imatrix Q4_0` runs GPTQ and beats uniform HQ4_0 in output error
+- **`tests-hq.sh`** quantizes and generates with the Q4_0, Q8_0, Q3_K_M and Q2_K mixes as well,
+  and its GPTQ step includes them.
+
+### Implementation record
+
+All tests pass, including `tests-hq.sh` with `CUDA=1` and `IMATRIX=build-hq/imatrix-06.gguf`. The
+benchmark driver is `build-hq/q06new.sh`, with outputs in `build-hq/q06n/`.
+
+**Unit measurements** (`test-hadamard-quants`, rotated Gaussian and Laplacian rows):
+- **Copy fidelity:** 99.8–100 % of blocks match the base quantizer (same scales for the legacy
+  types). None of the re-picked codes decodes worse.
+- **Aggregate MSE against the base without an imatrix:** 0.73–0.999× (HQ8_0 ≈ Q8_0; HQ2_K,
+  HQ4_1 and HQ5_1 −21 to −27 %).
+- **Round trip `Rᵀ·dequant(quant(R·w))`,** relative MSE:
+
+  | type | HQ4_0 | HQ4_1 | HQ5_0 | HQ5_1 | HQ8_0 | HQ2_K | HQ3_K | HQ6_K |
+  |---|--:|--:|--:|--:|--:|--:|--:|--:|
+  | rel. MSE | 0.0063 | 0.0047 | 0.0016 | 0.0011 | 0.00003 | 0.067 | 0.020 | 0.0003 |
+
+- **GPTQ in-sample output error** (`test-hq-gptq`): 0.13–0.25× uniform.
+
+**Qwen3-0.6B, KL wiki.test / tech-eval** (80 × 512; single types `--pure --token-embedding-type
+q6_K`; Q3_K from the `Q3_K_M` ftype):
+
+| type | plain | imatrix | HQ | HQ + GPTQ | GPTQ vs imatrix |
+|---|--:|--:|--:|--:|--:|
+| Q8_0 | 0.00363 / 0.00266 | (same) | 0.00305 / 0.00212 | **0.00238 / 0.00166** | −34 % / −37 % |
+| Q6_K | 0.0134 / 0.0094 | 0.0099 / 0.0075 | 0.0117 / 0.0088 | **0.0051 / 0.0042** | −49 % / −43 % |
+| Q5_1 | 0.0548 / 0.0407 | 0.0276 / 0.0222 | 0.0418 / 0.0300 | **0.0156 / 0.0131** | −44 % / −41 % |
+| Q5_0 | 0.0538 / 0.0411 | 0.0438 / 0.0336 | 0.0532 / 0.0389 | **0.0177 / 0.0155** | −60 % / −54 % |
+| Q4_1 | 0.2297 / 0.1578 | 0.0875 / 0.0691 | 0.1656 / 0.1134 | **0.0519 / 0.0432** | −41 % / −37 % |
+| Q4_0 | 0.2124 / 0.1445 | 0.1506 / 0.1186 | 0.2656 / 0.1890 | **0.0642 / 0.0559** | −57 % / −53 % |
+| Q3_K | 0.5854 / 0.4533 | 0.3992 / 0.3234 | 0.9008 / 0.7100 | **0.2061 / 0.1814** | −48 % / −44 % |
+| Q2_K | 8.257 / 9.973 | 1.191 / 1.163 | 6.346 / 5.542 | **0.830 / 0.718** | −30 % / −38 % |
+
+| mix | plain | imatrix | `--hadamard` | `--hadamard --imatrix` | GPTQ vs imatrix |
+|---|--:|--:|--:|--:|--:|
+| Q8_0 | 0.00263 / 0.00194 | (same) | 0.00192 / 0.00140 | **0.00125 / 0.00097** | −52 % / −50 % |
+| Q5_K_M | 0.0371 / 0.0262 | 0.0257 / 0.0206 | 0.0334 / 0.0245 | **0.0141 / 0.0116** | −45 % / −44 % |
+| Q4_K_M | 0.1105 / 0.0818 | 0.0672 / 0.0572 | 0.1073 / 0.0784 | **0.0427 / 0.0353** | −36 % / −38 % |
+| Q4_0 | 0.2124 / 0.1445 | 0.1440 / 0.1096 | 0.2656 / 0.1890 | **0.0641 / 0.0556** | −55 % / −49 % |
+| Q3_K_M | 0.4286 / 0.3284 | 0.2362 / 0.1895 | 0.3794 / 0.2725 | **0.1270 / 0.1008** | −46 % / −47 % |
+| Q2_K | 2.477 / 2.058 | 0.7625 / 0.6658 | 2.009 / 1.576 | **0.4614 / 0.4117** | −39 % / −38 % |
+| IQ2_XXS | — | 3.367 / 3.973 | 7.351 / 7.147 | **1.296 / 1.270** | −62 % / −68 % |
+
+- **With an imatrix,** HQ + GPTQ beats base + imatrix for every new type and mix, by 30–68 %.
+- **Without one, the rotation splits by type.** It helps the types with a min (Q4_1, Q5_1, Q2_K)
+  and the fine grids (Q6_K, Q8_0). It hurts the symmetric Q4_0 and Q3_K, as it does IQ4_NL/XS.
+- **Mixes that now rotate more tensors:** the IQ4_XS and IQ3_XS mixes have no new-type tensors on
+  this model (their KL is unchanged to all digits).
+  - Q4_K_M (its Q6_K `attn_v` / `ffn_down` now HQ6_K): uniform 0.1067 → 0.1073, GPTQ 0.0440 → 0.0427.
+  - IQ2_XXS (its Q2_K / Q3_K tensors now rotated): uniform 10.96 → 7.35, GPTQ 1.394 → 1.296.
+- **Generation:** Q8_0, Q4_0 and Q3_K_M answer "Paris" both uniform and with GPTQ; Q2_K doesn't at
+  0.6B.
+
+**Cost:** GPTQ adds a roughly fixed 3–7 s per 0.6B run. That's up to 5× the fastest uniform
+quantizers (HQ3_K 1.5 → 8.3 s, HQ8_0 1.8 → 6.4 s, HQ4_0 2.4 → 7.0 s), and Q4_K_M goes 6.0 → 8.2 s.
+
+**Speed** (Qwen3-4B `--hadamard Q4_K_M`, RTX 5090, CUDA graphs, `build-hq/throughput.sh`):
+
+| | prompt t/s | generation t/s |
+|---|--:|--:|
+| unrotated | 15549 | 225.4 |
+| HQ4_K/HQ5_K only | 14591 (−6.2 %) | 207.2 (−8.1 %) |
+| with HQ6_K | 14170 (−8.9 %) | 203.2 (−9.9 %) |
+
+Rotating the mix's Q6_K tensors adds `ffn_down` rotations in their layers. Where `attn_v` is HQ6_K,
+it shares the Q/K rotation, but its MMQ wants the D4 Q8_1 layout, not HQ4_K's DS4, so the fused
+emission falls back to F32 for that node (Q2_K's D2S6 never gets it).
+
+**Fixed after review** (a read-only review of the diff):
+- **Drafts that borrow the target's output** (`src/models/eagle3.cpp`, `dflash.cpp`) built their
+  graph against the draft model's rotated set. Once `--hadamard` made `output.weight` HQ6_K in the
+  common mixes, they would have computed `W·Rᵀ·x` silently.
+  - `rotate_input_if_rotated` now also asks the model in `cparams.ctx_other` and rotates with that
+    model's seed. The rotation cache is keyed by (input, seed).
+  - **Not run end to end:** no EAGLE3/DFlash draft is available here.
+- **CodeShell files without `token_embd`** read their embeddings from `output.weight`. The quantizer
+  now treats `output.weight` as an embedding, left unrotated, when a file has no `token_embd`
+  (`test-hadamard-quantize` checks it).
+- **The CUDA F32 fallback above** only costs speed, so it's documented, not changed.
 
 ## Key file index
 
