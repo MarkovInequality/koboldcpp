@@ -399,7 +399,7 @@ Rotation needs the whole row and the seed, which a block encoder doesn't have. T
   stays rotated.
 - **Runtime LoRA works unchanged:** `W'·(R·x) + scale·B·(A·x)`. The adapter branch uses the
   unrotated input, and adapter tensors keep their own types.
-- **Permanent LoRA merges** go through `llama-quantize --lora` (Phase 4). For an unrotated source,
+- **Permanent LoRA merges** go through `quantize_gguf --lora` (Phase 4). For an unrotated source,
   the delta is added before rotation. For an HQ source, the delta is rotated with the file's seed
   first.
 - **KV cache:** its allowed types are a fixed list (`common/arg.cpp:305`) that doesn't include HQ

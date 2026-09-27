@@ -42,10 +42,10 @@ Notes:
 
 ## Quantize the GGUF
 
-After you have created a high-quality GGUF version of the model, you use `llama-quantize` to apply quantization. For example, quantize to `Q4_K_M` using a command like the following:
+After you have created a high-quality GGUF version of the model, you use `quantize_gguf` (built with `make quantize_gguf`) to apply quantization. For example, quantize to `Q4_K_M` using a command like the following:
 
 ```bash
-./build/bin/llama-quantize gemma-4-E2B-it-bf16.gguf gemma-4-E2B-it-Q4_K_M.gguf Q4_K_M
+./quantize_gguf gemma-4-E2B-it-bf16.gguf gemma-4-E2B-it-Q4_K_M.gguf Q4_K_M
 ```
 
 Various quantization methods are described [later in this document](#quantize).
@@ -92,57 +92,57 @@ python convert_hf_to_gguf.py --mmproj --outfile mmproj-gemma-4-E2B-it-Q8_0.gguf 
 
 ```bash
 # naive Q4_K_M quantization using default settings and 8 CPU threads. Output will be "ggml-model-Q4_K_M.gguf"
-./llama-quantize input-model-f32.gguf q4_k_m 8
+./quantize_gguf input-model-f32.gguf q4_k_m 8
 ```
 
 ```bash
 #  quantize model enabling re-quantization, leaving the output tensor unquantized and all others quantized at the same level (Q4_K)
-./llama-quantize --allow-requantize --leave-output-tensor --pure input-model-f32.gguf q4_k_m 8
+./quantize_gguf --allow-requantize --leave-output-tensor --pure input-model-f32.gguf q4_k_m 8
 ```
 
 ```bash
 # quantize model using an importance matrix for specified tensors only (attn_v and ffn_down)
-./llama-quantize --imatrix imatrix.gguf --include-weights attn_v --include-weights ffn_down input-model-f32.gguf q4_k_m 8
+./quantize_gguf --imatrix imatrix.gguf --include-weights attn_v --include-weights ffn_down input-model-f32.gguf q4_k_m 8
 ```
 
 ```bash
 # quantize model setting output tensor to Q5_K_M, token embeddings to Q3_K_M, and keeping the input file's shards
-./llama-quantize --imatrix imatrix.gguf --output-tensor-type q5_k --token-embedding-type q3_k --keep-split input-model-f32.gguf q4_k_m 8
+./quantize_gguf --imatrix imatrix.gguf --output-tensor-type q5_k --token-embedding-type q3_k --keep-split input-model-f32.gguf q4_k_m 8
 ```
 
 ```bash
 # quantize model using a regex to quantize attn_k tensors in odd layers to Q5_K_M and attn_q tensors in even layers to Q3_K_M
-./llama-quantize --imatrix imatrix.gguf --tensor-type "\.(\d*[13579])\.attn_k=q5_k" --tensor-type "\.(\d*[02468])\.attn_q=q3_k" input-model-f32.gguf q4_k_m 8
+./quantize_gguf --imatrix imatrix.gguf --tensor-type "\.(\d*[13579])\.attn_k=q5_k" --tensor-type "\.(\d*[02468])\.attn_q=q3_k" input-model-f32.gguf q4_k_m 8
 ```
 
 ```bash
 # quantize model setting tensors attn_v and ffn_down to Q5_K_M and pruning layers 20, 21, and 22
-./llama-quantize --imatrix imatrix.gguf --tensor-type attn_v=q5_k --tensor-type ffn_down=q5_k --prune-layers 20,21,22 input-model-f32.gguf q4_k_m 8
+./quantize_gguf --imatrix imatrix.gguf --tensor-type attn_v=q5_k --tensor-type ffn_down=q5_k --prune-layers 20,21,22 input-model-f32.gguf q4_k_m 8
 ```
 
 ```bash
 # override expert used count metadata to 16, prune layers 20, 21, and 22 without quantizing the model (copy tensors) and use specified name for the output file
-./llama-quantize --imatrix imatrix.gguf --override-kv qwen3moe.expert_used_count=int:16 --prune-layers 20,21,22 input-model-f32.gguf pruned-model-f32.gguf copy 8
+./quantize_gguf --imatrix imatrix.gguf --override-kv qwen3moe.expert_used_count=int:16 --prune-layers 20,21,22 input-model-f32.gguf pruned-model-f32.gguf copy 8
 ```
 
 ```bash
 # Hadamard-rotated (HQ) Q4_K_M: every Q4_K/Q5_K/IQ* tensor of the mix becomes its HQ variant. Same size, lower KL
-./llama-quantize --hadamard input-model-f16.gguf q4_k_m 8
+./quantize_gguf --hadamard input-model-f16.gguf q4_k_m 8
 ```
 
 ```bash
 # the same with an importance matrix: the HQ tensors are quantized with GPTQ error feedback
-./llama-quantize --hadamard --imatrix imatrix.gguf input-model-f16.gguf q4_k_m 8
+./quantize_gguf --hadamard --imatrix imatrix.gguf input-model-f16.gguf q4_k_m 8
 ```
 
 ```bash
 # rotate only the ffn_down tensors, leaving everything else unrotated
-./llama-quantize --tensor-type "ffn_down=hq4_K" input-model-f16.gguf q4_k_m 8
+./quantize_gguf --tensor-type "ffn_down=hq4_K" input-model-f16.gguf q4_k_m 8
 ```
 
 ```bash
 # merge a LoRA adapter at half strength while quantizing
-./llama-quantize --hadamard --lora adapter.gguf:0.5 input-model-f16.gguf q4_k_m 8
+./quantize_gguf --hadamard --lora adapter.gguf:0.5 input-model-f16.gguf q4_k_m 8
 ```
 
 ## Memory/Disk Requirements
@@ -351,13 +351,98 @@ HQ models run on the **CPU** and the **CUDA backend** (CUDA, plus ROCm and MUSA,
 * **Speculative-decoding drafts that use the target's output projection** (EAGLE3, DFlash) rotate their input with the target's seed when that projection is rotated.
 * **Some architectures are not supported yet.** Models whose graphs call the matmul directly rather than through the common wrapper (deepseek2, glm-dsa, plm and a few others) refuse to run with a rotated weight, naming the offending tensor.
 
+### Per-weight sensitivity: `tensor-kl`
+
+`tensor-kl` measures how much each weight of a model matters to its quantization, at the model's operating point. It takes a model to perturb (usually a quantized mix, e.g. an Unsloth UD file or a `--hadamard` one) and the float model it came from. One weight at a time, it replaces the weight by the same weight quantized to each of a list of types, and measures how much the KL divergence and top-token agreement against the float model change from the unperturbed model's. The result is a `--tensor-type-file` with the measured changes in place of the types, which shows where a mix would gain most from more bits, or lose least from fewer.
+
+Build it with `make LLAMA_CUBLAS=1 tensor-kl-cuda` (CPU only: `make tensor-kl`).
+
+```bash
+./tensor-kl-cuda [options] <text-file> <reference.gguf> <model.gguf>
+```
+
+* `<text-file>`: the text to score, e.g. wikitext-2's `wiki.test.raw`. It's cut into windows of `-c` tokens, and the last half of each window is scored.
+* `<reference.gguf>`: the model the weights come from, in one file: the float model, or a near-lossless quantization of it such as an HQ8_0 file, whose weights are dequantized (and rotated back). It supplies each weight's values for quantizing, and the log-probabilities the model is measured against.
+* `<model.gguf>`: the model to perturb, with any types. Its weights must have the reference's names and shapes. It can be the reference itself, to measure each weight against an otherwise float model.
+
+**How it works**
+
+1. The reference's log-probabilities over the windows are computed once and saved to a cache file; later runs with the same settings reuse it, and the reference isn't loaded at all.
+2. The model is loaded and scored once, unperturbed: its KL and top-1 agreement are the baseline for every change.
+3. For each weight, the reference's values are read once and quantized to all the types in one step, exactly as `quantize_gguf` would (see below), and the variants are kept in RAM.
+4. For each type, the weight is replaced by its variant, a tensor of that type in a buffer of its own on the weight's device, and the model is scored. The variant runs on its type's own kernels, with the input rotated for an HQ type, so it behaves exactly as the weight would in a file quantized that way. After the last type, the weight is put back.
+
+The variants are quantized with `quantize_gguf`'s own code: plain types with the imatrix, HQ types rotated with the model's seed (or `quantize_gguf`'s default one for a model without HQ weights) and quantized with GPTQ where the imatrix has an entry. A variant of a weight's own type therefore reproduces the model exactly, and measures 0, when the model was quantized by this fork with the same imatrix. Files quantized elsewhere differ slightly in the imatrix-weighted types (Unsloth's Qwen3.8-27B UD-Q4_K_M: about 1e-5 KL), and that difference is part of each change.
+
+**Options**
+
+| option | default | meaning |
+|---|---|---|
+| `-ngl N` | 0 | GPU layers of the reference. Only used to compute its log-probabilities when they aren't cached. |
+| `-perturbngl N` | `-ngl` | GPU layers of the model to perturb. |
+| `-ot REGEX=DEVICE` | none | Places the weights whose name matches on a device, like llama.cpp's `--override-tensor`, for both models: `DEVICE` is a buffer type name such as `CUDA0` or `CPU`. Repeatable. |
+| `-c N` | 512 | Tokens per window. The last `N/2 - 1` of each window are scored, so each has at least `N/2` tokens of context. |
+| `--chunks N` | 10 | Number of windows. More windows lower the noise and cost proportionally more time. |
+| `--parallel N` | 1 | Windows per batch. With a model larger than VRAM, the weights in RAM cross to the GPU once per batch, so a larger batch is much faster, up to what VRAM and RAM hold. |
+| `--cache FILE` | `<reference>.ngl<N>.p<P>[.ot<hash>].kl-cache` | The reference's log-probabilities (FP16). The default name records the settings that change them: `-ngl`, `--parallel` and the `-ot` patterns. A cache is reused when it holds at least `--chunks` windows of the same text, window size and vocabulary. The files are shared with `test-hadamard-ppl`. |
+| `--imatrix FILE` | none | Importance matrix: plain types are quantized with it, HQ types with GPTQ. Weights without an entry are quantized without it, with a warning that names them. |
+| `--types T,T,...` | `q4_K,hq4_K` | The quantized types to try, by ggml type name, in any case. Types that need an imatrix (`iq2_xxs`, `iq2_xs`, `iq1_s`) are skipped for weights without one. |
+| `--variants-mb N` | 4096 | RAM for one weight's prepared variants. A weight whose variants would take more (`output` and `token_embd` of a large model) is prepared one type at a time. |
+| `--activations A` | `f32` | How the GEMMs round, on CUDA. `f32`: every weight runs as a dequantized F32 cuBLAS GEMM, which rounds nothing in between. `f16`: F16 cuBLAS GEMMs. `q8`: the quantized kernels, as in inference, which round each GEMM's input to 8 bits. See below for why `f32` is the default; it's recorded in the default cache name. |
+| `--group G` | `tensor` | What is perturbed at once: `tensor`, one weight; `layer`, all the weights of one block (`^blk\.N\.`); `kind`, one kind of weight in every selected block (`^blk\.\d+\.ffn_down\.weight$`). |
+| `--tensors REGEX` | all | Only the weights whose name matches. |
+| `--layers A[-B]` | all | Only the weights of blocks A to B; this leaves out `output` and `token_embd`. |
+
+`LLAMA_HQ_GPTQ=0` and `LLAMA_HQ_GPTQ_DAMP=<x>` work as in `quantize_gguf`.
+
+The weights perturbed are the ones `quantize_gguf` would quantize (2D and 3D weights, not norms, `ssm_conv1d` and the like) that the model has loaded; llama.cpp doesn't load the MTP layer's weights for normal inference, so those are left out. `token_embd` gets no HQ types, and neither does `output` in a model without `token_embd`. When `output` is tied to `token_embd`, both uses change together.
+
+**Output**
+
+On stdout, a header, a line per weight (or group) and a ranking per type; everything but the weight lines is a `#` comment. Progress and timings go to stderr.
+
+```
+# reference Qwen3.8-27B-bf16.gguf, perturbing Qwen3.8-27B-UD-Q4_K_M.gguf by tensor
+# 10 chunks of 512 tokens, 255 scored per chunk, 5 per batch; -ngl 32, -perturbngl 99; imatrix imatrix_unsloth.gguf (GPTQ for HQ)
+# unperturbed model: KL 0.009007, top-1 94.784 %
+# pattern=[(type, KL change, top-1 change in percentage points), ...]  # the weight's type in the model
+^output\.weight$=[(q4_k, 4.028e-03, -1.373), (hq4_k, 3.987e-03, -2.157), (hq5_k, 8.582e-04, -0.824), (q5_k, 9.871e-04, -0.275)]  # q6_k
+^blk\.63\.ffn_down\.weight$=[(q4_k, 2.465e-04, -0.314), (hq4_k, 1.252e-04, -0.039), (hq5_k, 2.440e-05, +0.118), (q5_k, 1.325e-04, +0.000)]  # q6_k
+...
+#
+# ranking for q4_k, largest KL change first
+# rank  pattern                       KL change    top-1  Mparams  now
+#    1  ^output\.weight$              4.028e-03   -1.373   1271.4  q6_k
+#    2  ^blk\.63\.ffn_down\.weight$   2.465e-04   -0.314     89.1  q6_k
+```
+
+A KL change is the model's mean KL divergence from the reference with the variant, minus the unperturbed model's; positive is worse. A top-1 change is in percentage points of tokens whose most likely token agrees with the reference's; negative is worse.
+
+**Reading the results**
+
+* **Rounding.** A change to one weight changes every activation after it, and any rounding of intermediate values then comes out differently in every later layer. Against a reference computed with the same rounding, that re-roll costs about the same whatever the size of the change, a floor under every result: with the quantized kernels' 8-bit activations (`--activations q8`), about 3e-4 KL for a layer-0 weight of Qwen3.8-27B and 9e-4 for Qwen3-0.6B, with F16 GEMMs 1.6e-4 on the 0.6B, with F32 GEMMs (`f32`, the default) under 1e-5. Only `f32` measures the weights themselves. The quantized kernels' own 8-bit rounding of a weight's input is a real inference cost, the same for every type of that weight; it doesn't depend on the weight's precision.
+* **A perturbed model at its minimum.** When the model is the reference itself, or a near-lossless stand-in for it (an HQ8_0 file as both), its KL is 0 and every change adds to it, more for fewer bits. With a quantized mix as the model (a UD file), the change of one weight also interacts with the other weights' errors and can come out either way, so small changes there are noise.
+* When the model is the reference itself, compute the reference with the same `-ngl`, `--parallel`, `-ot` and `--activations` as the model; the tool warns when the unperturbed model differs from its own reference.
+
+**Time and memory**
+
+Each (weight, type) costs one evaluation. On an RTX 5090, Qwen3.8-27B UD-Q4_K_M (16 GB) fits in VRAM with `-perturbngl 99`: an evaluation of 10 windows takes 2.8 s with `--parallel 5`, and preparing a weight takes up to about 20 s for `ffn_down` with 7 types (GPTQ). The whole model, 498 weights with 4 types, takes an estimated 2.2 hours. The BF16 model itself doesn't fit (54.7 GB). An HQ8_0 file of it (KL 0.0004 from BF16) serves as both reference and model: with `-ngl 48 -ot "output\.weight=CUDA0" --parallel 5` and F32 GEMMs, an evaluation of 30 windows takes 16 s (the F32 path dequantizes `output.weight` into a 5 GB buffer, hence the layers left in RAM).
+
+```bash
+# Qwen3.8-27B UD-Q4_K_M against its BF16 source; -ngl 32 --parallel 5 -ot ... name the cached reference
+./tensor-kl-cuda -ngl 32 -ot 'output\.weight=CUDA0' --parallel 5 -perturbngl 99 --chunks 10 \
+    --imatrix imatrix_unsloth.gguf --types q4_K,hq4_K,hq5_K,q5_K \
+    wiki.test.raw Qwen3.8-27B-bf16.gguf Qwen3.8-27B-UD-Q4_K_M.gguf > Qwen3.8-27B-UD-tensor-kl.txt
+```
+
 ### Testing
 
 The HQ tests are separate programs, built with make. `maincuda`, `test-backend-ops` and the `-cuda` variants need `LLAMA_CUBLAS=1`; `bench-rht` calls `nvcc` directly (`-arch=native`); the rest are CPU-only:
 
 ```bash
 make LLAMA_CUBLAS=1 -j$(nproc) quantize_gguf main maincuda test-hadamard test-hadamard-quants test-hadamard-quantize \
-    test-hq-gptq test-hadamard-llama test-hadamard-llama-cuda test-hadamard-ppl test-hadamard-ppl-cuda test-backend-ops bench-rht
+    test-hq-gptq test-hadamard-llama test-hadamard-llama-cuda test-hadamard-ppl test-hadamard-ppl-cuda tensor-kl tensor-kl-cuda \
+    test-backend-ops bench-rht
 ```
 
 Some take a small model and a text file: a BF16 GGUF of Qwen3-0.6B (e.g. `Qwen3-0.6B-BF16.gguf` from `unsloth/Qwen3-0.6B-GGUF`) and wikitext-2's `wiki.test.raw` (in `wikitext-2-raw-v1.zip` from `ggml-org/ci` on Hugging Face). Every program exits non-zero on a failure; the `test-hadamard*` ones print PASS/FAIL per check.
@@ -371,7 +456,8 @@ Some take a small model and a text file: a BF16 GGUF of Qwen3-0.6B (e.g. `Qwen3-
 | `test-hadamard-llama` | Loading and running HQ models. It takes plain quantizations and relabels their eligible tensors as HQ (the data isn't rotated; that doesn't matter here). Checks: HQ tensors load as their base type with the same bytes and buffer types (including the CPU repack), the loader still reports the HQ types, a saved model round-trips with its types and seed, one rotation per distinct rotated activation, no Hadamard graph inputs, the LoRA branch uses the unrotated input, the graph guard refuses every misuse of a rotated weight (wrong input, GET_ROWS, ADD, writes, views), a missing seed and a rotated `token_embd` are refused, and a model with an RPC device (an in-process server on 127.0.0.1:50931) is refused. The `-cuda` build also loads a real HQ model on the GPU and compares its logits with the CPU's. | `./quantize_gguf --pure <model-bf16.gguf> pure-q4k.gguf Q4_K`, then `./test-hadamard-llama <workdir> pure-q4k.gguf [more plain quantizations]` (same for `-cuda`) |
 | `test-backend-ops` | Upstream's backend test harness plus this fork's cases (`make_test_cases_fork`): the RHT op on CUDA against the CPU for every kernel, Hadamard order and width class, row counts, strides and 3D inputs; that CUDA accepts every width the rule accepts; and the graphs where the rotation writes the matmuls' 8-bit input directly, including every case that must fall back. | `./test-backend-ops -o RHT -b CUDA0`, also `-o MUL_MAT` and `-o MUL_MAT_ID`; repeat with `GGML_CUDA_DISABLE_FUSION=1` (all fusion off) and `GGML_CUDA_RHT_F32=1` (only the direct 8-bit output off) |
 | `bench-rht` | The CUDA kernels against the reference transform for every width class, the 8-bit outputs byte for byte against `quantize.cu`, and the device sign generator; then timings as CSV: µs per rotation in a CUDA graph for decode, and bandwidth against a copy for 512 rows. | `./bench-rht`; `--sweep` adds the kernel variants, `--once` launches each once for `ncu`, `-n N[,N...]`, `-r ROWS`, `-k A\|B` restrict the shapes |
-| `test-hadamard-ppl` | Quality against a reference model: perplexity, mean and 99th-percentile KL divergence, top-token agreement and bits per weight, over windows of a text file. The reference's log-probabilities are cached to a file (FP16, about 6 GB for 80 windows with a 152k vocabulary) and reused. `--lora` applies an adapter to every model. | `./test-hadamard-ppl-cuda -ngl 99 --chunks 80 [--cache FILE] [--lora FILE] wiki.test.raw <reference-bf16.gguf> <model.gguf>...` (CPU: `./test-hadamard-ppl` without `-ngl`) |
+| `test-hadamard-ppl` | Quality against a reference model: perplexity, mean and 99th-percentile KL divergence, top-token agreement and bits per weight, over windows of a text file. The reference's log-probabilities are cached to a file (FP16, about 6 GB for 80 windows with a 152k vocabulary) and reused, also for runs with fewer windows. `--lora` applies an adapter to every model. | `./test-hadamard-ppl-cuda -ngl 99 --chunks 80 [--cache FILE] [--lora FILE] wiki.test.raw <reference-bf16.gguf> <model.gguf>...` (CPU: `./test-hadamard-ppl` without `-ngl`) |
+| `tensor-kl` | Per-weight quantization sensitivity at a model's operating point; see [Per-weight sensitivity](#per-weight-sensitivity-tensor-kl). | `./tensor-kl-cuda [options] wiki.test.raw <reference-bf16.gguf> <model.gguf>` |
 
 `tools/quantize/tests-hq.sh` runs the whole set end to end on Qwen3-0.6B. It checks that no backend references the HQ types, runs the unit tests above, and quantizes and generates with `--hadamard` for Q8_0, Q4_K_M, Q5_K_M, Q4_0, IQ4_XS, Q3_K_M, IQ3_S, IQ3_XS, Q2_K and IQ2_XXS (the 4–8 bit ones must answer "Paris"). It then checks HQ5_K → HQ4_XS requantizing, runtime LoRA and `--lora` merges by KL (it writes a synthetic adapter with Python, so it needs `python3` and `numpy`), and, with `CUDA=1` on a build with CUDA graphs, that graphs on and off give identical output. About 10–15 minutes on the CPU, 5 on the GPU:
 
@@ -382,7 +468,7 @@ CUDA=1 tools/quantize/tests-hq.sh . Qwen3-0.6B-BF16.gguf wikitext-2-raw/wiki.tes
 
 `BIN=<dir>` takes the binaries from another directory than the repo root, and `CHUNKS=N` sets the number of windows for the KL checks (default 20). `IMATRIX=<imatrix.gguf>` adds the GPTQ step: Q8_0, Q4_K_M, Q5_K_M, Q4_0, IQ4_XS, Q3_K_M, IQ3_S, Q2_K and IQ2_XXS with `--hadamard --imatrix` must beat uniform HQ by KL, and all but IQ3_S, Q2_K and IQ2_XXS must answer "Paris" and come within 10 % of the unrotated mix with the same imatrix.
 
-## Background information on llama-quantize
+## Background information on quantize_gguf
 
 - [k-quants](https://github.com/ggml-org/llama.cpp/pull/1684)
 - k-quants improvements and i-quants

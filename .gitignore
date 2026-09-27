@@ -61,6 +61,8 @@ models-mnt
 /quantize_gguf
 /test-hadamard*
 /test-hq-gptq
+/tensor-kl*
+/gguf-split
 /test-backend-ops
 /bench-rht
 /ggml/src/ggml-cuda/**/*.d

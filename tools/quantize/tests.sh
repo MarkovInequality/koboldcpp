@@ -5,7 +5,7 @@ set -eu
 if [ $# -lt 1 ]
 then
     echo "usage:   $0 path_to_build_binary [path_to_temp_folder]"
-    echo "example: $0 ../../build/bin ../../tmp"
+    echo "example: $0 ../.. ../../tmp"
     exit 1
 fi
 
@@ -18,9 +18,9 @@ fi
 
 set -x
 
-SPLIT=$1/llama-gguf-split
-QUANTIZE=$1/llama-quantize
-MAIN=$1/llama-completion
+SPLIT=$1/gguf-split
+QUANTIZE=$1/quantize_gguf
+MAIN=$1/main
 WORK_PATH=$TMP_DIR/quantize
 ROOT_DIR=$(realpath $(dirname $0)/../../)
 
@@ -30,10 +30,11 @@ mkdir -p "$WORK_PATH"
 rm -f $WORK_PATH/ggml-model-split*.gguf $WORK_PATH/ggml-model-requant*.gguf
 
 # 1. Get a model
-(
-cd $WORK_PATH
-"$ROOT_DIR"/scripts/hf.sh --repo ggml-org/Qwen3-0.6B-GGUF --file Qwen3-0.6B-Q8_0.gguf
-)
+if [ ! -f $WORK_PATH/Qwen3-0.6B-Q8_0.gguf ]
+then
+    curl -fL -o $WORK_PATH/Qwen3-0.6B-Q8_0.gguf.part https://huggingface.co/ggml-org/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf
+    mv $WORK_PATH/Qwen3-0.6B-Q8_0.gguf.part $WORK_PATH/Qwen3-0.6B-Q8_0.gguf
+fi
 echo PASS
 
 # 2. Split model

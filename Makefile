@@ -1027,14 +1027,20 @@ test-hadamard-quantize: tests/test-hadamard-quantize.cpp ggml.o ggml-cpu.o ggml-
 test-hq-gptq: tests/test-hq-gptq.cpp ggml.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_default.o ggml-repack.o $(OBJS_FULL) $(OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
-test-hadamard-ppl: tests/test-hadamard-ppl.cpp ggml.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_default.o ggml-repack.o $(OBJS_FULL) $(OBJS)
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+test-hadamard-ppl: tests/test-hadamard-ppl.cpp tests/kl-eval.h ggml.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_default.o ggml-repack.o $(OBJS_FULL) $(OBJS)
+	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
+
+tensor-kl: tests/tensor-kl.cpp tests/kl-eval.h common/imatrix-loader.cpp ggml.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_default.o ggml-repack.o $(OBJS_FULL) $(OBJS)
+	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
 
 # CUDA variants (LLAMA_CUBLAS=1). CUBLAS_OBJS also carries the legacy v2/v3 CUDA backends, which
 # need the v2/v3 cores - these tools only want the modern one
 CUBLAS_OBJS_V4 = ggml-cuda.o $(patsubst %.cu,%.o,$(filter-out ggml/src/ggml-cuda/ggml-cuda.cu, $(wildcard ggml/src/ggml-cuda/*.cu))) $(OBJS_CUDA_TEMP_INST)
 
-test-hadamard-ppl-cuda: tests/test-hadamard-ppl.cpp ggml_v4_cublas.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_cublas.o ggml-repack.o $(CUBLAS_OBJS_V4) $(OBJS_FULL) $(OBJS)
+test-hadamard-ppl-cuda: tests/test-hadamard-ppl.cpp tests/kl-eval.h ggml_v4_cublas.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_cublas.o ggml-repack.o $(CUBLAS_OBJS_V4) $(OBJS_FULL) $(OBJS)
+	$(CXX) $(CXXFLAGS) $(CUBLAS_FLAGS) $(filter-out %.h,$^) -o $@ $(CUBLASLD_FLAGS) $(LDFLAGS)
+
+tensor-kl-cuda: tests/tensor-kl.cpp tests/kl-eval.h common/imatrix-loader.cpp ggml_v4_cublas.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_cublas.o ggml-repack.o $(CUBLAS_OBJS_V4) $(OBJS_FULL) $(OBJS)
 	$(CXX) $(CXXFLAGS) $(CUBLAS_FLAGS) $(filter-out %.h,$^) -o $@ $(CUBLASLD_FLAGS) $(LDFLAGS)
 
 maincuda: tools/completion/main.cpp tools/completion/completion.cpp common/arg.cpp common/preset.cpp $(COMMON_DOWNLOAD_SRCS) build-info.h ggml_v4_cublas.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o console.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_cublas.o ggml-repack.o $(CUBLAS_OBJS_V4) $(OBJS_FULL) $(OBJS)
