@@ -78,7 +78,7 @@ llama_model_plm::graph::graph(const llama_model & model, const llm_graph_params 
         // self_attention
         {
             ggml_tensor * q = NULL;
-            q = ggml_mul_mat(ctx0, model.layers[il].wq, cur);
+            q = build_mm(model.layers[il].wq, cur);
             cb(q, "q", il);
 
             // {n_embd_head_k, n_head, n_tokens}, RoPE is applied to the trailing dims only
@@ -86,7 +86,7 @@ llama_model_plm::graph::graph(const llama_model & model, const llm_graph_params 
             cb(q, "q", il);
 
             // {n_embd, kv_lora_rank + n_embd_head_qk_rope} * {n_embd, n_tokens} -> {kv_lora_rank + n_embd_head_qk_rope, n_tokens}
-            ggml_tensor * kv_pe_compresseed = ggml_mul_mat(ctx0, model.layers[il].wkv_a_mqa, cur);
+            ggml_tensor * kv_pe_compresseed = build_mm(model.layers[il].wkv_a_mqa, cur);
             cb(kv_pe_compresseed, "kv_pe_compresseed", il);
 
             // split into {kv_lora_rank, n_tokens}
@@ -108,7 +108,7 @@ llama_model_plm::graph::graph(const llama_model & model, const llm_graph_params 
             cb(kv_compressed, "kv_compressed", il);
 
             // {kv_lora_rank, n_head * (n_embd_head_qk_nope + n_embd_head_v)} * {kv_lora_rank, n_tokens} -> {n_head * (n_embd_head_qk_nope + n_embd_head_v), n_tokens}
-            ggml_tensor * kv = ggml_mul_mat(ctx0, model.layers[il].wkv_b, kv_compressed);
+            ggml_tensor * kv = build_mm(model.layers[il].wkv_b, kv_compressed);
             cb(kv, "kv", il);
 
             // split into {n_head * n_embd_head_qk_nope, n_tokens}

@@ -1,6 +1,5 @@
 #include "llama-kv-cache.h"
 
-#include "llama-hadamard.h"
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-model.h"
@@ -41,7 +40,19 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
         data = data_f32.data();
     }
 
-    llama_gen_hadamard_matrix(data, n);
+    data[0*n + 0] = 1.0 / sqrtf(n);
+
+    for (int s = 1; s < n; s *= 2) {
+        for (int i = 0; i < s; i++) {
+            for (int j = 0; j < s; j++) {
+                const float val = data[i*n + j];
+
+                data[(i + s)*n + (j    )] =  val;
+                data[(i    )*n + (j + s)] =  val;
+                data[(i + s)*n + (j + s)] = -val;
+            }
+        }
+    }
 
     if (tensor->type != GGML_TYPE_F32) {
         ggml_quantize_chunk(tensor->type, data, tensor->data, 0, 1, n*n, nullptr);

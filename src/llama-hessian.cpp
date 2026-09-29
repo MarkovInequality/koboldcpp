@@ -1,28 +1,12 @@
 #include "llama-hessian.h"
+#include "llama-mmap.h"
 
 #include "ggml.h"
 #include "gguf.h"
 
-#include <cerrno>
 #include <cstdio>
 #include <cstring>
-#include <fcntl.h>
-#include <unistd.h>
-
-static bool hessian_pread(int fd, void * dst, size_t size, size_t off) {
-    uint8_t * p = (uint8_t *) dst;
-    while (size > 0) {
-        const ssize_t r = pread(fd, p, size, (off_t) off);
-        if (r < 0 && errno == EINTR) {
-            continue;
-        }
-        if (r <= 0) {
-            return false;
-        }
-        p += r; off += r; size -= r;
-    }
-    return true;
-}
+#include <stdexcept>
 
 static bool hessian_remove_suffix(std::string & s, const char * suffix) {
     const size_t n = strlen(suffix);
@@ -33,10 +17,21 @@ static bool hessian_remove_suffix(std::string & s, const char * suffix) {
     return true;
 }
 
-llama_hessian::~llama_hessian() {
-    if (fd >= 0) {
-        close(fd);
+llama_hessian::llama_hessian()  = default;
+llama_hessian::~llama_hessian() = default;
+
+// llama_file reads short past the end of a buffered file instead of failing, so the range is checked here
+bool llama_hessian::read_at(void * dst, size_t size, size_t offset) const {
+    if (!file || offset > file->size() || size > file->size() - offset) {
+        return false;
     }
+    try {
+        file->seek(offset, SEEK_SET);
+        file->read_raw(dst, size);
+    } catch (const std::exception &) {
+        return false;
+    }
+    return true;
 }
 
 bool llama_hessian::open(const std::string & path) {
@@ -97,9 +92,13 @@ bool llama_hessian::open(const std::string & path) {
     gguf_free(g);
     ggml_free(meta);
 
-    fd = ::open(path.c_str(), O_RDONLY);
-    fname = path;
-    return fd >= 0;
+    try {
+        file = std::make_unique<llama_file>(path.c_str(), "rb");
+    } catch (const std::exception & e) {
+        fprintf(stderr, "%s: %s\n", __func__, e.what());
+        return false;
+    }
+    return true;
 }
 
 bool llama_hessian::has(const std::string & w) const {
@@ -119,7 +118,7 @@ std::string llama_hessian::owner(const std::string & w) const {
 double llama_hessian::count(const std::string & w) const {
     auto it = count_off.find(w);
     float c = 0.0f;
-    if (it == count_off.end() || !hessian_pread(fd, &c, sizeof(c), it->second)) {
+    if (it == count_off.end() || !read_at(&c, sizeof(c), it->second)) {
         return 0.0;
     }
     return c;
@@ -145,10 +144,10 @@ bool llama_hessian::read(const std::string & w, float * dst, int64_t row0, int64
     if (row0 < 0 || row0 + n_rows > gi.n) {
         return false;
     }
-    return hessian_pread(fd, dst, (size_t) n_rows*gi.n*sizeof(float), gi.offset + (size_t) row0*gi.n*sizeof(float));
+    return read_at(dst, (size_t) n_rows*gi.n*sizeof(float), gi.offset + (size_t) row0*gi.n*sizeof(float));
 }
 
 bool llama_hessian::read_sum2(const std::string & w, float * dst) const {
     auto it = sum2_off.find(w);
-    return it != sum2_off.end() && hessian_pread(fd, dst, (size_t) n(w)*sizeof(float), it->second);
+    return it != sum2_off.end() && read_at(dst, (size_t) n(w)*sizeof(float), it->second);
 }

@@ -5,6 +5,7 @@
 // tokens of context. Shared by test-hadamard-ppl and tensor-kl, which read the same cache files.
 
 #include "llama.h"
+#include "common/common.h"
 #include "ggml.h"
 
 #include <algorithm>
@@ -23,17 +24,6 @@ struct cache_header {
     int32_t  n_chunks;
     uint64_t token_hash;
 };
-
-static std::vector<llama_token> tokenize_file(const llama_vocab * vocab, const std::string & text, bool parse_special = false) {
-    std::vector<llama_token> tokens(text.size() + 16);
-    const int n = llama_tokenize(vocab, text.c_str(), (int32_t) text.size(), tokens.data(), (int32_t) tokens.size(), true, parse_special);
-    if (n < 0) {
-        fprintf(stderr, "tokenization failed (%d)\n", n);
-        return {};
-    }
-    tokens.resize(n);
-    return tokens;
-}
 
 // 1 for the tokens a chat model generates: its own turns (<|im_start|>assistant\n ... <|im_end|>) and text outside any
 // turn; 0 for turn headers and system/user/tool turns, where chat models aren't trained to predict. <|endoftext|>

@@ -3267,6 +3267,16 @@ void iq2xs_free_impl(enum ggml_type type) {
     }
 }
 
+float ggml_make_qkx3_quants(int n, int nmax, const float * GGML_RESTRICT x, const float * GGML_RESTRICT weights,
+        uint8_t * GGML_RESTRICT L, float * GGML_RESTRICT the_min, uint8_t * GGML_RESTRICT Laux,
+        float rmin, float rdelta, int nstep, bool use_mad) {
+    return make_qkx3_quants(n, nmax, x, weights, L, the_min, Laux, rmin, rdelta, nstep, use_mad);
+}
+
+float ggml_make_qp_quants(int n, int nmax, const float * GGML_RESTRICT x, uint8_t * GGML_RESTRICT L, const float * quant_weights) {
+    return make_qp_quants(n, nmax, x, L, quant_weights);
+}
+
 void ggml_iq2_entry(enum ggml_type type, const uint64_t ** grid, const int ** map, const uint16_t ** neighbours) {
     const iq2_entry_t * e = &iq2_data[iq2_data_index(type)];
     *grid       = e->grid;

@@ -2,8 +2,11 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
+
+struct llama_file;
 
 // A hessian file from hessian-collect: an imatrix GGUF in which each distinct GEMM input also carries its Gram
 // G = sum x x^T (unrotated, a raw sum over .counts rows) as <owner>.in_gram F32 [n, n]; the other weights that
@@ -11,7 +14,7 @@
 // in row slabs, never the whole file.
 class llama_hessian {
 public:
-    llama_hessian() = default;
+    llama_hessian();
     llama_hessian(const llama_hessian &) = delete;
     llama_hessian & operator=(const llama_hessian &) = delete;
     ~llama_hessian();
@@ -38,8 +41,9 @@ private:
         int64_t n;
     };
 
-    int fd = -1;
-    std::string fname;
+    bool read_at(void * dst, size_t size, size_t offset) const;
+
+    std::unique_ptr<llama_file> file;
     std::map<std::string, std::string> owners;   // weight -> owner, owners included
     std::map<std::string, gram_info>   grams;    // owner -> its .in_gram
     std::map<std::string, size_t>      sum2_off; // weight -> its .in_sum2

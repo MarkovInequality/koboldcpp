@@ -65,6 +65,13 @@ if grep -rn 'ggml_get_base_type\|ggml_is_rotated' "$ROOT"/ggml/src/ggml-*/; then
 fi
 echo PASS
 
+echo "== libllama has no POSIX-only I/O (it is built by MSVC too)"
+if grep -n '#include <unistd.h>\|#include <fcntl.h>\|[^_a-z]pread(\|[^_a-z]pwrite(' "$ROOT"/src/*.cpp "$ROOT"/src/*.h | grep -v '/src/llama-mmap.cpp:'; then
+    echo "FAIL: POSIX-only I/O outside llama-mmap.cpp's guarded code"
+    exit 1
+fi
+echo PASS
+
 echo "== unit tests"
 "$BIN"/test-hadamard > "$WORK"/unit.log
 "$BIN"/test-hadamard-quants >> "$WORK"/unit.log

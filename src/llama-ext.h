@@ -49,6 +49,12 @@ LLAMA_API bool llama_quant_tensor_allows_quantization(
         const quantize_state_impl * qs,
         const ggml_tensor * tensor);
 
+// Returns true if --hadamard can store this tensor Hadamard-rotated: quantized, not an embedding, and a
+// width with an RHT and an HQ block size.
+LLAMA_API bool llama_quant_tensor_rotatable(
+        const quantize_state_impl * qs,
+        const ggml_tensor * tensor);
+
 // Compute quantization type assignments for a list of tensors.
 // All tensors should be quantizable (use llama_quant_tensor_allows_quantization to filter).
 // result_types: caller-allocated array of n_tensors elements, filled with assigned types.

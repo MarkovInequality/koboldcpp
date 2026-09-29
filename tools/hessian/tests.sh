@@ -58,6 +58,7 @@ w("fullspan", [{"id": "d", "text": a, "count": [[0, n]]}])
 w("first", [{"id": "d", "text": a, "count": [[0, 700]]}])
 w("rest", [{"id": "d", "text": a, "count": [[700, n]]}])
 w("packed", [{"id": "x", "text": b, "count": []}, {"id": "d", "text": a}, {"id": "y", "text": c, "count": []}])
+w("tail", [{"id": "d", "text": a, "count": [[60, 100]]}])
 PY
 
 if [[ " $PHASES " == *" hook "* ]]; then
@@ -99,6 +100,11 @@ if [[ " $PHASES " == *" cpu "* ]]; then
     check "resume: finish" "$HC" -m "$M" "${docs4[@]}" "${common[@]}" --group-layers 5 --resume -o res.gguf
     check "resume: uninterrupted run" "$HC" -m "$M" "${docs4[@]}" "${common[@]}" --group-layers 5 -o full5.gguf
     check "resumed file = uninterrupted file" cmp res.gguf full5.gguf
+
+    # counted [60, 100) at stride 64 in ubatches of 64: position 60 is the only output; the second ubatch has
+    # none, so its last token (99, counted) gets a logit only to make the decode valid
+    check "a forced logit: collect (small ubatches)" "$HC" -m "$M" --docs spans/tail.jsonl --trim-docs --ubatch 64 --output-stride 64 --threads "$THREADS" --layers out -o spans/tail.gguf
+    check "... the LM head counts only the document's own output" "$TH" count spans/tail.gguf token_embd.weight 1
 
     for s in full fullspan first rest packed; do
         check "collect spans/$s" "$HC" -m "$M" --docs spans/$s.jsonl "${common[@]}" --group-layers 29 -o spans/$s.gguf

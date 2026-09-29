@@ -18,7 +18,7 @@
 // isn't F32, F16 or BF16 - a near-lossless one like an HQ8_0 file makes a fast stand-in for the float model
 // when the model to perturb is the reference itself. The values go through the same quantizers as
 // quantize_gguf: plain types use the imatrix, HQ types are rotated with the model's seed and quantized with
-// GPTQ when there is an imatrix entry (LLAMA_HQ_GPTQ, LLAMA_HQ_GPTQ_DAMP as in quantize_gguf). A variant
+// GPTQ when there is an imatrix entry (--no-gptq, --gptq-damp as in quantize_gguf). A variant
 // replaces the weight as a tensor of its own type on the weight's device, so it runs on that type's kernels,
 // rotated input included for an HQ type, exactly as in a file quantized that way. Each weight is quantized
 // to all the types in one step, which reads it and rotates it once and builds its GPTQ factor once; the
@@ -32,6 +32,7 @@
 
 #include "kl-eval.h"
 
+#include "llama-ext.h"
 #include "llama-model.h"
 #include "llama-quant-gptq.h"
 #include "common/imatrix-loader.h"
@@ -56,34 +57,9 @@
 #include <unistd.h>
 #include <unordered_map>
 
-static const uint64_t HADAMARD_SEED_DEFAULT = 0x48512d524854ull; // as in src/llama-quant.cpp
-
 // --types same and hq: per weight, its type in the model and that type's HQ twin
 static const ggml_type TYPE_SAME = (ggml_type) (GGML_TYPE_COUNT + 1);
 static const ggml_type TYPE_HQ   = (ggml_type) (GGML_TYPE_COUNT + 2);
-
-// mirrors tensor_allows_quantization in src/llama-quant.cpp
-static bool quantizable(const ggml_tensor * t) {
-    const std::string name = t->name;
-    if (ggml_n_dims(t) < 2 || name.size() < 6 || name.compare(name.size() - 6, 6, "weight") != 0 ||
-        name == "position_embd.weight" || name == "token_types.weight") {
-        return false;
-    }
-    static const char * const excluded[] = {
-        "_norm.weight", "ffn_gate_inp.weight", "ffn_gate_tid2eid.weight", "altup", "laurel", "per_layer_model_proj",
-        "ssm_conv1d", "shortconv.conv.weight", "indexer.k_proj.weight", "indexer.q_proj.weight",
-        "time_mix_first.weight", "time_mix_w0.weight", "time_mix_w1.weight", "time_mix_w2.weight",
-        "time_mix_v0.weight", "time_mix_v1.weight", "time_mix_v2.weight", "time_mix_a0.weight",
-        "time_mix_a1.weight", "time_mix_a2.weight", "time_mix_g1.weight", "time_mix_g2.weight",
-        "time_mix_decay_w1.weight", "time_mix_decay_w2.weight", "time_mix_lerp_fused.weight", "attn_rel_b.weight",
-    };
-    for (const char * s : excluded) {
-        if (name.find(s) != std::string::npos) {
-            return false;
-        }
-    }
-    return true;
-}
 
 static bool is_float(ggml_type type) {
     return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
@@ -106,17 +82,6 @@ static void row_to_f32(ggml_type type, const void * src, float * dst, int64_t n,
     }
 }
 
-static std::string regex_escape(const std::string & s) {
-    std::string out;
-    for (char c : s) {
-        if (strchr(".^$|()[]{}*+?\\", c)) {
-            out += '\\';
-        }
-        out += c;
-    }
-    return out;
-}
-
 static std::string type_label(ggml_type type) {
     if (type == TYPE_SAME || type == TYPE_HQ) {
         return type == TYPE_SAME ? "same" : "hq";
@@ -126,34 +91,6 @@ static std::string type_label(ggml_type type) {
         c = (char) tolower((unsigned char) c);
     }
     return s;
-}
-
-// the imatrix as quantize_gguf reads it: mean squared activation per input column (and expert)
-static bool load_imatrix(const std::string & path, std::unordered_map<std::string, std::vector<float>> & out) {
-    common_imatrix im;
-    if (!common_imatrix_load(path, im)) {
-        return false;
-    }
-    for (const auto & [name, entry] : im.entries) {
-        auto & e = out[name];
-        e.resize(entry.sums.size());
-        if (!im.is_legacy) {
-            const int64_t ncounts = entry.counts.size();
-            const int64_t ne0     = (int64_t) entry.sums.size() / ncounts;
-            for (int64_t j = 0; j < ncounts; ++j) {
-                const float count = (float) entry.counts[j];
-                for (int64_t i = 0; i < ne0; ++i) {
-                    e[j*ne0 + i] = count > 0.0f ? entry.sums[j*ne0 + i] / count : 1.0f;
-                }
-            }
-        } else {
-            const int64_t ncall = entry.counts.empty() ? 0 : entry.counts[0];
-            for (size_t i = 0; i < entry.sums.size(); ++i) {
-                e[i] = ncall > 0 ? entry.sums[i] / ncall : entry.sums[i];
-            }
-        }
-    }
-    return true;
 }
 
 struct quantizer {
@@ -175,7 +112,7 @@ struct quantizer {
         const float * U = nullptr;
         if (ggml_is_rotated(type) && im && gptq) {
             llama_gptq_cache::status st;
-            U = cache.get(im, n, seed, damp, workers, nth, &st);
+            U = cache.get(im, n, seed, damp, nth, &st);
             if ((st == llama_gptq_cache::TOO_BIG || st == llama_gptq_cache::FAILED) && warned.insert(n).second) {
                 fprintf(stderr, "warning: no GPTQ factor for width %" PRId64 " - uniform weights\n", n);
             }
@@ -206,7 +143,7 @@ struct target {
     std::string kind;       // the name without "blk.N." and ".weight"
     std::string label;      // the name without ".weight"
     const float * im = nullptr;
-    bool        no_rotate;  // token embeddings can't be HQ
+    bool        rotatable;  // --hadamard could store it rotated
     int64_t     src_offs;   // the weight's values in the reference file
     ggml_type   src_type;
 
@@ -248,7 +185,7 @@ struct target {
         }
         type = resolve(type);
         return t->ne[0] % ggml_blck_size(type) == 0 &&
-               (!ggml_is_rotated(type) || (!no_rotate && ggml_rht_plan(t->ne[0], nullptr, nullptr))) &&
+               (!ggml_is_rotated(type) || rotatable) &&
                (im || !ggml_quantize_requires_imatrix(type));
     }
 };
@@ -456,7 +393,7 @@ static void print_usage(const char * prog) {
         "  --tensors REGEX     only the weights whose name matches (default: all)\n"
         "  --layers A[-B]      only the weights of blocks A to B (default: all, with output and token_embd)\n"
         "\n"
-        "LLAMA_HQ_GPTQ=0 and LLAMA_HQ_GPTQ_DAMP=<x> work as in quantize_gguf.\n", prog);
+        "  --no-gptq, --gptq-damp D   as in quantize_gguf\n", prog);
 }
 
 int main(int argc, char ** argv) {
@@ -471,6 +408,9 @@ int main(int argc, char ** argv) {
     int  layer_max     = INT32_MAX;
     std::string cache_path, imatrix_path, types_arg = "q4_K,hq4_K", tensors_arg, group_by = "tensor", activations = "f32";
     std::vector<std::string> overrides;
+    const llama_model_quantize_params qparams = llama_model_quantize_default_params();
+    bool  gptq      = qparams.hq_gptq;
+    float gptq_damp = qparams.hq_gptq_damp;
 
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
@@ -483,7 +423,12 @@ int main(int argc, char ** argv) {
     for (; arg + 1 < argc && argv[arg][0] == '-'; arg += 2) {
         const char * a = argv[arg];
         const char * v = argv[arg + 1];
-        if (!strcmp(a, "-ngl")) {
+        if (!strcmp(a, "--no-gptq")) {
+            gptq = false;
+            arg--;
+        } else if (!strcmp(a, "--gptq-damp")) {
+            gptq_damp = (float) atof(v);
+        } else if (!strcmp(a, "-ngl")) {
             n_gpu_layers = atoi(v);
         } else if (!strcmp(a, "-perturbngl")) {
             perturb_ngl = atoi(v);
@@ -582,7 +527,7 @@ int main(int argc, char ** argv) {
             return 1;
         }
         n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(ref));
-        tokens  = tokenize_file(llama_model_get_vocab(ref), text);
+        tokens  = common_tokenize(llama_model_get_vocab(ref), text, true);
         llama_model_free(ref);
     }
     n_chunks = std::min(n_chunks, (int) (tokens.size() / n_ctx));
@@ -657,34 +602,29 @@ int main(int argc, char ** argv) {
     }
 
     std::unordered_map<std::string, std::vector<float>> imatrix;
-    if (!imatrix_path.empty() && !load_imatrix(imatrix_path, imatrix)) {
+    common_imatrix im;
+    if (!imatrix_path.empty() && !common_imatrix_load(imatrix_path, im)) {
         fprintf(stderr, "failed to load the imatrix %s\n", imatrix_path.c_str());
         return 1;
     }
+    common_imatrix_means(im, imatrix);
 
     // HQ variants use the model's seed, or quantize_gguf's default for a model without rotated weights
     quantizer qz;
     if (!model->hadamard_seed) {
-        model->hadamard_seed = HADAMARD_SEED_DEFAULT;
+        model->hadamard_seed = qparams.hadamard_seed;
     }
     qz.seed = model->hadamard_seed;
     qz.nth  = nth;
-    const char * gptq_env = getenv("LLAMA_HQ_GPTQ");
-    qz.gptq = !(gptq_env && strcmp(gptq_env, "0") == 0);
-    qz.damp = LLAMA_GPTQ_DAMP_DEFAULT;
-    if (const char * damp_env = getenv("LLAMA_HQ_GPTQ_DAMP")) {
-        qz.damp = strtof(damp_env, nullptr);
-        if (!(qz.damp >= LLAMA_GPTQ_DAMP_MIN)) {
-            fprintf(stderr, "LLAMA_HQ_GPTQ_DAMP=%s: needs a number of at least %g\n", damp_env, LLAMA_GPTQ_DAMP_MIN);
-            return 1;
-        }
+    qz.gptq = gptq;
+    qz.damp = gptq_damp;
+    if (!(qz.damp >= LLAMA_GPTQ_DAMP_MIN)) {
+        fprintf(stderr, "--gptq-damp %g: needs at least %g\n", qz.damp, LLAMA_GPTQ_DAMP_MIN);
+        return 1;
     }
 
     // the weights to perturb, those outside the blocks first
-    bool has_token_embd = false;
-    for (const auto & [name, t] : model->tensors_by_name) {
-        has_token_embd |= name == "token_embd.weight";
-    }
+    quantize_state_impl * qs = llama_quant_init(model, &qparams);
     // a tied output.weight loads token_embd.weight a second time; both copies are perturbed
     const std::regex tensors_re(tensors_arg.empty() ? "." : tensors_arg);
     std::vector<target> targets;
@@ -695,7 +635,7 @@ int main(int argc, char ** argv) {
             il = -1;
         }
         if ((layers_given && (il < layer_min || il > layer_max)) ||
-            !quantizable(t) || !std::regex_search(name, tensors_re) || !t->buffer || !t->data) {
+            !llama_quant_tensor_allows_quantization(qs, t) || !std::regex_search(name, tensors_re) || !t->buffer || !t->data) {
             continue;
         }
         GGML_ASSERT(ggml_is_contiguous(t) && t->ne[3] == 1 && !t->view_src);
@@ -714,7 +654,7 @@ int main(int argc, char ** argv) {
         tg.layer     = il;
         tg.label     = name.substr(0, name.size() - strlen(".weight"));
         tg.kind      = tg.label.substr(il >= 0 ? n_prefix : 0);
-        tg.no_rotate = name.find("token_embd") != std::string::npos || (name == "output.weight" && !has_token_embd);
+        tg.rotatable = llama_quant_tensor_rotatable(qs, t);
         tg.src_offs  = gguf_get_data_offset(ref_gguf) + gguf_get_tensor_offset(ref_gguf, id);
         tg.src_type  = rt->type;
         tg.type0     = t->type;
@@ -737,6 +677,7 @@ int main(int argc, char ** argv) {
         }
         targets.push_back(std::move(tg));
     }
+    llama_quant_free(qs);
     if (targets.empty()) {
         fprintf(stderr, "no weights to perturb in the selected layers and tensors\n");
         return 1;

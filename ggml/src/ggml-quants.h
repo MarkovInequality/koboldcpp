@@ -110,6 +110,12 @@ GGML_API void iq2xs_free_impl(enum ggml_type type);
 GGML_API void iq3xs_init_impl(int grid_size);
 GGML_API void iq3xs_free_impl(int grid_size);
 
+// the K-quant scale searches, for the HQ quantizers
+GGML_API float ggml_make_qkx3_quants(int n, int nmax, const float * GGML_RESTRICT x, const float * GGML_RESTRICT weights,
+        uint8_t * GGML_RESTRICT L, float * GGML_RESTRICT the_min, uint8_t * GGML_RESTRICT Laux,
+        float rmin, float rdelta, int nstep, bool use_mad);
+GGML_API float ggml_make_qp_quants(int n, int nmax, const float * GGML_RESTRICT x, uint8_t * GGML_RESTRICT L, const float * quant_weights);
+
 // tables built by iq2xs_init_impl / iq3xs_init_impl, NULL until then
 GGML_API void ggml_iq2_entry(enum ggml_type type, const uint64_t ** grid, const int ** map, const uint16_t ** neighbours);
 GGML_API void ggml_iq3_entry(int grid_size,       const uint32_t ** grid, const int ** map, const uint16_t ** neighbours);

@@ -780,6 +780,9 @@ llm_arch llm_arch_from_string(const std::string & name);
 
 const llm_tensor_info & llm_tensor_info_for(llm_tensor tensor);
 
+// the op that consumes a model file's tensor of this name (as LLM_TN formats it); GGML_OP_NONE if unknown
+ggml_op llm_tensor_op_for_name(const std::string & name);
+
 bool llm_arch_is_recurrent      (const llm_arch & arch);
 bool llm_arch_is_hybrid         (const llm_arch & arch);
 bool llm_arch_is_diffusion      (const llm_arch & arch);

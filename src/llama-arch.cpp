@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 
 #include <map>
+#include <unordered_map>
 #include <vector>
 
 static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
@@ -1044,6 +1045,37 @@ llm_arch llm_arch_from_string(const std::string & name) {
 
 const llm_tensor_info & llm_tensor_info_for(llm_tensor tensor) {
     return LLM_TENSOR_INFOS.at(tensor);
+}
+
+ggml_op llm_tensor_op_for_name(const std::string & name) {
+    static const std::unordered_map<std::string, ggml_op> ops = [] {
+        std::unordered_map<std::string, ggml_op> m;
+        for (const auto & [tensor, fmt] : LLM_TENSOR_NAMES) {
+            const auto it = LLM_TENSOR_INFOS.find(tensor);
+            const ggml_op op = it == LLM_TENSOR_INFOS.end() ? GGML_OP_NONE : it->second.op;
+            const auto [pos, added] = m.emplace(fmt, op);
+            if (!added && pos->second != op) {
+                pos->second = GGML_OP_NONE;
+            }
+        }
+        return m;
+    }();
+
+    // "blk.12.ffn_up.3.weight" -> "blk.%d.ffn_up.%d", with or without its last part
+    std::string key;
+    for (size_t p = 0; p <= name.size(); ) {
+        const size_t q = std::min(name.find('.', p), name.size());
+        const std::string part = name.substr(p, q - p);
+        const bool num = !part.empty() && part.find_first_not_of("0123456789") == std::string::npos;
+        key += (p ? "." : "") + (num ? std::string("%d") : part);
+        p = q + 1;
+    }
+    auto it = ops.find(key);
+    if (it == ops.end()) {
+        const size_t dot = key.rfind('.');
+        it = dot == std::string::npos ? ops.end() : ops.find(key.substr(0, dot));
+    }
+    return it == ops.end() ? GGML_OP_NONE : it->second;
 }
 
 bool llm_arch_is_recurrent(const llm_arch & arch) {

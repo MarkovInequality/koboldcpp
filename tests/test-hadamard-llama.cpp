@@ -265,6 +265,18 @@ static void test_guard(const llama_model * m) {
               ggml_tensor * v = ggml_view_2d(c, w, n, 8, w->nb[1], 0);
               return ggml_mul_mat(c, v, ggml_reshape_2d(c, ggml_rht(c, x(c), seed), n, 3)); }),
           "accepts a view of a rotated weight with a reshaped RHT input");
+    check(guard_throws(m, [&](ggml_context * c) {
+              ggml_tensor * v = ggml_view_2d(c, w, n/2, 8, w->nb[1], 0);
+              return ggml_mul_mat(c, v, ggml_rht(c, ggml_new_tensor_2d(c, GGML_TYPE_F32, n/2, 3), seed)); }),
+          "refuses a view narrower than the stored row, with an RHT input of its width");
+    check(guard_throws(m, [&](ggml_context * c) {
+              ggml_tensor * v = ggml_view_2d(c, w, n, 4, w->nb[1], w->nb[1]/2);
+              return ggml_mul_mat(c, v, ggml_rht(c, x(c), seed)); }),
+          "refuses a view that starts mid-row");
+    check(!guard_throws(m, [&](ggml_context * c) {
+              ggml_tensor * v = ggml_view_2d(c, w, n, 4, 2*w->nb[1], w->nb[1]);
+              return ggml_mul_mat(c, v, ggml_rht(c, x(c), seed)); }),
+          "accepts a view of every other row");
     check(guard_throws(m, [&](ggml_context * c) { return ggml_mul_mat(c, w, x(c)); }),
           "refuses an unrotated input");
     check(guard_throws(m, [&](ggml_context * c) { return ggml_mul_mat(c, w, ggml_rht(c, x(c), seed + 1)); }),

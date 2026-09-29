@@ -11,6 +11,7 @@
 //   test-hessian diag FILE IMATRIX [--tol T]  in_sum2 agrees with an imatrix's, per weight, within T in relative L2
 //                                             (the largest elementwise difference is reported), with equal counts
 //   test-hessian imatrix-load FILE            common_imatrix_load on FILE: entries and peak RSS
+//   test-hessian count FILE WEIGHT [N]        prints the rows summed into WEIGHT's Gram; fails unless it is N
 
 #include "llama-hessian.h"
 #include "common/imatrix-loader.h"
@@ -286,8 +287,22 @@ static int cmd_imatrix_load(char ** argv) {
     return 0;
 }
 
+static int cmd_count(int argc, char ** argv) {
+    llama_hessian h;
+    if (!h.open(argv[2]) || !h.has(argv[3])) {
+        fprintf(stderr, "count: no Gram for %s in %s\n", argv[3], argv[2]);
+        return 1;
+    }
+    const double n = h.count(argv[3]);
+    printf("count %s: %.0f\n", argv[3], n);
+    return argc > 4 && n != atof(argv[4]) ? 1 : 0;
+}
+
 int main(int argc, char ** argv) {
     const std::string c = argc > 1 ? argv[1] : "";
+    if (c == "count" && argc >= 4) {
+        return cmd_count(argc, argv);
+    }
     if (c == "imatrix-load" && argc >= 3) {
         return cmd_imatrix_load(argv);
     }

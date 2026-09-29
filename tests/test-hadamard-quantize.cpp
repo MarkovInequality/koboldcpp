@@ -3,7 +3,6 @@
 // usage: test-hadamard-quantize <workdir> <model-bf16.gguf>
 //
 // The source is pruned to two layers first, so each quantization takes a few seconds.
-// The imatrix checks set and unset LLAMA_HQ_GPTQ and LLAMA_HQ_GPTQ_DAMP.
 
 #include "llama.h"
 #include "llama-quant-gptq.h"
@@ -78,6 +77,11 @@ struct gguf_file {
         const int64_t k = gguf_find_key(g, "hadamard.seed");
         return k < 0 ? 0 : gguf_get_val_u64(g, k);
     }
+
+    std::string str(const char * key) const {
+        const int64_t k = gguf_find_key(g, key);
+        return k < 0 ? "" : gguf_get_val_str(g, k);
+    }
 };
 
 static std::vector<float> to_f32(const ggml_tensor * t, int64_t i0 = 0, int64_t n = -1) {
@@ -130,14 +134,6 @@ static size_t log_count(const std::string & needle) {
     size_t n = 0;
     for (size_t pos = 0; (pos = g_log.find(needle, pos)) != std::string::npos; ++pos) n++;
     return n;
-}
-
-static void set_env(const char * name, const char * value) {
-#ifdef _WIN32
-    _putenv_s(name, value ? value : "");
-#else
-    if (value) setenv(name, value, 1); else unsetenv(name);
-#endif
 }
 
 // a synthetic imatrix entry per expert: a spread-out floor with two loud channels, as with massive activations
@@ -218,6 +214,81 @@ static void relabel(const std::string & src, const std::string & dst, bool with_
     }
     gguf_write_to_file(out, dst.c_str(), false);
     gguf_free(out);
+}
+
+// the rank-one part of make_hessian's Grams: u u^T with u of the size of the diagonal's typical entry
+static std::vector<float> gram_u(const std::vector<float> & v) {
+    double mean = 0;
+    for (float x : v) mean += x;
+    mean /= v.size();
+    std::vector<float> u(v.size());
+    for (size_t k = 0; k < u.size(); ++k) u[k] = (float) (std::sqrt(mean)*std::sin(0.37*k + 1.0));
+    return u;
+}
+
+// a hessian-collect file for the 2D weights of im: G = diag(v) + u u^T, each weight the owner of its Gram
+static void make_hessian(const gguf_file & model, const imatrix_set & im, const std::string & dst) {
+    gguf_context * g = gguf_init_empty();
+    gguf_set_val_str(g, "general.type", "imatrix");
+    const char * ds = "synthetic";
+    gguf_set_arr_str(g, "imatrix.datasets", &ds, 1);
+    gguf_set_val_bool(g, "hessian.complete", true);
+    size_t mem = 0;
+    for (const auto & name : im.names) {
+        const int64_t n = model.t(name)->ne[0];
+        mem += 3*ggml_tensor_overhead() + (size_t) (n*n + n + 1)*sizeof(float) + 3*GGML_MEM_ALIGN;
+    }
+    ggml_context * ctx = ggml_init({ mem, nullptr, false });
+    for (const auto & name : im.names) {
+        if (model.t(name)->ne[2] != 1) continue;
+        const std::vector<float> & v = im.at(name);
+        const std::vector<float> u = gram_u(v);
+        const int64_t n = (int64_t) v.size();
+        ggml_tensor * gr = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n);
+        ggml_tensor * s2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, 1);
+        ggml_tensor * ct = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, 1);
+        for (int64_t i = 0; i < n; ++i) {
+            for (int64_t j = 0; j < n; ++j) {
+                ((float *) gr->data)[i*n + j] = (i == j ? v[i] : 0.0f) + u[i]*u[j];
+            }
+            ((float *) s2->data)[i] = ((float *) gr->data)[i*n + i];
+        }
+        ((float *) ct->data)[0] = 1.0f;
+        ggml_set_name(gr, (name + ".in_gram").c_str());
+        ggml_set_name(s2, (name + ".in_sum2").c_str());
+        ggml_set_name(ct, (name + ".counts").c_str());
+        gguf_add_tensor(g, gr);
+        gguf_add_tensor(g, s2);
+        gguf_add_tensor(g, ct);
+    }
+    gguf_write_to_file(g, dst.c_str(), false);
+    gguf_free(g);
+    ggml_free(ctx);
+}
+
+// sum over the rows of d^T G d, d = R^T (w - wq) in the unrotated space, for make_hessian's G, relative to w's
+static double gram_err(const std::vector<float> & w, const std::vector<float> & wq, int64_t n, const std::vector<float> & v, uint64_t seed) {
+    const std::vector<float> u = gram_u(v);
+    double num = 0, den = 0;
+    std::vector<double> d(n), a(n);
+    for (size_t r = 0; r*n < w.size(); ++r) {
+        for (int64_t k = 0; k < n; ++k) {
+            d[k] = (double) w[r*n + k] - wq[r*n + k];
+            a[k] = w[r*n + k];
+        }
+        ggml_rht_inv_f64(d.data(), n, seed);
+        ggml_rht_inv_f64(a.data(), n, seed);
+        double ud = 0, ua = 0;
+        for (int64_t k = 0; k < n; ++k) {
+            num += v[k]*d[k]*d[k];
+            den += v[k]*a[k]*a[k];
+            ud += u[k]*d[k];
+            ua += u[k]*a[k];
+        }
+        num += ud*ud;
+        den += ua*ua;
+    }
+    return num/den;
 }
 
 // a rank-4 adapter; A and B are laid out as llama-adapter.cpp expects (flipped for token_embd)
@@ -378,8 +449,6 @@ int main(int argc, char ** argv) {
     }
 
     printf("imatrix (GPTQ):\n");
-    set_env("LLAMA_HQ_GPTQ", nullptr);
-    set_env("LLAMA_HQ_GPTQ_DAMP", nullptr);
     imatrix_set im_all, im_part;
     for (int64_t i = 0; i < gguf_get_n_tensors(srcf.g); ++i) {
         const ggml_tensor * t = srcf.t(gguf_get_tensor_name(srcf.g, i));
@@ -400,7 +469,7 @@ int main(int argc, char ** argv) {
             n_hq++;
             all_differ &= !same_bytes(ta, b.t(ta->name)) && b.t(ta->name)->type == ta->type;
         }
-        check(all_differ && n_hq > 0, "the imatrix is used (LLAMA_HQ_GPTQ unset): every HQ tensor differs from the uniform one");
+        check(all_differ && n_hq > 0, "the imatrix is used (GPTQ on by default): every HQ tensor differs from the uniform one");
         check(log_count("use the imatrix through GPTQ") == 1 && g_log.find(std::to_string(n_hq) + " HQ tensors use the imatrix through GPTQ (damp 0.01)") != std::string::npos &&
               log_count("(gptq)") == n_hq, "one info line with the count, and each GPTQ tensor's line says (gptq)");
         check(b.f32("quantize.hq.gptq_damp") == 0.01f && !a.has_key("quantize.hq.gptq_damp"), "quantize.hq.gptq_damp is written only when GPTQ ran");
@@ -421,10 +490,8 @@ int main(int argc, char ** argv) {
         quantize(src, hq_1t, LLAMA_FTYPE_MOSTLY_Q4_K_M, [&](auto & p) { p.hadamard = true; p.imatrix = im_all.get(); p.nthread = 1; });
         check(files_identical(hq_im, hq_1t), "the same seed and imatrix give identical files at 1 and 8 threads");
 
-        set_env("LLAMA_HQ_GPTQ", "0");
         const std::string hq_off = path("hqq-hq-im-off.gguf");
-        quantize(src, hq_off, LLAMA_FTYPE_MOSTLY_Q4_K_M, [&](auto & p) { p.hadamard = true; p.imatrix = im_all.get(); });
-        set_env("LLAMA_HQ_GPTQ", nullptr);
+        quantize(src, hq_off, LLAMA_FTYPE_MOSTLY_Q4_K_M, [&](auto & p) { p.hadamard = true; p.imatrix = im_all.get(); p.hq_gptq = false; });
         gguf_file d(hq_off);
         bool off_same = true;
         for (int64_t i = 0; i < gguf_get_n_tensors(a.g); ++i) {
@@ -432,17 +499,15 @@ int main(int argc, char ** argv) {
             if (ggml_is_rotated(ta->type)) off_same &= same_bytes(ta, d.t(ta->name));
         }
         check(off_same && log_count("the imatrix is ignored") == 1 && log_count("(gptq)") == 0 && !d.has_key("quantize.hq.gptq_damp"),
-              "LLAMA_HQ_GPTQ=0: the uniform bytes, one imatrix-ignored warning, no damp key");
+              "hq_gptq = false: the uniform bytes, one imatrix-ignored warning, no damp key");
 
-        set_env("LLAMA_HQ_GPTQ_DAMP", "0.0001");
-        check(quantize(src, path("hqq-bad.gguf"), LLAMA_FTYPE_MOSTLY_Q4_K_M, [&](auto & p) { p.hadamard = true; p.imatrix = im_all.get(); }) != 0 &&
-              g_log.find("LLAMA_HQ_GPTQ_DAMP") != std::string::npos, "LLAMA_HQ_GPTQ_DAMP=0.0001 is refused");
-        set_env("LLAMA_HQ_GPTQ_DAMP", "0.1");
+        check(quantize(src, path("hqq-bad.gguf"), LLAMA_FTYPE_MOSTLY_Q4_K_M,
+                       [&](auto & p) { p.hadamard = true; p.imatrix = im_all.get(); p.hq_gptq_damp = 0.0001f; }) != 0 &&
+              g_log.find("GPTQ damp") != std::string::npos, "hq_gptq_damp = 0.0001 is refused");
         const std::string hq_d = path("hqq-hq-im-damp.gguf");
-        quantize(src, hq_d, LLAMA_FTYPE_MOSTLY_Q4_K_M, [&](auto & p) { p.hadamard = true; p.imatrix = im_all.get(); });
-        set_env("LLAMA_HQ_GPTQ_DAMP", nullptr);
+        quantize(src, hq_d, LLAMA_FTYPE_MOSTLY_Q4_K_M, [&](auto & p) { p.hadamard = true; p.imatrix = im_all.get(); p.hq_gptq_damp = 0.1f; });
         gguf_file e(hq_d);
-        check(e.f32("quantize.hq.gptq_damp") == 0.1f && !same_bytes(e.t(q), b.t(q)), "LLAMA_HQ_GPTQ_DAMP=0.1 is used and recorded");
+        check(e.f32("quantize.hq.gptq_damp") == 0.1f && !same_bytes(e.t(q), b.t(q)), "hq_gptq_damp = 0.1 is used and recorded");
 
         const std::string hq_copy = path("hqq-hq-im-copy.gguf");
         quantize(hq_im, hq_copy, LLAMA_FTYPE_MOSTLY_Q4_K_M, [&](auto & p) { p.hadamard = true; p.imatrix = im_all.get(); });
@@ -468,6 +533,42 @@ int main(int argc, char ** argv) {
         const double eg = out_err(want, to_f32(g.t(q), 0, nrq*n_embd), n_embd, im_all.at(q), g.seed());
         printf("  (HQ4_0 attn_q output error: uniform %.4g, GPTQ %.4g)\n", eu, eg);
         check(g.t(q)->type == GGML_TYPE_HQ4_0 && log_count("(gptq)") > 0 && eg < 0.7*eu, "--hadamard --imatrix Q4_0: GPTQ beats uniform HQ4_0");
+    }
+
+    printf("full Hessian (--hessian):\n");
+    {
+        const std::string hfile = path("hqq-hessian.gguf");
+        make_hessian(srcf, im_all, hfile);
+        const std::string hq_h = path("hqq-hq-hess.gguf");
+        const int rc = quantize(src, hq_h, LLAMA_FTYPE_MOSTLY_Q4_K_M,
+                                [&](auto & p) { p.hadamard = true; p.imatrix = im_all.get(); p.hessian = hfile.c_str(); });
+        gguf_file a(hq), b(hq_im), h(hq_h);
+        size_t n_hq = 0;
+        for (int64_t i = 0; i < gguf_get_n_tensors(h.g); ++i) {
+            n_hq += ggml_is_rotated(h.t(gguf_get_tensor_name(h.g, i))->type);
+        }
+        check(rc == 0 && log_count("(gptq, full H)") == n_hq && n_hq > 0 &&
+              g_log.find(std::to_string(n_hq) + " of them with the full Hessian (alpha 0.1)") != std::string::npos,
+              "every HQ tensor uses its full Gram, with one info line");
+        check(h.f32("quantize.hq.gptq_damp") == 0.01f && h.f32("quantize.hq.gptq_hessian_alpha") == 0.1f &&
+              h.str("quantize.hq.gptq_hessian") == "synthetic", "the three GPTQ keys are written");
+        check(!b.has_key("quantize.hq.gptq_hessian_alpha") && !b.has_key("quantize.hq.gptq_hessian"),
+              "a run without --hessian and without HQ copies has no Hessian keys");
+
+        const int64_t nrq = srcf.t(q)->ne[1];
+        const std::vector<float> want = rotate_rows(to_f32(srcf.t(q), 0, nrq*n_embd), n_embd, h.seed());
+        const double eu = gram_err(want, to_f32(a.t(q), 0, nrq*n_embd), n_embd, im_all.at(q), h.seed());
+        const double ed = gram_err(want, to_f32(b.t(q), 0, nrq*n_embd), n_embd, im_all.at(q), h.seed());
+        const double ef = gram_err(want, to_f32(h.t(q), 0, nrq*n_embd), n_embd, im_all.at(q), h.seed());
+        printf("  (attn_q output error under the full G: uniform %.4g, diagonal GPTQ %.4g, full-H GPTQ %.4g)\n", eu, ed, ef);
+        check(ef < 0.7*ed && ed < eu, "under the full Gram, full-H GPTQ beats diagonal GPTQ, which beats uniform");
+
+        const std::string hq_hc = path("hqq-hq-hess-copy.gguf");
+        quantize(hq_h, hq_hc, LLAMA_FTYPE_MOSTLY_Q4_K_M, [&](auto & p) { p.hadamard = true; p.imatrix = im_all.get(); });
+        gguf_file c(hq_hc);
+        check(log_count("(gptq") == 0 && c.f32("quantize.hq.gptq_damp") == 0.01f &&
+              c.f32("quantize.hq.gptq_hessian_alpha") == 0.1f && c.str("quantize.hq.gptq_hessian") == "synthetic",
+              "HQ tensors copied from a full-H file keep all three keys");
     }
 
     printf("unsupported widths:\n");
@@ -704,7 +805,7 @@ int main(int argc, char ** argv) {
                 auto encode = [&](int64_t ev) {
                     std::vector<float> rows = rotate_rows(std::vector<float>(src_e, src_e + nr*n_embd), n_embd, f.seed());
                     std::vector<float> U;
-                    llama_gptq_factor(im3.at(en).data() + ev*n_embd, n_embd, f.seed(), LLAMA_GPTQ_DAMP_DEFAULT, U, workers, 8);
+                    llama_gptq_factor(im3.at(en).data() + ev*n_embd, n_embd, f.seed(), LLAMA_GPTQ_DAMP_DEFAULT, U, 8);
                     std::vector<uint8_t> qb(nr*rs);
                     llama_tensor_quantize_gptq(GGML_TYPE_HQ4_K, rows.data(), qb.data(), nr, n_embd, U.data(), workers, 8);
                     return qb;

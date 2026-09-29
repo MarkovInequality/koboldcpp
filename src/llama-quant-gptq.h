@@ -51,18 +51,20 @@ bool llama_gptq_normalize(const float * v, int64_t n, std::vector<float> & vbar)
 // false, without factoring, for damp < LLAMA_GPTQ_DAMP_MIN, a v refused by llama_gptq_normalize, or a
 // width without an RHT; also false if the factorization breaks down, which the damp floor rules out
 // for n up to about 30000
-bool llama_gptq_factor(const float * v, int64_t n, uint64_t seed, float damp, std::vector<float> & U,
-                       std::vector<std::thread> & workers, int nthread);
+bool llama_gptq_factor(const float * v, int64_t n, uint64_t seed, float damp, std::vector<float> & U, int nthread);
 
 // bytes of building a factor from a full Gram
 size_t llama_gptq_build_bytes_full(int64_t n);
 
+// fills dst with the rows [row0, row0 + nrows) of an n x n Gram, row-major
+using llama_gptq_read_gram = std::function<bool(float * dst, int64_t row0, int64_t nrows)>;
+
 // U as llama_gptq_factor builds it, for H = R*((1 - alpha)*Gbar + alpha*diag(Gbar) + damp*I)*R^T with Gbar =
-// G/mean(diag G): alpha = 1 is the diagonal H of llama_gptq_factor. read_gram fills the n x n Gram. false for damp <
+// G/mean(diag G): alpha = 1 is the diagonal H of llama_gptq_factor. The Gram is read in row slabs. false for damp <
 // LLAMA_GPTQ_DAMP_MIN, alpha outside [0, 1], a width without an RHT, a Gram that can't be read or has a negative or
 // all-zero diagonal, or a breakdown of the factorization
-bool llama_gptq_factor_full(const std::function<bool(float *)> & read_gram, int64_t n, uint64_t seed, float alpha, float damp,
-                            std::vector<float> & U, std::vector<std::thread> & workers, int nthread);
+bool llama_gptq_factor_full(const llama_gptq_read_gram & read_gram, int64_t n, uint64_t seed, float alpha, float damp,
+                            std::vector<float> & U, int nthread);
 
 // the most recently used factors, keyed by (vbar, n, seed, damp), or for full Grams by (key, n, seed, alpha, damp);
 // the cache and a factor being built
@@ -75,11 +77,11 @@ struct llama_gptq_cache {
 
     // nullptr unless the status is HIT or BUILT
     const float * get(const float * v, int64_t n, uint64_t seed, float damp,
-                      std::vector<std::thread> & workers, int nthread, status * st = nullptr);
+                      int nthread, status * st = nullptr);
 
     // the full-Gram factor of the input named key (its owner weight); read_gram is called only to build it
-    const float * get_full(const std::string & key, const std::function<bool(float *)> & read_gram, int64_t n, uint64_t seed,
-                           float alpha, float damp, std::vector<std::thread> & workers, int nthread, status * st = nullptr);
+    const float * get_full(const std::string & key, const llama_gptq_read_gram & read_gram, int64_t n, uint64_t seed,
+                           float alpha, float damp, int nthread, status * st = nullptr);
 
     size_t size()  const { return entries.size(); }
     size_t bytes() const;

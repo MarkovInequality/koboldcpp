@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 inline constexpr const char * LLM_KV_IMATRIX_DATASETS    = "imatrix.datasets";
@@ -24,3 +25,6 @@ struct common_imatrix {
 };
 
 bool common_imatrix_load(const std::string & fname, common_imatrix & imatrix);
+
+// the mean squared activation per input column (and expert) of every entry, as the quantizer uses it
+void common_imatrix_means(const common_imatrix & imatrix, std::unordered_map<std::string, std::vector<float>> & out);

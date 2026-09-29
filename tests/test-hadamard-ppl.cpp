@@ -91,7 +91,7 @@ int main(int argc, char ** argv) {
             return 1;
         }
         n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(ref));
-        tokens  = tokenize_file(llama_model_get_vocab(ref), text, special);
+        tokens  = common_tokenize(llama_model_get_vocab(ref), text, true, special);
         if (chat) {
             mask = chat_mask(llama_model_get_vocab(ref), tokens);
         }

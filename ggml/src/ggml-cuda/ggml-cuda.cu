@@ -70,11 +70,8 @@ bool g_mul_mat_q = true;
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/rht.cuh"
 #include "ggml.h"
-
-// rht.cuh holds the Hadamard tables as device data, so only rht.cu includes it
-void ggml_cuda_op_rht(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
-bool ggml_cuda_rht_write_q8_1(const ggml_tensor * dst, int fmt, int n_consumers);
 
 #include <algorithm>
 #include <array>

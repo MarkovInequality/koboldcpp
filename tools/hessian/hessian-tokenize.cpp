@@ -5,6 +5,7 @@
 // usage: hessian-tokenize MODEL.gguf [--detokenize]
 
 #include "llama.h"
+#include "common/common.h"
 
 #include <nlohmann/json.hpp>
 
@@ -34,7 +35,6 @@ int main(int argc, char ** argv) {
 
     std::ios::sync_with_stdio(false);
     std::string line;
-    std::vector<llama_token> ids;
     while (std::getline(std::cin, line)) {
         nlohmann::json in;
         try {
@@ -44,25 +44,10 @@ int main(int argc, char ** argv) {
             continue;
         }
         if (detok) {
-            ids = in.get<std::vector<llama_token>>();
-            std::string out(ids.size()*8 + 16, '\0');
-            int n = llama_detokenize(vocab, ids.data(), (int32_t) ids.size(), out.data(), (int32_t) out.size(), false, true);
-            if (n < 0) {
-                out.resize(-n);
-                n = llama_detokenize(vocab, ids.data(), (int32_t) ids.size(), out.data(), (int32_t) out.size(), false, true);
-            }
-            out.resize(n);
+            const std::string out = common_detokenize(vocab, in.get<std::vector<llama_token>>(), true);
             std::cout << nlohmann::json(out).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) << '\n' << std::flush;
         } else {
-            const std::string text = in.get<std::string>();
-            ids.resize(text.size() + 16);
-            int n = llama_tokenize(vocab, text.data(), (int32_t) text.size(), ids.data(), (int32_t) ids.size(), true, true);
-            if (n < 0) {
-                ids.resize(-n);
-                n = llama_tokenize(vocab, text.data(), (int32_t) text.size(), ids.data(), (int32_t) ids.size(), true, true);
-            }
-            ids.resize(n);
-            std::cout << nlohmann::json(ids).dump() << '\n' << std::flush;
+            std::cout << nlohmann::json(common_tokenize(vocab, in.get<std::string>(), true, true)).dump() << '\n' << std::flush;
         }
     }
 

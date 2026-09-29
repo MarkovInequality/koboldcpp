@@ -5,7 +5,7 @@
 //   bench-rht --once     launch each timed variant once, for ncu
 //   -n N[,N...], -r ROWS, -k A|B  restrict the timed shapes
 
-#include "ggml-cuda/rht.cuh"
+#include "ggml-cuda/rht-impl.cuh"
 #include "ggml-threading.h"
 
 #include <cmath>

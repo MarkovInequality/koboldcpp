@@ -158,6 +158,14 @@ static tensor_category tensor_get_category(const std::string & tensor_name) {
     return tensor_category::OTHER;
 }
 
+// A rotated weight needs its input rotated, which the graph does only for GEMM weights (build_mm / build_lora_mm);
+// tables read by row can't be rotated. Without token_embd, some architectures (CodeShell) read the embeddings
+// from output.weight.
+static bool tensor_is_rotatable(const std::string & name, tensor_category cat, bool has_token_embd) {
+    const ggml_op op = llm_tensor_op_for_name(name);
+    return (op == GGML_OP_MUL_MAT || op == GGML_OP_MUL_MAT_ID) && !(!has_token_embd && cat == tensor_category::OUTPUT);
+}
+
 // check if category is for attention-v-like tensors (more sensitive to quantization)
 static bool category_is_attn_v(tensor_category cat) {
     return cat == tensor_category::ATTENTION_V     ||
@@ -188,6 +196,8 @@ struct quantize_state_impl {
 
     // used to figure out if a model has tied embeddings (tok_embd shares weights with output)
     bool has_tied_embeddings = true; // assume tied until we see output.weight
+
+    bool has_token_embd = true;
 
     // tensor type override patterns (compiled once, used twice)
     std::vector<std::pair<std::regex, ggml_type>> tensor_type_patterns;
@@ -1016,7 +1026,8 @@ static void llama_quant_apply_lora(float * rows, const std::vector<llama_quant_l
         int64_t ir, int64_t nrows, int64_t n_per_row, int64_t nrows_total, bool rotate_delta, uint64_t seed,
         std::vector<std::thread> & workers, int nthread) {
     llama_parallel_rows(nrows, workers, nthread, [&](int64_t r) {
-        std::vector<float> delta(n_per_row, 0.0f);
+        thread_local std::vector<float> delta;
+        delta.assign(n_per_row, 0.0f);
         for (const auto & d : deltas) {
             const float * l = d.L.data()  + (e*nrows_total + ir + r)*d.rank;
             const float * m = d.Rm.data() + e*d.rank*n_per_row;
@@ -1037,6 +1048,168 @@ static void llama_quant_apply_lora(float * rows, const std::vector<llama_quant_l
         }
     });
 }
+
+// --hadamard, GPTQ and --hessian over one quantization's tensors: each target type, each HQ tensor's GPTQ plan and
+// factor, and what it all did, for the log and the file's keys
+struct hq_plan {
+    const llama_model_quantize_params * params;
+    const std::unordered_map<std::string, std::vector<float>> * imatrix_data;
+    const llama_hessian * hessian;
+    uint64_t seed;
+    size_t   max_buf_size;
+
+    size_t n_rotated_out      = 0;
+    size_t n_imatrix_ignored  = 0;
+    size_t n_gptq             = 0;
+    size_t n_gptq_full        = 0;
+    size_t n_gptq_missing     = 0;
+    size_t n_gptq_zero_slices = 0;
+    size_t n_hq_copied        = 0;
+    std::set<int64_t> unsupported_widths;
+
+    // type with --hadamard applied where the tensor can be rotated, checked against what the rotation needs
+    ggml_type target_type(const ggml_tensor * tensor, ggml_type type, bool rotatable) {
+        const bool explicit_hq = ggml_is_rotated(type) && !ggml_is_rotated(tensor->type);
+
+        if (params->hadamard && rotatable) {
+            type = ggml_get_rotated_type(type);
+        }
+        if (ggml_is_rotated(type) && !rotatable) {
+            throw std::runtime_error(format("tensor %s: only a GEMM weight can be Hadamard-rotated - not token "
+                "embeddings or other tables read by row (%s)", tensor->name, ggml_type_name(type)));
+        }
+        if (ggml_is_rotated(type) && !ggml_rht_plan(tensor->ne[0], nullptr, nullptr)) {
+            if (explicit_hq) {
+                throw std::runtime_error(format("tensor %s: width %" PRId64 " has no supported Hadamard rotation "
+                    "(it needs a multiple of 4 whose odd part is at most 63), so it can't be %s",
+                    tensor->name, tensor->ne[0], ggml_type_name(type)));
+            }
+            if (unsupported_widths.insert(tensor->ne[0]).second) {
+                LLAMA_LOG_WARN("%s: width %" PRId64 " has no supported Hadamard rotation - tensors of this width "
+                    "keep their unrotated type\n", __func__, tensor->ne[0]);
+            }
+            type = ggml_get_base_type(type);
+        }
+        return type;
+    }
+
+    // for an HQ target: GPTQ with the full Gram, with the imatrix, or none; quantized: it isn't a byte copy
+    void plan_gptq(tensor_metadata & tm, const ggml_tensor * tensor, const std::string & im_name, bool quantized) {
+        n_rotated_out++;
+        n_hq_copied += !quantized;
+        const int64_t n = tensor->ne[0];
+        if (hessian && imatrix_data && imatrix_data->count(im_name) && quantized && params->hq_gptq && tensor->ne[2] == 1 &&
+            hessian->n(im_name) == n) {
+            if (llama_gptq_build_bytes_full(n) > max_buf_size) {
+                throw std::runtime_error(format("%s: the full-Hessian GPTQ factor for width %" PRId64 " needs %.1f GiB, more than "
+                    "--max-buffer-size", tensor->name, n, llama_gptq_build_bytes_full(n)/1024.0/1024.0/1024.0));
+            }
+            tm.use_gptq      = true;
+            tm.use_gptq_full = true;
+            n_gptq++;
+            n_gptq_full++;
+        } else if (imatrix_data && quantized) {
+            const auto im = imatrix_data->find(im_name);
+            if (!params->hq_gptq) {
+                n_imatrix_ignored += im != imatrix_data->end();
+            } else if (im != imatrix_data->end() && im->second.size() != (size_t) (n*tensor->ne[2])) {
+                // the main loop refuses a wrong-size entry, as for every type
+            } else if (im != imatrix_data->end()) {
+                // usable if some expert's slice isn't all zero and a factor fits in the cap
+                size_t n_zero = 0;
+                std::vector<float> vbar;
+                for (int64_t e = 0; e < tensor->ne[2]; ++e) {
+                    n_zero += !llama_gptq_normalize(im->second.data() + e*n, n, vbar);
+                }
+                bool usable = n_zero < (size_t) tensor->ne[2];
+                if (usable && llama_gptq_build_bytes(n) > max_buf_size) {
+                    LLAMA_LOG_WARN("%s: WARNING: %s: the GPTQ factor for width %" PRId64 " needs %.1f GiB, more than "
+                                   "--max-buffer-size - it uses uniform weights\n", __func__, tensor->name, n,
+                                   llama_gptq_build_bytes(n)/1024.0/1024.0/1024.0);
+                    usable = false;
+                }
+                tm.use_gptq         = usable;
+                n_gptq             += usable;
+                n_gptq_missing     += !usable;
+                n_gptq_zero_slices += usable ? n_zero : 0;
+            } else {
+                n_gptq_missing++;
+            }
+        }
+    }
+
+    // the factor for rows with the imatrix slice im, one per expert; nullptr: uniform weights (an all-zero slice)
+    const float * factor(const tensor_metadata & tm, const ggml_tensor * tensor, const float * im, llama_gptq_cache & cache,
+                         int nthread) const {
+        const int64_t n = tensor->ne[0];
+        if (tm.use_gptq_full) {
+            const std::string & w = tm.remapped_imatrix_name;
+            const float * U = cache.get_full(hessian->owner(w), [&](float * dst, int64_t r0, int64_t nr) { return hessian->read(w, dst, r0, nr); }, n, seed,
+                                             params->hessian_alpha, params->hq_gptq_damp, nthread);
+            if (!U) {
+                throw std::runtime_error(format("%s: the full-Hessian GPTQ factorization failed", tensor->name));
+            }
+            return U;
+        }
+        if (!tm.use_gptq || !im) {
+            return nullptr;
+        }
+        llama_gptq_cache::status st;
+        const float * U = cache.get(im, n, seed, params->hq_gptq_damp, nthread, &st);
+        if (st == llama_gptq_cache::FAILED) {
+            LLAMA_LOG_WARN("\n%s: WARNING: %s: the GPTQ factorization failed - uniform weights\n", __func__, tensor->name);
+        }
+        return U;
+    }
+
+    // the log lines and the file's HQ keys; each GPTQ key is written when this run used it, otherwise a source's key
+    // still describes the HQ tensors copied from it
+    void finish(gguf_context * ctx, const std::string & seed_key) const {
+        if (params->hadamard && n_rotated_out == 0) {
+            LLAMA_LOG_WARN("%s: WARNING: --hadamard had no effect - none of the selected types has an HQ variant\n", __func__);
+        }
+        if (n_imatrix_ignored > 0) {
+            LLAMA_LOG_WARN("%s: WARNING: the imatrix is ignored for the %zu Hadamard-rotated (HQ) tensors (GPTQ is off) - "
+                           "they use uniform weights\n", __func__, n_imatrix_ignored);
+        }
+        if (n_gptq > 0) {
+            if (n_gptq_full == 0) {
+                LLAMA_LOG_INFO("%s: %zu HQ tensors use the imatrix through GPTQ (damp %g)\n", __func__, n_gptq, params->hq_gptq_damp);
+            } else {
+                LLAMA_LOG_INFO("%s: %zu HQ tensors use GPTQ (damp %g), %zu of them with the full Hessian (alpha %g)\n", __func__,
+                               n_gptq, params->hq_gptq_damp, n_gptq_full, params->hessian_alpha);
+            }
+            gguf_set_val_f32(ctx, "quantize.hq.gptq_damp", params->hq_gptq_damp);
+        } else if (n_hq_copied == 0) {
+            gguf_remove_key(ctx, "quantize.hq.gptq_damp");
+        }
+        if (n_gptq_full > 0) {
+            gguf_set_val_f32(ctx, "quantize.hq.gptq_hessian_alpha", params->hessian_alpha);
+            if (!hessian->datasets.empty()) {
+                gguf_set_val_str(ctx, "quantize.hq.gptq_hessian", hessian->datasets[0].c_str());
+            } else {
+                gguf_remove_key(ctx, "quantize.hq.gptq_hessian");
+            }
+        } else if (n_hq_copied == 0) {
+            gguf_remove_key(ctx, "quantize.hq.gptq_hessian_alpha");
+            gguf_remove_key(ctx, "quantize.hq.gptq_hessian");
+        }
+        if (n_gptq_missing > 0) {
+            LLAMA_LOG_WARN("%s: WARNING: %zu HQ tensors have no usable imatrix entry - they use uniform weights\n", __func__, n_gptq_missing);
+        }
+        if (n_gptq_zero_slices > 0) {
+            LLAMA_LOG_WARN("%s: WARNING: %zu experts of GPTQ tensors have an all-zero imatrix slice - they use uniform weights\n",
+                           __func__, n_gptq_zero_slices);
+        }
+
+        if (n_rotated_out > 0) {
+            gguf_set_val_u64(ctx, seed_key.c_str(), seed);
+            LLAMA_LOG_INFO("%s: %zu Hadamard-rotated (HQ) tensors, seed = %" PRIu64 "\n", __func__, n_rotated_out, seed);
+        } else {
+            gguf_remove_key(ctx, seed_key.c_str());
+        }
+    }
+};
 
 static void init_quantize_state_counters(quantize_state_impl & qs, std::vector<tensor_metadata> & metadata) {
     for (auto & tm : metadata) {
@@ -1139,16 +1312,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         LLAMA_LOG_INFO("%s: hessian file with %zu weights' Grams\n", __func__, hessian->weights().size());
     }
 
-    // GPTQ for the HQ types with an imatrix: on unless LLAMA_HQ_GPTQ=0; LLAMA_HQ_GPTQ_DAMP for experiments
-    const char * gptq_env = getenv("LLAMA_HQ_GPTQ");
-    const bool   hq_gptq  = !(gptq_env && strcmp(gptq_env, "0") == 0);
-    float gptq_damp = LLAMA_GPTQ_DAMP_DEFAULT;
-    if (const char * damp_env = getenv("LLAMA_HQ_GPTQ_DAMP")) {
-        char * end = nullptr;
-        gptq_damp = strtof(damp_env, &end);
-        if (end == damp_env || *end != '\0' || !std::isfinite(gptq_damp) || !(gptq_damp >= LLAMA_GPTQ_DAMP_MIN)) {
-            throw std::runtime_error(format("LLAMA_HQ_GPTQ_DAMP=%s: needs a number of at least %g", damp_env, LLAMA_GPTQ_DAMP_MIN));
-        }
+    if (!std::isfinite(params->hq_gptq_damp) || !(params->hq_gptq_damp >= LLAMA_GPTQ_DAMP_MIN)) {
+        throw std::runtime_error(format("GPTQ damp %g: needs at least %g", params->hq_gptq_damp, LLAMA_GPTQ_DAMP_MIN));
     }
 
     // a file holds one seed, so tensors that are already rotated fix it for the whole output
@@ -1262,21 +1427,13 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
     // flag for --dry-run
     bool will_require_imatrix = false;
-    size_t n_rotated_out      = 0;
-    size_t n_imatrix_ignored  = 0;
-    size_t n_gptq             = 0;
-    size_t n_gptq_full        = 0;
-    size_t n_gptq_missing     = 0;
-    size_t n_gptq_zero_slices = 0;
-    size_t n_hq_copied        = 0;
-    std::set<int64_t> unsupported_widths;
 
     const size_t max_buf_size = params->max_buf_size ? params->max_buf_size : LLAMA_QUANT_MAX_BUF_SIZE;
+    hq_plan hq { params, imatrix_data, hessian.get(), hadamard_seed, max_buf_size };
 
-    // without token_embd, some architectures (CodeShell) read the embeddings from output.weight
-    bool has_token_embd = false;
+    qs.has_token_embd = false;
     for (const auto * it : tensors) {
-        has_token_embd |= std::strcmp(ggml_get_name(it->tensor), "token_embd.weight") == 0;
+        qs.has_token_embd |= std::strcmp(ggml_get_name(it->tensor), "token_embd.weight") == 0;
     }
 
     //
@@ -1296,31 +1453,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         metadata[i].allows_quantization = tensor_allows_quantization(params, model->arch, tensor);
 
         if (metadata[i].allows_quantization) {
-            ggml_type type = llama_tensor_get_type(qs, params, tensor, default_type, metadata[i]);
-            const bool explicit_hq = ggml_is_rotated(type) && !ggml_is_rotated(tensor->type);
-            const bool embd        = metadata[i].category == tensor_category::TOKEN_EMBD ||
-                                     (!has_token_embd && metadata[i].category == tensor_category::OUTPUT);
-
-            if (params->hadamard && !embd) {
-                type = ggml_get_rotated_type(type);
-            }
-            if (ggml_is_rotated(type) && embd) {
-                throw std::runtime_error(format("tensor %s: token embeddings can't be Hadamard-rotated (%s)",
-                    tensor->name, ggml_type_name(type)));
-            }
-            if (ggml_is_rotated(type) && !ggml_rht_plan(tensor->ne[0], nullptr, nullptr)) {
-                if (explicit_hq) {
-                    throw std::runtime_error(format("tensor %s: width %" PRId64 " has no supported Hadamard rotation "
-                        "(it needs a multiple of 4 whose odd part is at most 63), so it can't be %s",
-                        tensor->name, tensor->ne[0], ggml_type_name(type)));
-                }
-                if (unsupported_widths.insert(tensor->ne[0]).second) {
-                    LLAMA_LOG_WARN("%s: width %" PRId64 " has no supported Hadamard rotation - tensors of this width "
-                        "keep their unrotated type\n", __func__, tensor->ne[0]);
-                }
-                type = ggml_get_base_type(type);
-            }
-            metadata[i].target_type = type;
+            const ggml_type type = llama_tensor_get_type(qs, params, tensor, default_type, metadata[i]);
+            metadata[i].target_type = hq.target_type(tensor, type, tensor_is_rotatable(tensor->name, metadata[i].category, qs.has_token_embd));
         } else {
             metadata[i].target_type = tensor->type;
         }
@@ -1331,50 +1465,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 tensor->name, ggml_type_name(tensor->type), ggml_type_name(metadata[i].target_type)));
         }
         if (ggml_is_rotated(metadata[i].target_type)) {
-            n_rotated_out++;
-            const bool quantized = tensor->type != metadata[i].target_type || lora_deltas.count(orig_names.at(it));
-            n_hq_copied += !quantized;
-            const int64_t n_in = tensor->ne[0];
-            const std::string im_name = remap_imatrix(tensor->name, mapped);
-            if (hessian && imatrix_data && imatrix_data->count(im_name) && quantized && hq_gptq && tensor->ne[2] == 1 &&
-                hessian->n(im_name) == n_in) {
-                if (llama_gptq_build_bytes_full(n_in) > max_buf_size) {
-                    throw std::runtime_error(format("%s: the full-Hessian GPTQ factor for width %" PRId64 " needs %.1f GiB, more than "
-                        "--max-buffer-size", tensor->name, n_in, llama_gptq_build_bytes_full(n_in)/1024.0/1024.0/1024.0));
-                }
-                metadata[i].use_gptq      = true;
-                metadata[i].use_gptq_full = true;
-                n_gptq++;
-                n_gptq_full++;
-            } else if (imatrix_data && quantized) {
-                const auto im = imatrix_data->find(im_name);
-                const int64_t n = tensor->ne[0];
-                if (!hq_gptq) {
-                    n_imatrix_ignored += im != imatrix_data->end();
-                } else if (im != imatrix_data->end() && im->second.size() != (size_t) (n*tensor->ne[2])) {
-                    // the main loop refuses a wrong-size entry, as for every type
-                } else if (im != imatrix_data->end()) {
-                    // usable if some expert's slice isn't all zero and a factor fits in the cap
-                    size_t n_zero = 0;
-                    std::vector<float> vbar;
-                    for (int64_t e = 0; e < tensor->ne[2]; ++e) {
-                        n_zero += !llama_gptq_normalize(im->second.data() + e*n, n, vbar);
-                    }
-                    bool usable = n_zero < (size_t) tensor->ne[2];
-                    if (usable && llama_gptq_build_bytes(n) > max_buf_size) {
-                        LLAMA_LOG_WARN("%s: WARNING: %s: the GPTQ factor for width %" PRId64 " needs %.1f GiB, more than "
-                                       "--max-buffer-size - it uses uniform weights\n", __func__, tensor->name, n,
-                                       llama_gptq_build_bytes(n)/1024.0/1024.0/1024.0);
-                        usable = false;
-                    }
-                    metadata[i].use_gptq = usable;
-                    n_gptq             += usable;
-                    n_gptq_missing     += !usable;
-                    n_gptq_zero_slices += usable ? n_zero : 0;
-                } else {
-                    n_gptq_missing++;
-                }
-            }
+            hq.plan_gptq(metadata[i], tensor, remap_imatrix(tensor->name, mapped),
+                         tensor->type != metadata[i].target_type || lora_deltas.count(orig_names.at(it)));
         }
 
         metadata[i].requires_imatrix = tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype);
@@ -1396,48 +1488,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         }
     }
 
-    if (params->hadamard && n_rotated_out == 0) {
-        LLAMA_LOG_WARN("%s: WARNING: --hadamard had no effect - none of the selected types has an HQ variant\n", __func__);
-    }
-    if (n_imatrix_ignored > 0) {
-        LLAMA_LOG_WARN("%s: WARNING: the imatrix is ignored for the %zu Hadamard-rotated (HQ) tensors (LLAMA_HQ_GPTQ=0) - "
-                       "they use uniform weights\n", __func__, n_imatrix_ignored);
-    }
-    // a source's key still describes the HQ tensors copied from it
-    if (n_gptq > 0) {
-        if (n_gptq_full == 0) {
-            LLAMA_LOG_INFO("%s: %zu HQ tensors use the imatrix through GPTQ (damp %g)\n", __func__, n_gptq, gptq_damp);
-        } else {
-            LLAMA_LOG_INFO("%s: %zu HQ tensors use GPTQ (damp %g), %zu of them with the full Hessian (alpha %g)\n", __func__,
-                           n_gptq, gptq_damp, n_gptq_full, params->hessian_alpha);
-        }
-        gguf_set_val_f32(ctx_outs[0].get(), "quantize.hq.gptq_damp", gptq_damp);
-    } else if (n_hq_copied == 0) {
-        gguf_remove_key(ctx_outs[0].get(), "quantize.hq.gptq_damp");
-    }
-    if (n_gptq_full > 0) {
-        gguf_set_val_f32(ctx_outs[0].get(), "quantize.hq.gptq_hessian_alpha", params->hessian_alpha);
-        if (!hessian->datasets.empty()) {
-            gguf_set_val_str(ctx_outs[0].get(), "quantize.hq.gptq_hessian", hessian->datasets[0].c_str());
-        }
-    } else {
-        gguf_remove_key(ctx_outs[0].get(), "quantize.hq.gptq_hessian_alpha");
-        gguf_remove_key(ctx_outs[0].get(), "quantize.hq.gptq_hessian");
-    }
-    if (n_gptq_missing > 0) {
-        LLAMA_LOG_WARN("%s: WARNING: %zu HQ tensors have no usable imatrix entry - they use uniform weights\n", __func__, n_gptq_missing);
-    }
-    if (n_gptq_zero_slices > 0) {
-        LLAMA_LOG_WARN("%s: WARNING: %zu experts of GPTQ tensors have an all-zero imatrix slice - they use uniform weights\n",
-                       __func__, n_gptq_zero_slices);
-    }
-
-    if (n_rotated_out > 0) {
-        gguf_set_val_u64(ctx_outs[0].get(), ml.llm_kv(LLM_KV_HADAMARD_SEED).c_str(), hadamard_seed);
-        LLAMA_LOG_INFO("%s: %zu Hadamard-rotated (HQ) tensors, seed = %" PRIu64 "\n", __func__, n_rotated_out, hadamard_seed);
-    } else {
-        gguf_remove_key(ctx_outs[0].get(), ml.llm_kv(LLM_KV_HADAMARD_SEED).c_str());
-    }
+    hq.finish(ctx_outs[0].get(), ml.llm_kv(LLM_KV_HADAMARD_SEED));
 
     if (params->loras && params->loras->path) {
         const char * key = "general.merged_loras";
@@ -1596,7 +1647,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 }
             } else {
                 const float * imatrix = nullptr;
-                if (imatrix_data && (!ggml_is_rotated(new_type) || hq_gptq)) {
+                if (imatrix_data && (!ggml_is_rotated(new_type) || params->hq_gptq)) {
                     auto it = imatrix_data->find(tm.remapped_imatrix_name);
                     if (it == imatrix_data->end()) {
                         LLAMA_LOG_INFO("\n====== %s: did not find weights for %s\n", __func__, tensor->name);
@@ -1654,28 +1705,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
                     const float * imatrix_03 = imatrix ? imatrix + i03 * n_per_row : nullptr;
 
-                    // one factor per expert; an all-zero slice keeps uniform weights
                     const float * gptq_U = nullptr;
-                    if (tm.use_gptq_full) {
+                    if (tm.use_gptq) {
                         GGML_ASSERT(f32_copy);
                         const auto t0 = std::chrono::steady_clock::now();
-                        const std::string & w = tm.remapped_imatrix_name;
-                        llama_gptq_cache::status st;
-                        gptq_U = gptq_cache.get_full(hessian->owner(w), [&](float * dst) { return hessian->read(w, dst); }, n_per_row,
-                                                     hadamard_seed, params->hessian_alpha, gptq_damp, workers, nthread, &st);
+                        gptq_U = hq.factor(tm, tensor, imatrix_03, gptq_cache, nthread);
                         t_factor += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-                        if (!gptq_U) {
-                            throw std::runtime_error(format("%s: the full-Hessian GPTQ factorization failed", tensor->name));
-                        }
-                    } else if (tm.use_gptq && imatrix_03) {
-                        GGML_ASSERT(f32_copy);
-                        const auto t0 = std::chrono::steady_clock::now();
-                        llama_gptq_cache::status st;
-                        gptq_U = gptq_cache.get(imatrix_03, n_per_row, hadamard_seed, gptq_damp, workers, nthread, &st);
-                        t_factor += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-                        if (st == llama_gptq_cache::FAILED) {
-                            LLAMA_LOG_WARN("\n%s: WARNING: %s: the GPTQ factorization failed - uniform weights\n", __func__, tensor->name);
-                        }
                     }
 
                     for (int64_t ir = 0; ir < nrows; ir += nrows_slab) {
@@ -1798,6 +1833,8 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.loras                       =*/ nullptr,
         /*.hessian                     =*/ nullptr,
         /*.hessian_alpha               =*/ 0.1f,
+        /*.hq_gptq                     =*/ true,
+        /*.hq_gptq_damp                =*/ LLAMA_GPTQ_DAMP_DEFAULT,
     };
 
     return result;
@@ -1824,7 +1861,9 @@ uint32_t llama_model_quantize(
 quantize_state_impl * llama_quant_init(
         const llama_model * model,
         const llama_model_quantize_params * params) {
-    return new quantize_state_impl(*model, params);
+    auto * qs = new quantize_state_impl(*model, params);
+    qs->has_token_embd = model->get_tensor("token_embd.weight") != nullptr;
+    return qs;
 }
 
 void llama_quant_free(quantize_state_impl * qs) {
@@ -1862,6 +1901,14 @@ bool llama_quant_tensor_allows_quantization(
         const quantize_state_impl * qs,
         const ggml_tensor * tensor) {
     return tensor_allows_quantization(qs->params, qs->model.arch, tensor);
+}
+
+bool llama_quant_tensor_rotatable(
+        const quantize_state_impl * qs,
+        const ggml_tensor * tensor) {
+    return tensor_allows_quantization(qs->params, qs->model.arch, tensor) &&
+           tensor_is_rotatable(tensor->name, tensor_get_category(tensor->name), qs->has_token_embd) &&
+           tensor->ne[0] % 32 == 0 && ggml_rht_plan(tensor->ne[0], nullptr, nullptr);
 }
 
 void llama_quant_compute_types(

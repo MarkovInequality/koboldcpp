@@ -181,3 +181,27 @@ bool common_imatrix_load(const std::string & fname, common_imatrix & imatrix) {
     ggml_free(ctx);
     return true;
 }
+
+void common_imatrix_means(const common_imatrix & imatrix, std::unordered_map<std::string, std::vector<float>> & out) {
+    for (const auto & [name, entry] : imatrix.entries) {
+        auto & e = out[name];
+        e.resize(entry.sums.size());
+        if (!imatrix.is_legacy) {
+            // GGUF format: normalize by per-expert counts
+            const int64_t ncounts = entry.counts.size();
+            const int64_t ne0     = (int64_t) entry.sums.size() / ncounts;
+            for (int64_t j = 0; j < ncounts; ++j) {
+                const float count = (float) entry.counts[j];
+                for (int64_t i = 0; i < ne0; ++i) {
+                    e[j*ne0 + i] = count > 0.0f ? entry.sums[j*ne0 + i] / count : 1.0f;
+                }
+            }
+        } else {
+            // legacy format: sums contain (raw/count)*ncall, divide by ncall
+            const int64_t ncall = entry.counts.empty() ? 0 : entry.counts[0];
+            for (size_t i = 0; i < entry.sums.size(); ++i) {
+                e[i] = ncall > 0 ? entry.sums[i] / ncall : entry.sums[i];
+            }
+        }
+    }
+}

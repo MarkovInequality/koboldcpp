@@ -1,4 +1,5 @@
 #include "rht.cuh"
+#include "rht-impl.cuh"
 
 void ggml_cuda_op_rht(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src = dst->src[0];

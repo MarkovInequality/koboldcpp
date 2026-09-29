@@ -122,7 +122,7 @@ llama_model_gemma3n::graph::graph(const llama_model & model, const llm_graph_par
         ggml_tensor * target_magnitude = calc_magnitude(inpL);
         ggml_tensor * inp_repeated     = ggml_repeat_4d(ctx0, inpL, n_embd, n_tokens, n_altup - 1, 1);
         ggml_tensor * altup_added =
-            ggml_mul_mat(ctx0, model.altup_proj, inp_repeated);  // shape: [n_embd, n_tokens, n_altup - 1]
+            build_mm(model.altup_proj, inp_repeated);  // shape: [n_embd, n_tokens, n_altup - 1]
         ggml_tensor * new_magnitude = calc_magnitude(altup_added);
         altup_added                 = ggml_div(ctx0, ggml_mul(ctx0, altup_added, target_magnitude), new_magnitude);
         inpL                        = ggml_concat(ctx0, inpL, altup_added, 2);  // shape: [n_embd, n_tokens, n_altup]
@@ -270,7 +270,7 @@ llama_model_gemma3n::graph::graph(const llama_model & model, const llm_graph_par
             ggml_view_3d(ctx0, cur, n_embd, n_tokens, n_altup - 1, ggml_row_size(cur->type, n_embd),
                          ggml_row_size(cur->type, n_embd * n_tokens), n_embd * n_tokens * ggml_element_size(cur));
         ggml_tensor * altup_unembd =
-            ggml_mul_mat(ctx0, model.altup_unembd_proj, alt_slice);  // shape: [n_embd, n_tokens, n_altup - 1]
+            build_mm(model.altup_unembd_proj, alt_slice);  // shape: [n_embd, n_tokens, n_altup - 1]
         ggml_tensor * new_magnitude = calc_magnitude(altup_unembd);
         altup_unembd                = ggml_div(ctx0, ggml_mul(ctx0, altup_unembd, target_magnitude), new_magnitude);
         cb(altup_unembd, "altup_unembd", -1);
@@ -405,7 +405,7 @@ ggml_tensor * llama_model_gemma3n::graph::altup_compute_router_modalities(ggml_t
     // router_input_scale
     router_inputs = ggml_scale(ctx0, router_inputs, 1.0f / (float) n_embd);
 
-    ggml_tensor * output = ggml_mul_mat(ctx0, model.layers[il].altup_router, router_inputs);
+    ggml_tensor * output = build_mm(model.layers[il].altup_router, router_inputs);
     return ggml_tanh(ctx0, output);  // [n_altup, n_tokens]
 }
 

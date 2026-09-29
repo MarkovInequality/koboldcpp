@@ -460,6 +460,8 @@ extern "C" {
         const struct llama_model_quantize_lora * loras;             // LoRA adapters to merge, terminated by path == NULL
         const char * hessian;                                       // hessian-collect file: HQ GPTQ uses its full input Grams
         float hessian_alpha;                                        // with hessian: shrinkage toward the Grams' diagonals, 0 (full) to 1 (diagonal); default 0.1
+        bool hq_gptq;                                               // HQ tensors with an imatrix (or hessian) entry use GPTQ; default true
+        float hq_gptq_damp;                                         // GPTQ damping, relative to the mean of H's diagonal; default 0.01, at least 0.001
     } llama_model_quantize_params;
 
     typedef struct llama_logit_bias {

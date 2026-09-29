@@ -53,7 +53,7 @@ UD-Q4_K_M scored KL 0.137 on heldout and 0.858 on opencode (p99 20 nats), agains
 |---|---|
 | `ref.sh` | computes the reference's log-probs for each set into `work/<set>.kl-cache`; about 2 minutes per set for the 27B (`REF_NGL=33` on a 32 GB GPU). A valid cache is reused. |
 | `eval.sh MODEL` | scores a model on every set: one line per set, `set bpw NLL PPL meanKL p99KL top1`. About 2 minutes for a 16 GB model. |
-| `iter.sh NAME ALPHA DAMP [NOTE]` | one tuning run: quantizes `REF` with `TYPES` as HQ types and `--hessian HESSIAN --hessian-alpha ALPHA` (`LLAMA_HQ_GPTQ_DAMP=DAMP`), scores it, appends a row to `LOG`, and deletes the quantization |
+| `iter.sh NAME ALPHA DAMP [NOTE]` | one tuning run: quantizes `REF` with `TYPES` as HQ types and `--hessian HESSIAN --hessian-alpha ALPHA --gptq-damp DAMP`, scores it, appends a row to `LOG`, and deletes the quantization |
 | `iter.sh --baseline MODEL NAME` | scores and logs an existing model; nothing is deleted |
 | `queue.sh` | runs the lines of `work/queue.txt` (`NAME ALPHA DAMP [NOTE]`) through `iter.sh` one at a time; lines can be appended while it runs |
 | `compare.sh ROTATED.gguf` | quantizes `REF` rotated (HQ, `--hessian` at the defaults, kept as `ROTATED.gguf`) and unrotated (the plain types with `IMATRIX`, deleted), scores both, and appends the comparison to `LOG` |

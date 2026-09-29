@@ -26,6 +26,7 @@
 
 #include "llama.h"
 #include "llama-context.h"
+#include "common/common.h"
 
 #include "ggml-backend.h"
 #include "gguf.h"
@@ -63,7 +64,7 @@ static double now_s() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-[[noreturn]] static void die(const char * fmt, ...) {
+[[noreturn]] static void fatal(const char * fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
@@ -73,8 +74,8 @@ static double now_s() {
 }
 
 #ifdef GGML_USE_CUDA
-#define CUDA_CHECK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) die("%s: %s", #x, cudaGetErrorString(e_)); } while (0)
-#define CUBLAS_CHECK(x) do { cublasStatus_t s_ = (x); if (s_ != CUBLAS_STATUS_SUCCESS) die("%s: cuBLAS status %d", #x, (int) s_); } while (0)
+#define CUDA_CHECK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) fatal("%s: %s", #x, cudaGetErrorString(e_)); } while (0)
+#define CUBLAS_CHECK(x) do { cublasStatus_t s_ = (x); if (s_ != CUBLAS_STATUS_SUCCESS) fatal("%s: cuBLAS status %d", #x, (int) s_); } while (0)
 #endif
 
 struct document {
@@ -180,11 +181,13 @@ struct collector {
         return true;
     }
 
-    // rows of x in the current ubatch -> token indices of the ubatch, then runs of counted rows
+    // rows of x in the current ubatch -> token indices of the ubatch, then runs of counted rows; where the rows
+    // are the ubatch's outputs, only the documents' own outputs count, not a logit forced for the decode
     bool counted_runs(const ggml_tensor * x, const llama_ubatch * ub) {
         const int64_t nrows = ggml_nrows(x);
+        const bool outputs = nrows != (int64_t) ub->n_tokens;
         row_tok.clear();
-        if (nrows == (int64_t) ub->n_tokens) {
+        if (!outputs) {
             for (uint32_t i = 0; i < ub->n_tokens; ++i) {
                 row_tok.push_back(i);
             }
@@ -208,7 +211,7 @@ struct collector {
                 const int s = ub->seq_id[t][0];
                 const document & d = (*docs)[seq_doc[s]];
                 const llama_pos p = ub->pos[t];
-                c = p < (llama_pos) d.tok.size() && d.counted[p];
+                c = p < (llama_pos) d.tok.size() && (outputs ? d.output[p] : d.counted[p]);
             }
             if (c && r0 < 0) {
                 r0 = r;
@@ -369,14 +372,12 @@ struct collector {
 static bool eval_cb(ggml_tensor * t, bool ask, void * ud) {
     auto * c = (collector *) ud;
     c->refresh();
+    // only the current pass's inputs are asked for: the scheduler splits the graph and syncs at each one
     auto it = c->x_group.find(t);
-    if (it == c->x_group.end()) {
-        return ask ? false : true;
+    if (it == c->x_group.end() || !c->groups[it->second].active) {
+        return !ask;
     }
     if (ask) {
-        return true;
-    }
-    if (!c->groups[it->second].active) {
         return true;
     }
     if (!c->observe(t)) {
@@ -387,17 +388,6 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * ud) {
 }
 
 // ---------------------------------------------------------------- documents and batches
-
-static std::vector<llama_token> tokenize(const llama_vocab * vocab, const std::string & text) {
-    std::vector<llama_token> t(text.size() + 16);
-    int n = llama_tokenize(vocab, text.data(), (int32_t) text.size(), t.data(), (int32_t) t.size(), true, true);
-    if (n < 0) {
-        t.resize(-n);
-        n = llama_tokenize(vocab, text.data(), (int32_t) text.size(), t.data(), (int32_t) t.size(), true, true);
-    }
-    t.resize(n);
-    return t;
-}
 
 static void finish_doc(document & d, int stride) {
     d.output.assign(d.tok.size(), 0);
@@ -414,7 +404,7 @@ static void finish_doc(document & d, int stride) {
 static std::vector<document> load_docs(const std::string & path, const llama_vocab * vocab, int stride, bool trim) {
     std::ifstream in(path);
     if (!in) {
-        die("cannot open %s", path.c_str());
+        fatal("cannot open %s", path.c_str());
     }
     std::vector<document> docs;
     std::string line;
@@ -425,14 +415,14 @@ static std::vector<document> load_docs(const std::string & path, const llama_voc
         const json j = json::parse(line);
         document d;
         d.id  = j.value("id", std::to_string(docs.size()));
-        d.tok = tokenize(vocab, j.at("text").get<std::string>());
+        d.tok = common_tokenize(vocab, j.at("text").get<std::string>(), true, true);
         if (j.contains("count") && !j["count"].is_null()) {
             d.counted.assign(d.tok.size(), 0);
             int64_t prev_end = 0;
             for (const auto & sp : j["count"]) {
                 const int64_t a = sp.at(0).get<int64_t>(), b = sp.at(1).get<int64_t>();
                 if (a < prev_end || b < a || b > (int64_t) d.tok.size()) {
-                    die("%s: count span [%" PRId64 ", %" PRId64 ") is out of order or outside its %zu tokens", d.id.c_str(), a, b, d.tok.size());
+                    fatal("%s: count span [%" PRId64 ", %" PRId64 ") is out of order or outside its %zu tokens", d.id.c_str(), a, b, d.tok.size());
                 }
                 std::fill(d.counted.begin() + a, d.counted.begin() + b, 1);
                 prev_end = b;
@@ -456,10 +446,10 @@ static std::vector<document> load_docs(const std::string & path, const llama_voc
 static std::vector<document> text_chunks(const std::string & path, const llama_vocab * vocab, int n, int max_chunks, int stride) {
     std::ifstream in(path, std::ios::binary);
     if (!in) {
-        die("cannot open %s", path.c_str());
+        fatal("cannot open %s", path.c_str());
     }
     const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    std::vector<llama_token> all = tokenize(vocab, text);
+    std::vector<llama_token> all = common_tokenize(vocab, text, true, true);
     std::vector<document> docs;
     for (size_t c = 0; (c + 1)*n <= all.size() && (max_chunks <= 0 || (int) docs.size() < max_chunks); ++c) {
         document d;
@@ -507,7 +497,7 @@ static std::vector<batch_plan> plan_batches(const std::vector<document> & docs, 
 static void decode_or_die(llama_context * ctx, llama_batch & b) {
     const int rc = llama_decode(ctx, b);
     if (rc != 0) {
-        die("llama_decode failed (%d)", rc);
+        fatal("llama_decode failed (%d)", rc);
     }
 }
 
@@ -611,7 +601,7 @@ static void pwrite_all(int fd, const void * data, size_t size, size_t off) {
     while (size > 0) {
         const ssize_t w = pwrite(fd, p, std::min(size, (size_t) 1 << 30), (off_t) off);
         if (w <= 0) {
-            die("write failed at offset %zu: %s", off, strerror(errno));
+            fatal("write failed at offset %zu: %s", off, strerror(errno));
         }
         p += w; off += w; size -= w;
     }
@@ -622,7 +612,7 @@ static void pread_all(int fd, void * data, size_t size, size_t off) {
     while (size > 0) {
         const ssize_t r = pread(fd, p, std::min(size, (size_t) 1 << 30), (off_t) off);
         if (r <= 0) {
-            die("read failed at offset %zu: %s", off, strerror(errno));
+            fatal("read failed at offset %zu: %s", off, strerror(errno));
         }
         p += r; off += r; size -= r;
     }
@@ -646,7 +636,7 @@ static ggml_type parse_cache_type(const std::string & s) {
             return (ggml_type) t;
         }
     }
-    die("unknown cache type %s", s.c_str());
+    fatal("unknown cache type %s", s.c_str());
 }
 
 static std::set<int> parse_layers(const std::string & spec, int n_layer) {
@@ -663,7 +653,7 @@ static std::set<int> parse_layers(const std::string & spec, int n_layer) {
             const int b = d == std::string::npos ? a : std::stoi(item.substr(d + 1));
             for (int l = a; l <= b; ++l) {
                 if (l < 0 || l > n_layer) {
-                    die("--layers: %d is not a layer of this model (0-%d, out)", l, n_layer - 1);
+                    fatal("--layers: %d is not a layer of this model (0-%d, out)", l, n_layer - 1);
                 }
                 out.insert(l);
             }
@@ -694,7 +684,7 @@ int main(int argc, char ** argv) {
         auto next = [&]() -> std::string {
             if (i + 1 >= argc) {
                 usage(argv[0]);
-                die("%s needs a value", a.c_str());
+                fatal("%s needs a value", a.c_str());
             }
             return argv[++i];
         };
@@ -726,7 +716,7 @@ int main(int argc, char ** argv) {
         else if (a == "--no-op-offload") op_offload = false;
         else if (a == "--trim-docs") trim_docs = true;
         else if (a == "-h" || a == "--help") { usage(argv[0]); return 0; }
-        else { usage(argv[0]); die("unknown argument %s", a.c_str()); }
+        else { usage(argv[0]); fatal("unknown argument %s", a.c_str()); }
     }
     if (model_path.empty() || out_path.empty() || docs_path.empty() == text_path.empty() || stride < 1) {
         usage(argv[0]);
@@ -736,7 +726,7 @@ int main(int argc, char ** argv) {
     const bool use_cuda = accum != "cpu";
 #else
     if (accum == "cuda") {
-        die("--accum cuda needs the CUDA build (hessian-collect-cuda)");
+        fatal("--accum cuda needs the CUDA build (hessian-collect-cuda)");
     }
     const bool use_cuda = false;
 #endif
@@ -774,7 +764,7 @@ int main(int argc, char ** argv) {
             }
         }
         if (!buft) {
-            die("-ot %s: needs REGEX=DEVICE with a device's buffer type (CUDA0, CPU, CUDA_Host for pinned host memory, ...)", o.c_str());
+            fatal("-ot %s: needs REGEX=DEVICE with a device's buffer type (CUDA0, CPU, CUDA_Host for pinned host memory, ...)", o.c_str());
         }
         ot_patterns.push_back(o.substr(0, eq));
         ot.push_back({ ot_patterns.back().c_str(), buft });
@@ -791,7 +781,7 @@ int main(int argc, char ** argv) {
     }
     llama_model * model = llama_model_load_from_file(model_path.c_str(), mp);
     if (!model) {
-        die("failed to load %s", model_path.c_str());
+        fatal("failed to load %s", model_path.c_str());
     }
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const int n_layer = llama_model_n_layer(model);
@@ -799,7 +789,7 @@ int main(int argc, char ** argv) {
     const double t_tok0 = now_s();
     std::vector<document> docs = docs_path.empty() ? text_chunks(text_path, vocab, chunk, max_chunks, stride) : load_docs(docs_path, vocab, stride, trim_docs);
     if (docs.empty()) {
-        die("no documents");
+        fatal("no documents");
     }
     int64_t max_len = 0, n_proc = 0, n_counted = 0, n_outputs = 0;
     for (const auto & d : docs) {
@@ -812,7 +802,7 @@ int main(int argc, char ** argv) {
         n_ctx = std::max(n_ubatch, (max_len + 255)/256*256);
     }
     if (max_len > n_ctx) {
-        die("the longest document has %" PRId64 " tokens, more than --ctx %" PRId64, max_len, n_ctx);
+        fatal("the longest document has %" PRId64 " tokens, more than --ctx %" PRId64, max_len, n_ctx);
     }
     fprintf(stderr, "%zu documents: %" PRId64 " tokens, %" PRId64 " counted, %" PRId64 " LM-head rows, longest %" PRId64 " (tokenized in %.1f s)\n",
             docs.size(), n_proc, n_counted, n_outputs, max_len, now_s() - t_tok0);
@@ -887,7 +877,7 @@ int main(int argc, char ** argv) {
     cp.cb_eval_user_data = &col;
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) {
-        die("failed to create the context");
+        fatal("failed to create the context");
     }
     col.ctx = ctx;
     ctx->set_collect_mm_inputs(true);
@@ -898,7 +888,7 @@ int main(int argc, char ** argv) {
         gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
         gguf_context * mg = gguf_init_from_file(model_path.c_str(), gp);
         if (!mg) {
-            die("cannot read %s", model_path.c_str());
+            fatal("cannot read %s", model_path.c_str());
         }
         for (int64_t i = 0; i < gguf_get_n_tensors(mg); ++i) {
             file_order.push_back(gguf_get_tensor_name(mg, i));
@@ -919,7 +909,8 @@ int main(int argc, char ** argv) {
             b.pos[i] = i;
             b.n_seq_id[i] = 1;
             b.seq_id[i][0] = 0;
-            b.logits[i] = 1;
+            // one output reaches the LM head; the context holds only about n_ubatch/stride of them
+            b.logits[i] = i == n - 1;
         }
         col.seq_doc = { 0 };
         decode_or_die(ctx, b);
@@ -939,16 +930,16 @@ int main(int argc, char ** argv) {
                 continue;
             }
             if (r.id) {
-                die("%s is a MUL_MAT_ID weight: expert (MoE) Grams are not supported", r.w->name);
+                fatal("%s is a MUL_MAT_ID weight: expert (MoE) Grams are not supported", r.w->name);
             }
             if (!nodes.count(r.x)) {
-                die("the input of %s is not a computed node of the graph (a leaf or an elided node) - it can't be observed", r.w->name);
+                fatal("the input of %s is not a computed node of the graph (a leaf or an elided node) - it can't be observed", r.w->name);
             }
             if (r.x->type != GGML_TYPE_F32 || r.x->nb[0] != sizeof(float)) {
-                die("the input of %s is %s with nb[0] = %zu, not F32 rows", r.w->name, ggml_type_name(r.x->type), r.x->nb[0]);
+                fatal("the input of %s is %s with nb[0] = %zu, not F32 rows", r.w->name, ggml_type_name(r.x->type), r.x->nb[0]);
             }
             if (recorded.count(r.w->name)) {
-                die("%s is multiplied with more than one input", r.w->name);
+                fatal("%s is multiplied with more than one input", r.w->name);
             }
             recorded.insert(r.w->name);
             by_x[r.x].push_back(r.w->name);
@@ -967,9 +958,9 @@ int main(int argc, char ** argv) {
         }
         if (!missing.empty()) {
             for (const auto & m : missing) {
-                fprintf(stderr, "not recorded: %s (multiplied outside build_lora_mm / rotate_input_if_rotated)\n", m.c_str());
+                fprintf(stderr, "not recorded: %s (multiplied outside build_mm / build_lora_mm)\n", m.c_str());
             }
-            die("%zu weights are multiplied without going through the GEMM-input hook", missing.size());
+            fatal("%zu weights are multiplied without going through the GEMM-input hook", missing.size());
         }
         for (auto & [x, ws] : by_x) {
             std::sort(ws.begin(), ws.end(), [&](const std::string & a, const std::string & b) { return file_rank[a] < file_rank[b]; });
@@ -991,7 +982,7 @@ int main(int argc, char ** argv) {
             g.layer = il;
             for (const auto & w : ws) {
                 if (sscanf(w.c_str(), "blk.%d.", &il) == 1 ? il != g.layer : g.layer != n_layer) {
-                    die("%s and %s share an input across layers", g.owner.c_str(), w.c_str());
+                    fatal("%s and %s share an input across layers", g.owner.c_str(), w.c_str());
                 }
             }
             col.groups.push_back(std::move(g));
@@ -1094,16 +1085,16 @@ int main(int argc, char ** argv) {
     if (resume) {
         fd = open(out_path.c_str(), O_RDWR);
         if (fd < 0) {
-            die("--resume: cannot open %s", out_path.c_str());
+            fatal("--resume: cannot open %s", out_path.c_str());
         }
         gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
         gguf_context * og = gguf_init_from_file(out_path.c_str(), gp);
         if (!og) {
-            die("--resume: %s is not a GGUF file", out_path.c_str());
+            fatal("--resume: %s is not a GGUF file", out_path.c_str());
         }
         const int64_t k = gguf_find_key(og, "hessian.layers_done");
         if (k < 0 || gguf_get_arr_n(og, k) != L.layers_done.size()) {
-            die("--resume: %s has no matching hessian.layers_done", out_path.c_str());
+            fatal("--resume: %s has no matching hessian.layers_done", out_path.c_str());
         }
         memcpy(L.layers_done.data(), gguf_get_arr_data(og, k), L.layers_done.size());
         const int64_t kc = gguf_find_key(og, "hessian.complete");
@@ -1115,7 +1106,7 @@ int main(int argc, char ** argv) {
         std::vector<uint8_t> have(want.size());
         pread_all(fd, have.data(), have.size(), 0);
         if (have != want) {
-            die("--resume: the header of %s doesn't match this model, these documents and these options", out_path.c_str());
+            fatal("--resume: the header of %s doesn't match this model, these documents and these options", out_path.c_str());
         }
         int n_done = 0;
         for (auto v : L.layers_done) {
@@ -1125,10 +1116,10 @@ int main(int argc, char ** argv) {
     } else {
         fd = open(out_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
         if (fd < 0) {
-            die("cannot create %s", out_path.c_str());
+            fatal("cannot create %s", out_path.c_str());
         }
         if (posix_fallocate(fd, 0, (off_t) L.total_size) != 0 && ftruncate(fd, (off_t) L.total_size) != 0) {
-            die("cannot allocate %zu bytes for %s", L.total_size, out_path.c_str());
+            fatal("cannot allocate %zu bytes for %s", L.total_size, out_path.c_str());
         }
         const std::vector<uint8_t> h = header_bytes(L);
         pwrite_all(fd, h.data(), h.size(), 0);
@@ -1290,12 +1281,12 @@ int main(int argc, char ** argv) {
             for (int64_t i = 0; i < n; ++i) {
                 diag[i] = gbuf[i*n + i];
                 if (!(diag[i] >= 0.0f)) {
-                    die("%s: diagonal element %" PRId64 " is %g", g.owner.c_str(), i, diag[i]);
+                    fatal("%s: diagonal element %" PRId64 " is %g", g.owner.c_str(), i, diag[i]);
                 }
             }
             for (float v : gbuf) {
                 if (!std::isfinite(v)) {
-                    die("%s: non-finite Gram entry", g.owner.c_str());
+                    fatal("%s: non-finite Gram entry", g.owner.c_str());
                 }
             }
             pwrite_all(fd, gbuf.data(), gbuf.size()*sizeof(float), L.slots.at(g.owner + ".in_gram").offset);
@@ -1307,7 +1298,7 @@ int main(int argc, char ** argv) {
             g.active = false;
         }
         if (fdatasync(fd) != 0) {
-            die("fdatasync failed: %s", strerror(errno));
+            fatal("fdatasync failed: %s", strerror(errno));
         }
         for (int l : pass) {
             L.layers_done[l] = 1;
@@ -1320,7 +1311,7 @@ int main(int argc, char ** argv) {
         gguf_set_val_bool(L.gguf, "hessian.complete", complete);
         const std::vector<uint8_t> h = header_bytes(L);
         if (h.size() != L.meta_size) {
-            die("header size changed (%zu -> %zu)", L.meta_size, h.size());
+            fatal("header size changed (%zu -> %zu)", L.meta_size, h.size());
         }
         pwrite_all(fd, h.data(), h.size(), 0);
         fdatasync(fd);
@@ -1367,7 +1358,7 @@ int main(int argc, char ** argv) {
             gguf_add_tensor(ig, ct);
         }
         if (!gguf_write_to_file(ig, imatrix_out.c_str(), false)) {
-            die("cannot write %s", imatrix_out.c_str());
+            fatal("cannot write %s", imatrix_out.c_str());
         }
         gguf_free(ig);
         ggml_free(ictx);

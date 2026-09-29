@@ -295,13 +295,13 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
             ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
             cb(conv_states_all, "conv_states_all", il);
             ggml_tensor * conv_state_all = build_rs(inp_rs, conv_states_all, hparams.n_embd_r(), n_seqs);
-            ggml_tensor * Qcur = causal_conv1d(gf, ctx0, conv_states_all, conv_state_all, 0, cur, layer.wq, layer.ssm_q_conv, d_conv, head_dim, n_head, n_seq_tokens, n_seqs, n_tokens, kv_head);
-            ggml_tensor * Kcur = causal_conv1d(gf, ctx0, conv_states_all, conv_state_all, 1, cur, layer.wk, layer.ssm_k_conv, d_conv, head_dim, n_head, n_seq_tokens, n_seqs, n_tokens, kv_head);
-            ggml_tensor * Vcur = causal_conv1d(gf, ctx0, conv_states_all, conv_state_all, 2, cur, layer.wv, layer.ssm_v_conv, d_conv, head_dim, n_head, n_seq_tokens, n_seqs, n_tokens, kv_head);
+            ggml_tensor * Qcur = causal_conv1d(gf, ctx0, conv_states_all, conv_state_all, 0, rotate_input_if_rotated(layer.wq, cur), layer.wq, layer.ssm_q_conv, d_conv, head_dim, n_head, n_seq_tokens, n_seqs, n_tokens, kv_head);
+            ggml_tensor * Kcur = causal_conv1d(gf, ctx0, conv_states_all, conv_state_all, 1, rotate_input_if_rotated(layer.wk, cur), layer.wk, layer.ssm_k_conv, d_conv, head_dim, n_head, n_seq_tokens, n_seqs, n_tokens, kv_head);
+            ggml_tensor * Vcur = causal_conv1d(gf, ctx0, conv_states_all, conv_state_all, 2, rotate_input_if_rotated(layer.wv, cur), layer.wv, layer.ssm_v_conv, d_conv, head_dim, n_head, n_seq_tokens, n_seqs, n_tokens, kv_head);
 
             // g1 = -exp(A_log) * softplus(f_b(f_a(x)) + dt_bias)
-            ggml_tensor * f_a = ggml_mul_mat(ctx0, layer.ssm_f_a, cur);
-            ggml_tensor * g1 = ggml_mul_mat(ctx0, layer.ssm_f_b, f_a);
+            ggml_tensor * f_a = build_mm(layer.ssm_f_a, cur);
+            ggml_tensor * g1 = build_mm(layer.ssm_f_b, f_a);
             cb(g1, "g1 f_b(f_a(cur))", il);
             g1 = ggml_add(ctx0, g1, layer.ssm_dt_b);
             g1 = ggml_softplus(ctx0, g1);
@@ -316,7 +316,7 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
             g1 = ggml_reshape_4d(ctx0, g1, head_dim, n_head, n_seq_tokens, n_seqs);
 
             // Compute beta (mixing coefficient)
-            ggml_tensor * beta = ggml_mul_mat(ctx0, layer.ssm_beta, cur);
+            ggml_tensor * beta = build_mm(layer.ssm_beta, cur);
             beta = ggml_reshape_4d(ctx0, beta, 1, n_head, n_seq_tokens, n_seqs);
             cb(beta, "kda_beta", il);
 
@@ -352,8 +352,8 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
 
             // Output gating g2 = g_b(g_a(x))
             ggml_tensor * cur_2d = ggml_reshape_2d(ctx0, cur, cur->ne[0], n_seq_tokens * n_seqs);
-            ggml_tensor * g_a = ggml_mul_mat(ctx0, layer.ssm_g_a, cur_2d);
-            ggml_tensor * g2 = ggml_mul_mat(ctx0, layer.ssm_g_b, g_a);
+            ggml_tensor * g_a = build_mm(layer.ssm_g_a, cur_2d);
+            ggml_tensor * g2 = build_mm(layer.ssm_g_b, g_a);
             cb(g2, "g2 g_b(g_a(cur_2d))", il);
             g2 = ggml_reshape_3d(ctx0, g2, head_dim, n_head, n_seq_tokens * n_seqs);
 
@@ -368,7 +368,7 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
 
             // Output projection
             gated = ggml_cont_2d(ctx0, gated, d_inner, n_tokens);
-            cur = ggml_mul_mat(ctx0, layer.wo, gated);
+            cur = build_mm(layer.wo, gated);
             cb(cur, "kda_out", il);
 
         } else {
@@ -377,11 +377,11 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
             // Step 1: Q projection and reshape
             // vLLM Kimi: q = q_proj(hidden_states), then view as [n_tokens, n_head, qk_head_dim]
             // Note: Kimi MLA does NOT use RoPE (rotary_emb=None in vLLM)
-            ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.wq, cur);
+            ggml_tensor * Qcur = build_mm(layer.wq, cur);
 
             // Step 2: KV compression
             // kv_cmpr_pe = kv_a_proj_with_mqa(hidden_states) -> [kv_lora_rank + qk_rope_head_dim, n_tokens]
-            ggml_tensor * kv_cmpr_pe = ggml_mul_mat(ctx0, layer.wkv_a_mqa, cur);
+            ggml_tensor * kv_cmpr_pe = build_mm(layer.wkv_a_mqa, cur);
 
             // Split: kv_cmpr = kv_lora[:kv_lora_rank], k_pe = kv_lora[kv_lora_rank:]
             ggml_tensor * kv_cmpr = ggml_view_2d(ctx0, kv_cmpr_pe, kv_lora_rank, n_tokens,
@@ -413,7 +413,7 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
                 cb(q_nope, "q_nope_perm", il);
 
                 // {n_embd_head_qk_nope, kv_lora_rank, n_head} x {n_embd_head_qk_nope, n_tokens, n_head}
-                ggml_tensor * q_nope_absorbed = ggml_mul_mat(ctx0, layer.wk_b, q_nope);
+                ggml_tensor * q_nope_absorbed = build_mm(layer.wk_b, q_nope);
                 cb(q_nope_absorbed, "q_nope_absorbed", il);
 
                 // {kv_lora_rank, n_head, n_tokens}
@@ -442,7 +442,7 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
                 Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head_k_mla, n_head, n_tokens);
                 cb(Qcur, "mla_Q", il);
                 // KV decompression: kv = kv_b_proj(kv_c_normed)
-                ggml_tensor * kv = ggml_mul_mat(ctx0, layer.wkv_b, kv_cmpr);
+                ggml_tensor * kv = build_mm(layer.wkv_b, kv_cmpr);
                 const int64_t kv_per_head = n_embd_head_qk_nope + n_embd_head_v_mla;
 
                 // Split kv into k_nope and v
@@ -542,7 +542,7 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
     res->t_embd = cur;
 
     // Output
-    cur = ggml_mul_mat(ctx0, model.output, cur);
+    cur = build_mm(model.output, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 

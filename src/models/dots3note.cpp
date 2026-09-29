@@ -200,7 +200,7 @@ llama_model_dots3note::graph::graph(const llama_model & model, const llm_graph_p
         {
             ggml_tensor * attn_inp = cur;
 
-            ggml_tensor * qr = ggml_mul_mat(ctx0, model.layers[il].wq_a, cur);
+            ggml_tensor * qr = build_mm(model.layers[il].wq_a, cur);
             cb(qr, "qr", il);
 
             qr = build_norm(qr, model.layers[il].attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
@@ -210,7 +210,7 @@ llama_model_dots3note::graph::graph(const llama_model & model, const llm_graph_p
 
             // lightning indexer (full-attention layers only)
             if (!is_swa) {
-                ggml_tensor * indexer_q = ggml_mul_mat(ctx0, model.layers[il].indexer_attn_q_b, qr);
+                ggml_tensor * indexer_q = build_mm(model.layers[il].indexer_attn_q_b, qr);
                 cb(indexer_q, "indexer_q", il);
 
                 // {n_embd_indexer_head, n_indexer_head, n_tokens}
@@ -220,7 +220,7 @@ llama_model_dots3note::graph::graph(const llama_model & model, const llm_graph_p
                                      ext_factor, attn_factor, beta_fast, beta_slow);
                 cb(indexer_q, "indexer_q", il);
 
-                ggml_tensor * indexer_k = ggml_mul_mat(ctx0, model.layers[il].indexer_attn_k, cur);
+                ggml_tensor * indexer_k = build_mm(model.layers[il].indexer_attn_k, cur);
                 cb(indexer_k, "indexer_k", il);
 
                 indexer_k = build_norm(indexer_k, model.layers[il].indexer_k_norm, model.layers[il].indexer_k_norm_b, LLM_NORM, il);
@@ -244,7 +244,7 @@ llama_model_dots3note::graph::graph(const llama_model & model, const llm_graph_p
                 const auto & k_idxs_lid = inp_attn->get_dsa()->get_k_idxs_lid();
                 ggml_build_forward_expand(gf, mctx_lid->cpy_k(ctx0, indexer_k, k_idxs_lid, il));
 
-                ggml_tensor * indexer_weights = ggml_mul_mat(ctx0, model.layers[il].indexer_proj, cur);
+                ggml_tensor * indexer_weights = build_mm(model.layers[il].indexer_proj, cur);
                 cb(indexer_weights, "indexer_weights", il);
 
                 indexer_k = mctx_lid->get_k(ctx0, il);
@@ -301,7 +301,7 @@ llama_model_dots3note::graph::graph(const llama_model & model, const llm_graph_p
                 cb(top_k, "top_k", il);
             }
 
-            ggml_tensor * q = ggml_mul_mat(ctx0, model.layers[il].wq_b, qr);
+            ggml_tensor * q = build_mm(model.layers[il].wq_b, qr);
             cb(q, "q", il);
 
             // split into {n_embd_head_qk_nope, n_head_l, n_tokens}
@@ -316,7 +316,7 @@ llama_model_dots3note::graph::graph(const llama_model & model, const llm_graph_p
                 ggml_row_size(q->type, n_embd_head_k_mla) * n_head_l, ggml_row_size(q->type, n_embd_head_qk_nope));
             cb(q_pe, "q_pe", il);
 
-            ggml_tensor * kv_cmpr_pe = ggml_mul_mat(ctx0, model.layers[il].wkv_a_mqa, cur);
+            ggml_tensor * kv_cmpr_pe = build_mm(model.layers[il].wkv_a_mqa, cur);
             cb(kv_cmpr_pe, "kv_cmpr_pe", il);
 
             // split into {kv_lora_rank, n_tokens}
@@ -354,7 +354,7 @@ llama_model_dots3note::graph::graph(const llama_model & model, const llm_graph_p
                 cb(q_nope, "q_nope_perm", il);
 
                 // {n_embd_head_qk_nope, kv_lora_rank, n_head_l} x {n_embd_head_qk_nope, n_tokens, n_head_l}
-                ggml_tensor * q_nope_absorbed = ggml_mul_mat(ctx0, model.layers[il].wk_b, q_nope);
+                ggml_tensor * q_nope_absorbed = build_mm(model.layers[il].wk_b, q_nope);
                 cb(q_nope_absorbed, "q_nope_absorbed", il);
 
                 // {kv_lora_rank, n_head_l, n_tokens}
@@ -471,7 +471,7 @@ llama_model_dots3note::graph::graph(const llama_model & model, const llm_graph_p
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = ggml_mul_mat(ctx0, model.output, cur);
+    cur = build_mm(model.output, cur);
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;

@@ -311,10 +311,10 @@ llama_model_kimi_k3::graph::graph(const llama_model & model, const llm_graph_par
         cb(cur, "ffn_norm", il);
 
         if ((uint32_t) il < hparams.n_layer_dense_lead) {
-            ggml_tensor * g = ggml_mul_mat(ctx0, layer.ffn_gate, cur);
-            ggml_tensor * u = ggml_mul_mat(ctx0, layer.ffn_up,   cur);
+            ggml_tensor * g = build_mm(layer.ffn_gate, cur);
+            ggml_tensor * u = build_mm(layer.ffn_up,   cur);
             cur = kimi_k3_situ(ctx0, g, u, hparams.situ_beta, hparams.situ_linear_beta);
-            cur = ggml_mul_mat(ctx0, layer.ffn_down, cur);
+            cur = build_mm(layer.ffn_down, cur);
             cb(cur, "ffn_out", il);
         } else {
             cur = build_latent_moe(cur, layer, n_embd_latent, il);
@@ -341,7 +341,7 @@ llama_model_kimi_k3::graph::graph(const llama_model & model, const llm_graph_par
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = ggml_mul_mat(ctx0, model.output, cur);
+    cur = build_mm(model.output, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
@@ -399,9 +399,9 @@ ggml_tensor * llama_model_kimi_k3::graph::build_kda_layer(
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
     ggml_tensor * conv_state_all  = build_rs(inp_rs, conv_states_all, hparams.n_embd_r(), n_seqs);
 
-    ggml_tensor * Qcur = kimi_k3_conv1d(gf, ctx0, conv_states_all, conv_state_all, 0, cur, layer.wq, layer.ssm_q_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head);
-    ggml_tensor * Kcur = kimi_k3_conv1d(gf, ctx0, conv_states_all, conv_state_all, 1, cur, layer.wk, layer.ssm_k_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head);
-    ggml_tensor * Vcur = kimi_k3_conv1d(gf, ctx0, conv_states_all, conv_state_all, 2, cur, layer.wv, layer.ssm_v_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head);
+    ggml_tensor * Qcur = kimi_k3_conv1d(gf, ctx0, conv_states_all, conv_state_all, 0, rotate_input_if_rotated(layer.wq, cur), layer.wq, layer.ssm_q_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head);
+    ggml_tensor * Kcur = kimi_k3_conv1d(gf, ctx0, conv_states_all, conv_state_all, 1, rotate_input_if_rotated(layer.wk, cur), layer.wk, layer.ssm_k_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head);
+    ggml_tensor * Vcur = kimi_k3_conv1d(gf, ctx0, conv_states_all, conv_state_all, 2, rotate_input_if_rotated(layer.wv, cur), layer.wv, layer.ssm_v_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head);
     cb(Qcur, "kda_q_conv", il);
     cb(Kcur, "kda_k_conv", il);
     cb(Vcur, "kda_v_conv", il);
@@ -410,8 +410,8 @@ ggml_tensor * llama_model_kimi_k3::graph::build_kda_layer(
     //   unset (kimi-linear):  g = -exp(A_log) * softplus(f_b(f_a(x)) + dt_bias)
     //   set   (K3, -5.0):     g = lower_bound * sigmoid(exp(A_log) * (f_b(f_a(x)) + dt_bias))
     // ssm_a holds -exp(A_log) (folded at conversion time), so exp(A_log) == -ssm_a
-    ggml_tensor * f_a = ggml_mul_mat(ctx0, layer.ssm_f_a, cur);
-    ggml_tensor * g1  = ggml_mul_mat(ctx0, layer.ssm_f_b, f_a);
+    ggml_tensor * f_a = build_mm(layer.ssm_f_a, cur);
+    ggml_tensor * g1  = build_mm(layer.ssm_f_b, f_a);
     g1 = ggml_add(ctx0, g1, layer.ssm_dt_b);
 
     ggml_tensor * A = ggml_reshape_3d(ctx0, layer.ssm_a, 1, n_head_kda, 1);
@@ -430,7 +430,7 @@ ggml_tensor * llama_model_kimi_k3::graph::build_kda_layer(
 
     g1 = ggml_reshape_4d(ctx0, g1, head_dim, n_head_kda, n_seq_tokens, n_seqs);
 
-    ggml_tensor * beta = ggml_mul_mat(ctx0, layer.ssm_beta, cur);
+    ggml_tensor * beta = build_mm(layer.ssm_beta, cur);
     beta = ggml_reshape_4d(ctx0, beta, 1, n_head_kda, n_seq_tokens, n_seqs);
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "kda_beta", il);
@@ -458,7 +458,7 @@ ggml_tensor * llama_model_kimi_k3::graph::build_kda_layer(
 
     // K3: single full-rank gate (kimi-linear factors this as g_b(g_a(x)))
     ggml_tensor * cur_2d = ggml_reshape_2d(ctx0, cur_3d, cur_3d->ne[0], n_seq_tokens * n_seqs);
-    ggml_tensor * g2     = ggml_mul_mat(ctx0, layer.ssm_g, cur_2d);
+    ggml_tensor * g2     = build_mm(layer.ssm_g, cur_2d);
     g2 = ggml_reshape_3d(ctx0, g2, head_dim, n_head_kda, n_seq_tokens * n_seqs);
 
     ggml_tensor * o      = ggml_reshape_3d(ctx0, output, head_dim, n_head_kda, n_seq_tokens * n_seqs);
@@ -468,7 +468,7 @@ ggml_tensor * llama_model_kimi_k3::graph::build_kda_layer(
     ggml_tensor * gated  = ggml_mul(ctx0, normed, ggml_sigmoid(ctx0, g2));
 
     gated = ggml_cont_2d(ctx0, gated, d_inner, n_tokens);
-    cur   = ggml_mul_mat(ctx0, layer.wo, gated);
+    cur   = build_mm(layer.wo, gated);
     cb(cur, "kda_out", il);
 
     return cur;
@@ -488,14 +488,14 @@ ggml_tensor * llama_model_kimi_k3::graph::build_mla_layer(
 
     ggml_tensor * Qcur;
     if (layer.wq_a) {
-        Qcur = ggml_mul_mat(ctx0, layer.wq_a, cur);
+        Qcur = build_mm(layer.wq_a, cur);
         Qcur = build_norm(Qcur, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
-        Qcur = ggml_mul_mat(ctx0, layer.wq_b, Qcur);
+        Qcur = build_mm(layer.wq_b, Qcur);
     } else {
-        Qcur = ggml_mul_mat(ctx0, layer.wq, cur);
+        Qcur = build_mm(layer.wq, cur);
     }
 
-    ggml_tensor * kv_cmpr_pe = ggml_mul_mat(ctx0, layer.wkv_a_mqa, cur);
+    ggml_tensor * kv_cmpr_pe = build_mm(layer.wkv_a_mqa, cur);
 
     ggml_tensor * kv_cmpr = ggml_view_2d(ctx0, kv_cmpr_pe, kv_lora_rank, n_tokens,
         ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope), 0);
@@ -518,7 +518,7 @@ ggml_tensor * llama_model_kimi_k3::graph::build_mla_layer(
             ggml_row_size(Qcur->type, n_embd_head_qk_nope));
 
         q_nope = ggml_permute(ctx0, q_nope, 0, 2, 1, 3);
-        ggml_tensor * q_nope_absorbed = ggml_mul_mat(ctx0, layer.wk_b, q_nope);
+        ggml_tensor * q_nope_absorbed = build_mm(layer.wk_b, q_nope);
         q_nope_absorbed = ggml_permute(ctx0, q_nope_absorbed, 0, 2, 1, 3);
 
         ggml_tensor * Q = ggml_concat(ctx0, q_nope_absorbed, q_pe, 0);
@@ -530,7 +530,7 @@ ggml_tensor * llama_model_kimi_k3::graph::build_mla_layer(
         out = build_attn(inp_attn_k, nullptr, NULL, nullptr, Q, K, V, nullptr, nullptr, layer.wv_b, kq_scale, il);
     } else {
         ggml_tensor * Q = ggml_reshape_3d(ctx0, Qcur, n_embd_head_k_mla, n_head, n_tokens);
-        ggml_tensor * kv = ggml_mul_mat(ctx0, layer.wkv_b, kv_cmpr);
+        ggml_tensor * kv = build_mm(layer.wkv_b, kv_cmpr);
         const int64_t kv_per_head = n_embd_head_qk_nope + n_embd_head_v_mla;
 
         ggml_tensor * k_nope = ggml_view_3d(ctx0, kv, n_embd_head_qk_nope, n_head, n_tokens,
@@ -547,12 +547,12 @@ ggml_tensor * llama_model_kimi_k3::graph::build_mla_layer(
 
     // K3: attn_output *= sigmoid(g_proj(x)), then o_proj
     if (layer.wqkv_gate) {
-        ggml_tensor * g = ggml_sigmoid(ctx0, ggml_mul_mat(ctx0, layer.wqkv_gate, inp_gate));
+        ggml_tensor * g = ggml_sigmoid(ctx0, build_mm(layer.wqkv_gate, inp_gate));
         out = ggml_mul(ctx0, out, g);
         cb(out, "mla_gated", il);
     }
 
-    out = ggml_mul_mat(ctx0, layer.wo, out);
+    out = build_mm(layer.wo, out);
     cb(out, "mla_out", il);
 
     return out;
@@ -569,12 +569,12 @@ ggml_tensor * llama_model_kimi_k3::graph::build_latent_moe(
     ggml_tensor * identity = cur;
 
     ggml_tensor * routed_in = layer.ffn_routed_down
-        ? ggml_mul_mat(ctx0, layer.ffn_routed_down, cur)
+        ? build_mm(layer.ffn_routed_down, cur)
         : cur;
 
     // the router scores the full-width input while the experts take the latent one,
     // so the logits are computed here and passed to build_moe_ffn
-    ggml_tensor * logits = ggml_mul_mat(ctx0, layer.ffn_gate_inp, identity);
+    ggml_tensor * logits = build_mm(layer.ffn_gate_inp, identity);
     cb(logits, "ffn_moe_logits", il);
 
     ggml_tensor * moe_out = build_moe_ffn(routed_in,
@@ -596,15 +596,15 @@ ggml_tensor * llama_model_kimi_k3::graph::build_latent_moe(
         moe_out = build_norm(moe_out, layer.ffn_routed_norm, NULL, LLM_NORM_RMS, il);
     }
     if (layer.ffn_routed_up) {
-        moe_out = ggml_mul_mat(ctx0, layer.ffn_routed_up, moe_out);
+        moe_out = build_mm(layer.ffn_routed_up, moe_out);
     }
     GGML_UNUSED(n_embd_latent);
 
     if (layer.ffn_gate_shexp) {
-        ggml_tensor * g = ggml_mul_mat(ctx0, layer.ffn_gate_shexp, identity);
-        ggml_tensor * u = ggml_mul_mat(ctx0, layer.ffn_up_shexp,   identity);
+        ggml_tensor * g = build_mm(layer.ffn_gate_shexp, identity);
+        ggml_tensor * u = build_mm(layer.ffn_up_shexp,   identity);
         ggml_tensor * sh = kimi_k3_situ(ctx0, g, u, hparams.situ_beta, hparams.situ_linear_beta);
-        sh = ggml_mul_mat(ctx0, layer.ffn_down_shexp, sh);
+        sh = build_mm(layer.ffn_down_shexp, sh);
         cb(sh, "ffn_shexp", il);
         moe_out = ggml_add(ctx0, moe_out, sh);
     }

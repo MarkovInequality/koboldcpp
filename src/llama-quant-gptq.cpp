@@ -2,7 +2,9 @@
 
 #include <cmath>
 #include <cstring>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 
 // x86 builds without AVX2 in their baseline (llama.o isn't built with -march) get an AVX2+FMA clone of
 // the fp64 kernels, picked at run time
@@ -19,6 +21,83 @@
 #define GPTQ_NB 128 // Cholesky panel width
 #define GPTQ_NC 256 // columns per panel-solve task and per trailing-update block
 #define GPTQ_MC 64  // rows per trailing-update task
+#define GPTQ_TR 64  // rows per task of the triangular inverse
+#define GPTQ_KC 256 // reduction tile of the triangular inverse
+
+// threads kept across the parallel loops of one factorization, which has hundreds of them
+class gptq_pool {
+public:
+    explicit gptq_pool(int nthread) {
+        for (int t = 1; t < nthread; ++t) {
+            threads.emplace_back([this] { worker(); });
+        }
+    }
+
+    ~gptq_pool() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            quit = true;
+        }
+        start.notify_all();
+        for (auto & t : threads) {
+            t.join();
+        }
+    }
+
+    // fn(r) for r in [0, n), taken in order by all the threads; returns when they are done
+    template <typename F>
+    void run(int64_t n, F && fn) {
+        const std::function<void(int64_t)> f = fn;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            job   = &f;
+            count = n;
+            next  = 0;
+            busy  = (int) threads.size();
+            ++generation;
+        }
+        start.notify_all();
+        work();
+        std::unique_lock<std::mutex> lock(mutex);
+        done.wait(lock, [&] { return busy == 0; });
+    }
+
+private:
+    void work() {
+        for (int64_t r; (r = next++) < count; ) {
+            (*job)(r);
+        }
+    }
+
+    void worker() {
+        uint64_t seen = 0;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                start.wait(lock, [&] { return quit || generation != seen; });
+                if (quit) {
+                    return;
+                }
+                seen = generation;
+            }
+            work();
+            std::lock_guard<std::mutex> lock(mutex);
+            if (--busy == 0) {
+                done.notify_one();
+            }
+        }
+    }
+
+    std::vector<std::thread> threads;
+    std::mutex               mutex;
+    std::condition_variable  start, done;
+    const std::function<void(int64_t)> * job = nullptr;
+    int64_t                  count = 0;
+    std::atomic<int64_t>     next { 0 };
+    uint64_t                 generation = 0;
+    int                      busy = 0;
+    bool                     quit = false;
+};
 
 size_t llama_gptq_packed_bytes(int64_t n) {
     return sizeof(float)*(size_t) n*(n + 1)/2;
@@ -181,9 +260,7 @@ static void gptq_update_avx2(double * A, int64_t ld, int64_t jend, int64_t k1, i
 }
 #endif
 
-// with augmented, A is n x 2n (row stride 2n) holding [B | I]: the right half becomes W^-T for B = W^T W. W^-T is lower
-// triangular, so at the panel [k0, k1) only its columns below k1 are nonzero and updated.
-static bool gptq_cholesky(double * A, int64_t n, std::vector<std::thread> & workers, int nthread, bool augmented = false) {
+static bool gptq_cholesky(double * A, int64_t n, gptq_pool & pool) {
     auto panel  = gptq_panel_default;
     auto update = gptq_update_default;
 #ifdef GPTQ_AVX2_CLONE
@@ -193,37 +270,135 @@ static bool gptq_cholesky(double * A, int64_t n, std::vector<std::thread> & work
     }
 #endif
 
-    const int64_t ld = augmented ? 2*n : n;
-    std::vector<double> pack((size_t) GPTQ_NB*(ld + 8));
+    std::vector<double> pack((size_t) GPTQ_NB*(n + 8));
 
     for (int64_t k0 = 0; k0 < n; k0 += GPTQ_NB) {
         const int64_t k1 = std::min<int64_t>(n, k0 + GPTQ_NB);
-        if (!gptq_chol_diag(A, ld, k0, k1)) {
+        if (!gptq_chol_diag(A, n, k0, k1)) {
             return false;
         }
-        const int64_t jend = augmented ? n + k1 : n;
-        if (k1 == jend) {
+        if (k1 == n) {
             break;
         }
         const int64_t nb = k1 - k0;
-        llama_parallel_rows((jend - k1 + GPTQ_NC - 1)/GPTQ_NC, workers, nthread, [&](int64_t t) {
+        pool.run((n - k1 + GPTQ_NC - 1)/GPTQ_NC, [&](int64_t t) {
             const int64_t j0 = k1 + t*GPTQ_NC;
-            panel(A, ld, k0, k1, j0, std::min<int64_t>(jend, j0 + GPTQ_NC), pack.data());
+            panel(A, n, k0, k1, j0, std::min<int64_t>(n, j0 + GPTQ_NC), pack.data());
         });
-        llama_parallel_rows((n - k1 + GPTQ_MC - 1)/GPTQ_MC, workers, nthread, [&](int64_t t) {
+        pool.run((n - k1 + GPTQ_MC - 1)/GPTQ_MC, [&](int64_t t) {
             const int64_t i0 = k1 + t*GPTQ_MC;
-            update(A, ld, jend, k1, nb, pack.data(), i0, std::min<int64_t>(n, i0 + GPTQ_MC));
+            update(A, n, n, k1, nb, pack.data(), i0, std::min<int64_t>(n, i0 + GPTQ_MC));
         });
     }
     return true;
 }
 
-bool llama_gptq_factor(const float * v, int64_t n, uint64_t seed, float damp, std::vector<float> & U,
-                       std::vector<std::thread> & workers, int nthread) {
+// ====================== blocked in-place inverse of an upper triangular W, X = W^-1, one block column [j0, j0 + jb) at
+// a time: X12 = -X11*W12*W22^-1 by rows (a product with the finished X11, then a solve with W22), then X22 = W22^-1
+
+// rows [i0, i1) of X12; bpack holds W12 as bpack[(g*j0 + k)*8 + l] = W12[k][8*g + l], w22t = W22^T (jb x jb)
+static GPTQ_INLINE void gptq_trtri_rows_body(double * A, int64_t n, int64_t j0, int64_t jb, const double * bpack,
+                                             const double * w22t, int64_t i0, int64_t i1) {
+    double c[GPTQ_TR*GPTQ_NB] = { 0.0 };
+    double apack[GPTQ_KC*8];
+    for (int64_t kt = i0; kt < j0; kt += GPTQ_KC) {
+        const int64_t kc = std::min<int64_t>(GPTQ_KC, j0 - kt);
+        for (int64_t r0 = i0; r0 < i1; r0 += 4) {
+            const int nr = (int) std::min<int64_t>(4, i1 - r0);
+            for (int64_t p = 0; p < kc; ++p) {
+                for (int r = 0; r < 4; ++r) {
+                    const int64_t i = r0 + r;
+                    apack[p*8 + r] = r < nr && kt + p >= i ? A[(size_t) i*n + kt + p] : 0.0;
+                }
+            }
+            for (int64_t g = 0; g*8 < jb; ++g) {
+                gptq_kernel_4x8(apack, bpack + ((size_t) g*j0 + kt)*8, kc, c + (r0 - i0)*GPTQ_NB + 8*g, GPTQ_NB, nr,
+                                (int) std::min<int64_t>(8, jb - 8*g));
+            }
+        }
+    }
+    for (int64_t i = i0; i < i1; ++i) {
+        const double * ci = c + (i - i0)*GPTQ_NB;
+        double       * xi = A + (size_t) i*n + j0;
+        for (int64_t q = 0; q < jb; ++q) {
+            const double * wq = w22t + q*jb;
+            double s = ci[q];
+            for (int64_t p = 0; p < q; ++p) {
+                s -= xi[p]*wq[p];
+            }
+            xi[q] = s/wq[q];
+        }
+    }
+}
+
+static void gptq_trtri_rows_default(double * A, int64_t n, int64_t j0, int64_t jb, const double * bpack, const double * w22t, int64_t i0, int64_t i1) {
+    gptq_trtri_rows_body(A, n, j0, jb, bpack, w22t, i0, i1);
+}
+
+#ifdef GPTQ_AVX2_CLONE
+__attribute__((target("avx2,fma")))
+static void gptq_trtri_rows_avx2(double * A, int64_t n, int64_t j0, int64_t jb, const double * bpack, const double * w22t, int64_t i0, int64_t i1) {
+    gptq_trtri_rows_body(A, n, j0, jb, bpack, w22t, i0, i1);
+}
+#endif
+
+static void gptq_trtri(double * A, int64_t n, gptq_pool & pool) {
+    auto rows = gptq_trtri_rows_default;
+#ifdef GPTQ_AVX2_CLONE
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+        rows = gptq_trtri_rows_avx2;
+    }
+#endif
+
+    std::vector<double> bpack, w22t;
+    for (int64_t j0 = 0; j0 < n; j0 += GPTQ_NB) {
+        const int64_t jb = std::min<int64_t>(GPTQ_NB, n - j0);
+        if (j0 > 0) {
+            const int64_t ng = (jb + 7)/8;
+            bpack.resize((size_t) ng*j0*8);
+            pool.run((j0 + 255)/256, [&](int64_t t) {
+                for (int64_t k = t*256; k < std::min<int64_t>(j0, (t + 1)*256); ++k) {
+                    const double * ak = A + (size_t) k*n + j0;
+                    for (int64_t g = 0; g < ng; ++g) {
+                        for (int64_t l = 0; l < 8; ++l) {
+                            bpack[((size_t) g*j0 + k)*8 + l] = 8*g + l < jb ? ak[8*g + l] : 0.0;
+                        }
+                    }
+                }
+            });
+            w22t.assign((size_t) jb*jb, 0.0);
+            for (int64_t p = 0; p < jb; ++p) {
+                for (int64_t q = p; q < jb; ++q) {
+                    w22t[q*jb + p] = A[(size_t) (j0 + p)*n + j0 + q];
+                }
+            }
+            pool.run((j0 + GPTQ_TR - 1)/GPTQ_TR, [&](int64_t t) {
+                rows(A, n, j0, jb, bpack.data(), w22t.data(), t*GPTQ_TR, std::min<int64_t>(j0, (t + 1)*GPTQ_TR));
+            });
+        }
+        // column q of X22 from the finished columns before it and W22's column q, which it replaces
+        for (int64_t q = 0; q < jb; ++q) {
+            double * aq = A + (size_t) j0*n + j0 + q;
+            const double d = aq[(size_t) q*n];
+            for (int64_t p = 0; p < q; ++p) {
+                const double * xp = A + (size_t) (j0 + p)*n + j0;
+                double s = 0.0;
+                for (int64_t k = p; k < q; ++k) {
+                    s += xp[k]*aq[(size_t) k*n];
+                }
+                aq[(size_t) p*n] = -s/d;
+            }
+            aq[(size_t) q*n] = 1.0/d;
+        }
+    }
+}
+
+bool llama_gptq_factor(const float * v, int64_t n, uint64_t seed, float damp, std::vector<float> & U, int nthread) {
     std::vector<float> vbar;
     if (!(damp >= LLAMA_GPTQ_DAMP_MIN) || !ggml_rht_plan(n, nullptr, nullptr) || !llama_gptq_normalize(v, n, vbar)) {
         return false;
     }
+    gptq_pool pool(nthread);
 
     // H^-1 = R*diag(g)*R^T, g = 1/(vbar + damp); column i is R(g * R^T e_i), stored as row i
     std::vector<double> g(n);
@@ -232,7 +407,7 @@ bool llama_gptq_factor(const float * v, int64_t n, uint64_t seed, float damp, st
     }
     std::unique_ptr<double[]> A(new double[(size_t) n*n]);
     const int64_t cols = 64;
-    llama_parallel_rows((n + cols - 1)/cols, workers, nthread, [&](int64_t t) {
+    pool.run((n + cols - 1)/cols, [&](int64_t t) {
         std::vector<double> e(n);
         for (int64_t i = t*cols; i < std::min(n, (t + 1)*cols); ++i) {
             std::fill(e.begin(), e.end(), 0.0);
@@ -246,12 +421,12 @@ bool llama_gptq_factor(const float * v, int64_t n, uint64_t seed, float damp, st
         }
     });
 
-    if (!gptq_cholesky(A.get(), n, workers, nthread)) {
+    if (!gptq_cholesky(A.get(), n, pool)) {
         return false;
     }
 
     U.resize((size_t) n*(n + 1)/2);
-    llama_parallel_rows(n, workers, nthread, [&](int64_t j) {
+    pool.run(n, [&](int64_t j) {
         float        * uj = U.data() + ((size_t) j*n - (size_t) j*(j - 1)/2);
         const double * aj = A.get() + (size_t) j*n;
         for (int64_t k = j; k < n; ++k) {
@@ -261,85 +436,93 @@ bool llama_gptq_factor(const float * v, int64_t n, uint64_t seed, float damp, st
     return true;
 }
 
-size_t llama_gptq_build_bytes_full(int64_t n) {
-    return sizeof(double)*(size_t) n*2*n + sizeof(float)*(size_t) n*n + llama_gptq_packed_bytes(n);
+// rows of the Gram read at a time
+static int64_t gptq_gram_slab(int64_t n) {
+    return std::max<int64_t>(1, std::min<int64_t>(n, ((int64_t) 8 << 20)/(n*(int64_t) sizeof(float))));
 }
 
-bool llama_gptq_factor_full(const std::function<bool(float *)> & read_gram, int64_t n, uint64_t seed, float alpha, float damp,
-                            std::vector<float> & U, std::vector<std::thread> & workers, int nthread) {
+size_t llama_gptq_build_bytes_full(int64_t n) {
+    return sizeof(double)*(size_t) n*(n + GPTQ_NB) + llama_gptq_packed_bytes(n) + sizeof(float)*(size_t) gptq_gram_slab(n)*n;
+}
+
+bool llama_gptq_factor_full(const llama_gptq_read_gram & read_gram, int64_t n, uint64_t seed, float alpha, float damp,
+                            std::vector<float> & U, int nthread) {
     if (!(damp >= LLAMA_GPTQ_DAMP_MIN) || !(alpha >= 0.0f && alpha <= 1.0f) || !ggml_rht_plan(n, nullptr, nullptr)) {
         return false;
     }
-    const int64_t ld = 2*n;
-    std::unique_ptr<double[]> A(new double[(size_t) n*ld]);
+    gptq_pool pool(nthread);
+    std::unique_ptr<double[]> A(new double[(size_t) n*n]);
     {
-        std::unique_ptr<float[]> G(new float[(size_t) n*n]);
-        if (!read_gram(G.get())) {
-            return false;
-        }
-        double mean = 0.0;
-        for (int64_t i = 0; i < n; ++i) {
-            if (!(G[(size_t) i*n + i] >= 0.0f)) {
+        const int64_t slab = gptq_gram_slab(n);
+        std::vector<float> g((size_t) slab*n);
+        for (int64_t r0 = 0; r0 < n; r0 += slab) {
+            const int64_t nr = std::min(slab, n - r0);
+            if (!read_gram(g.data(), r0, nr)) {
                 return false;
             }
-            mean += G[(size_t) i*n + i];
+            std::copy(g.begin(), g.begin() + nr*n, A.get() + (size_t) r0*n);
         }
-        mean /= n;
-        if (!(mean > 0.0)) {
+    }
+    double mean = 0.0;
+    for (int64_t i = 0; i < n; ++i) {
+        if (!(A[(size_t) i*n + i] >= 0.0)) {
             return false;
         }
-        // (1 - alpha)*G/mean + alpha*diag(G/mean) + damp*I, then its rows rotated: H*R^T
-        llama_parallel_rows(n, workers, nthread, [&](int64_t i) {
-            double       * a = A.get() + (size_t) i*ld;
-            const float  * g = G.get() + (size_t) i*n;
-            for (int64_t j = 0; j < n; ++j) {
-                a[j] = (1.0 - alpha)*g[j]/mean;
-            }
-            a[i] = g[i]/mean + damp;
-            ggml_rht_ref_f64(a, n, seed);
-        });
+        mean += A[(size_t) i*n + i];
     }
+    mean /= n;
+    if (!(mean > 0.0)) {
+        return false;
+    }
+    // (1 - alpha)*G/mean + alpha*diag(G/mean) + damp*I, then its rows rotated: H*R^T
+    pool.run(n, [&](int64_t i) {
+        double * a = A.get() + (size_t) i*n;
+        const double gii = a[i];
+        for (int64_t j = 0; j < n; ++j) {
+            a[j] = (1.0 - alpha)*a[j]/mean;
+        }
+        a[i] = gii/mean + damp;
+        ggml_rht_ref_f64(a, n, seed);
+    });
     // transposed and rotated again: R*H*R^T
-    llama_parallel_rows((n + 63)/64, workers, nthread, [&](int64_t t) {
+    pool.run((n + 63)/64, [&](int64_t t) {
         for (int64_t i = t*64; i < std::min(n, (t + 1)*64); ++i) {
             for (int64_t j = 0; j < i; ++j) {
-                std::swap(A[(size_t) i*ld + j], A[(size_t) j*ld + i]);
+                std::swap(A[(size_t) i*n + j], A[(size_t) j*n + i]);
             }
         }
     });
-    llama_parallel_rows(n, workers, nthread, [&](int64_t i) {
-        ggml_rht_ref_f64(A.get() + (size_t) i*ld, n, seed);
+    pool.run(n, [&](int64_t i) {
+        ggml_rht_ref_f64(A.get() + (size_t) i*n, n, seed);
     });
     // GPTQ needs U with H^-1 = U^T U, U upper. For the index reversal J, J*H*J = W^T W gives H^-1 = V V^T with
-    // V = J*W^-1*J lower triangular, so U = V^T = J*W^-T*J, and W^-T comes out of the Cholesky of [J*H*J | I].
+    // V = J*W^-1*J lower triangular, so U = V^T = J*W^-T*J.
     for (int64_t i = 0; i < n/2; ++i) {
-        double * a = A.get() + (size_t) i*ld;
-        double * b = A.get() + (size_t) (n - 1 - i)*ld;
+        double * a = A.get() + (size_t) i*n;
+        double * b = A.get() + (size_t) (n - 1 - i)*n;
         for (int64_t j = 0; j < n; ++j) {
             std::swap(a[j], b[n - 1 - j]);
         }
     }
     if (n % 2) {
-        double * a = A.get() + (size_t) (n/2)*ld;
+        double * a = A.get() + (size_t) (n/2)*n;
         std::reverse(a, a + n);
     }
-    llama_parallel_rows(n, workers, nthread, [&](int64_t i) {
-        double * a = A.get() + (size_t) i*ld + n;
-        std::fill(a, a + n, 0.0);
-        a[i] = 1.0;
-    });
 
-    if (!gptq_cholesky(A.get(), n, workers, nthread, true)) {
+    if (!gptq_cholesky(A.get(), n, pool)) {
         return false;
     }
+    gptq_trtri(A.get(), n, pool);
 
-    // U[i][j] = W^-T[n-1-i][n-1-j], for j >= i
+    // U[i][j] = W^-1[n-1-j][n-1-i] for j >= i, by tiles of rows of U for contiguous reads of W^-1
     U.resize((size_t) n*(n + 1)/2);
-    llama_parallel_rows(n, workers, nthread, [&](int64_t i) {
-        float        * ui = U.data() + ((size_t) i*n - (size_t) i*(i - 1)/2);
-        const double * y  = A.get() + (size_t) (n - 1 - i)*ld + n;
-        for (int64_t j = i; j < n; ++j) {
-            ui[j - i] = (float) y[n - 1 - j];
+    pool.run((n + 63)/64, [&](int64_t t) {
+        const int64_t i0 = t*64, i1 = std::min(n, i0 + 64);
+        for (int64_t j = i0; j < n; ++j) {
+            const double * x = A.get() + (size_t) (n - 1 - j)*n + n - 1;
+            for (int64_t i = i0; i < std::min(i1, j + 1); ++i) {
+                U[(size_t) i*n - (size_t) i*(i - 1)/2 + (j - i)] = (float) x[-i];
+            }
         }
     });
     return true;
@@ -354,7 +537,7 @@ size_t llama_gptq_cache::bytes() const {
 }
 
 const float * llama_gptq_cache::get(const float * v, int64_t n, uint64_t seed, float damp,
-                                    std::vector<std::thread> & workers, int nthread, status * st) {
+                                    int nthread, status * st) {
     status dummy;
     st = st ? st : &dummy;
 
@@ -381,7 +564,7 @@ const float * llama_gptq_cache::get(const float * v, int64_t n, uint64_t seed, f
     }
 
     entry e { std::move(vbar), {}, n, seed, damp, 0.0f, {} };
-    if (!llama_gptq_factor(v, n, seed, damp, e.U, workers, nthread)) {
+    if (!llama_gptq_factor(v, n, seed, damp, e.U, nthread)) {
         *st = FAILED;
         return nullptr;
     }
@@ -390,8 +573,8 @@ const float * llama_gptq_cache::get(const float * v, int64_t n, uint64_t seed, f
     return entries.front().U.data();
 }
 
-const float * llama_gptq_cache::get_full(const std::string & key, const std::function<bool(float *)> & read_gram, int64_t n,
-                                         uint64_t seed, float alpha, float damp, std::vector<std::thread> & workers, int nthread,
+const float * llama_gptq_cache::get_full(const std::string & key, const llama_gptq_read_gram & read_gram, int64_t n,
+                                         uint64_t seed, float alpha, float damp, int nthread,
                                          status * st) {
     status dummy;
     st = st ? st : &dummy;
@@ -418,7 +601,7 @@ const float * llama_gptq_cache::get_full(const std::string & key, const std::fun
     }
 
     entry e { {}, key, n, seed, damp, alpha, {} };
-    if (!llama_gptq_factor_full(read_gram, n, seed, alpha, damp, e.U, workers, nthread)) {
+    if (!llama_gptq_factor_full(read_gram, n, seed, alpha, damp, e.U, nthread)) {
         *st = FAILED;
         return nullptr;
     }

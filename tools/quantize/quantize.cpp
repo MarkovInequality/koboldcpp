@@ -120,7 +120,7 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
 [[noreturn]]
 static void usage(const char * executable) {
     printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--hadamard] [--hadamard-seed] [--lora]\n", executable);
-    printf("       [--imatrix] [--hessian] [--hessian-alpha] [--include-weights]\n");
+    printf("       [--imatrix] [--hessian] [--hessian-alpha] [--no-gptq] [--gptq-damp] [--include-weights]\n");
     printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--tensor-type-file]\n");
     printf("       [--prune-layers] [--keep-split] [--override-kv] [--dry-run] [--max-buffer-size]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
@@ -154,6 +154,11 @@ static void usage(const char * executable) {
     printf("  --hessian-alpha A\n");
     printf("                                      with --hessian, shrink the Grams toward their diagonals: (1-A) G + A diag(G)\n");
     printf("                                      (default 0.1; 0 is the full Gram, 1 gives --imatrix's GPTQ)\n");
+    printf("  --no-gptq\n");
+    printf("                                      HQ tensors ignore the imatrix and the hessian and use nearest-neighbour rounding\n");
+    printf("  --gptq-damp D\n");
+    printf("                                      GPTQ damping, relative to the mean of the Hessian's diagonal (default 0.01,\n");
+    printf("                                      at least 0.001)\n");
     printf("  --include-weights tensor_name\n");
     printf("                                      use importance matrix for this/these tensor(s)\n");
     printf("  --exclude-weights tensor_name\n");
@@ -183,7 +188,9 @@ static void usage(const char * executable) {
     printf("                                      example: quantize_gguf --dry-run model-f32.gguf Q4_K\n");
     printf("  --max-buffer-size MiB\n");
     printf("                                      max amount of tensor rows kept in memory while quantizing one tensor (default: 8192)\n");
-    printf("                                      lower it to quantize models with very large tensors on a machine with little RAM\n\n");
+    printf("                                      lower it to quantize models with very large tensors on a machine with little RAM;\n");
+    printf("                                      GPTQ factors (their cache and the one being built) get the same size again, so\n");
+    printf("                                      with GPTQ the peak can reach about twice it\n\n");
     printf("note: --include-weights and --exclude-weights cannot be used together\n\n");
     printf("-----------------------------------------------------------------------------\n");
     printf(" allowed quantization types\n");
@@ -211,55 +218,18 @@ static int load_imatrix(const std::string & imatrix_file, std::vector<std::strin
         exit(1);
     }
 
-    for (const auto & [name, entry] : loaded.entries) {
-        auto & e = imatrix_data[name];
-        e.resize(entry.sums.size());
+    common_imatrix_means(loaded, imatrix_data);
 
-        if (!loaded.is_legacy) {
-            // GGUF format: normalize by per-expert counts
-            const int64_t ncounts = entry.counts.size();
-            const int64_t ne0     = (int64_t) entry.sums.size() / ncounts;
-
-            for (int64_t j = 0; j < ncounts; ++j) {
-                const float count = (float) entry.counts[j];
-                if (count > 0.0f) {
-                    for (int64_t i = 0; i < ne0; ++i) {
-                        e[j*ne0 + i] = entry.sums[j*ne0 + i] / count;
-                    }
-                } else {
-                    for (int64_t i = 0; i < ne0; ++i) {
-                        e[j*ne0 + i] = 1;
-                    }
-                }
-            }
-
-            if (getenv("LLAMA_TRACE")) {
-                float max_count = 0.0f;
-                for (int64_t j = 0; j < ncounts; ++j) {
-                    const float count = (float) entry.counts[j];
-                    if (count > max_count) {
-                        max_count = count;
-                    }
-                }
+    if (getenv("LLAMA_TRACE")) {
+        for (const auto & [name, entry] : loaded.entries) {
+            const int size = int(imatrix_data[name].size());
+            if (!loaded.is_legacy) {
+                const int64_t max_count = entry.counts.empty() ? 0 : *std::max_element(entry.counts.begin(), entry.counts.end());
                 printf("%s: loaded data (size = %6d, n_tokens = %6d, n_chunks = %6d) for '%s'\n",
-                       __func__, int(e.size()), int(max_count), int(max_count / loaded.chunk_size), name.c_str());
-            }
-        } else {
-            // Legacy format: sums contain (raw/count)*ncall, divide by ncall
-            const int64_t ncall = entry.counts.empty() ? 0 : entry.counts[0];
-            if (ncall > 0) {
-                for (size_t i = 0; i < entry.sums.size(); ++i) {
-                    e[i] = entry.sums[i] / ncall;
-                }
+                       __func__, size, int(max_count), int(max_count / loaded.chunk_size), name.c_str());
             } else {
-                for (size_t i = 0; i < entry.sums.size(); ++i) {
-                    e[i] = entry.sums[i];
-                }
-            }
-
-            if (getenv("LLAMA_TRACE")) {
                 printf("%s: loaded data (size = %6d, ncall = %6d) for '%s'\n",
-                       __func__, int(e.size()), int(ncall), name.c_str());
+                       __func__, size, int(entry.counts.empty() ? 0 : entry.counts[0]), name.c_str());
             }
         }
     }
@@ -523,6 +493,18 @@ int llama_quantize(int argc, char ** argv) {
             params.hessian_alpha = strtof(argv[++arg_idx], &end);
             if (*end != '\0' || !(params.hessian_alpha >= 0.0f && params.hessian_alpha <= 1.0f)) {
                 fprintf(stderr, "%s: invalid --hessian-alpha '%s'\n", __func__, argv[arg_idx]);
+                return 1;
+            }
+        } else if (strcmp(argv[arg_idx], "--no-gptq") == 0) {
+            params.hq_gptq = false;
+        } else if (strcmp(argv[arg_idx], "--gptq-damp") == 0) {
+            if (arg_idx == argc-1) {
+                usage(argv[0]);
+            }
+            char * end = nullptr;
+            params.hq_gptq_damp = strtof(argv[++arg_idx], &end);
+            if (*end != '\0' || !(params.hq_gptq_damp >= 0.001f)) {
+                fprintf(stderr, "%s: invalid --gptq-damp '%s' (needs a number of at least 0.001)\n", __func__, argv[arg_idx]);
                 return 1;
             }
         } else if (strcmp(argv[arg_idx], "--include-weights") == 0) {

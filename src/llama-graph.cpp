@@ -1511,6 +1511,13 @@ ggml_tensor * llm_graph_context::build_cvec(
     return cvec->apply_to(ctx0, cur, il);
 }
 
+// the rotation spans a stored row, so a view of a rotated weight must keep whole rows
+static bool llm_graph_keeps_rows(const ggml_tensor * w) {
+    const ggml_tensor * root = w->view_src ? w->view_src : w;
+    return w->ne[0] == root->ne[0] && w->nb[0] == root->nb[0] && w->nb[1] % root->nb[1] == 0 &&
+           w->view_offs % root->nb[1] == 0;
+}
+
 ggml_tensor * llm_graph_context::rotate_input_if_rotated(ggml_tensor * w, ggml_tensor * cur, bool id) const {
     if (cparams.collect_mm_inputs) {
         res->mm_inputs.push_back({ cur, w, id });
@@ -1526,6 +1533,9 @@ ggml_tensor * llm_graph_context::rotate_input_if_rotated(ggml_tensor * w, ggml_t
     }
     if (!owner) {
         return cur;
+    }
+    if (!llm_graph_keeps_rows(w)) {
+        throw std::runtime_error(format("Hadamard-rotated weight %s is used through a view that splits its stored rows", w->name));
     }
 
     auto & cur_rot = hadamard_rot_cache[{ cur, owner->hadamard_seed }];
@@ -1545,7 +1555,7 @@ static bool llm_graph_is_view_op(ggml_op op) {
 
 // A rotated weight stores W*R^T, so a GEMM with it is only W*x if its input is R*x, and anything
 // else that reads or writes it is silently wrong. This also catches model code that bypasses
-// build_lora_mm / rotate_input_if_rotated.
+// build_mm / build_lora_mm.
 void llm_graph_check_hadamard_rotation(ggml_cgraph * gf, const llama_model & model) {
     if (model.rotated_tensors.empty()) {
         return;
@@ -1569,6 +1579,10 @@ void llm_graph_check_hadamard_rotation(ggml_cgraph * gf, const llama_model & mod
                 throw std::runtime_error(format("Hadamard-rotated weight %s is used by %s (%s) - only a GEMM with a "
                     "rotated input can use it", w->name, node->name, ggml_op_desc(node)));
             }
+            if (!llm_graph_keeps_rows(w)) {
+                throw std::runtime_error(format("Hadamard-rotated weight %s is multiplied through a view that splits its "
+                    "stored rows (%s)", w->name, node->name));
+            }
 
             const ggml_tensor * x = node->src[1];
             while (x && (x->op == GGML_OP_RESHAPE || x->op == GGML_OP_VIEW)) {
@@ -1582,10 +1596,18 @@ void llm_graph_check_hadamard_rotation(ggml_cgraph * gf, const llama_model & mod
             if (!x || x->op != GGML_OP_RHT || x->ne[0] != w->ne[0] || seed != model.hadamard_seed) {
                 throw std::runtime_error(format("Hadamard-rotated weight %s is multiplied by %s, which is not its input "
                     "rotated by RHT(n = %" PRId64 ", seed = %" PRIu64 ") - this model graph does not route the weight "
-                    "through build_lora_mm / rotate_input_if_rotated", w->name, node->src[1]->name, w->ne[0], model.hadamard_seed));
+                    "through build_mm / build_lora_mm", w->name, node->src[1]->name, w->ne[0], model.hadamard_seed));
             }
         }
     }
+}
+
+ggml_tensor * llm_graph_context::build_mm(ggml_tensor * w, ggml_tensor * cur) const {
+    return ggml_mul_mat(ctx0, w, rotate_input_if_rotated(w, cur));
+}
+
+ggml_tensor * llm_graph_context::build_mm_id(ggml_tensor * w, ggml_tensor * cur, ggml_tensor * ids) const {
+    return ggml_mul_mat_id(ctx0, w, rotate_input_if_rotated(w, cur, true), ids);
 }
 
 ggml_tensor * llm_graph_context::build_lora_mm(
@@ -2680,7 +2702,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             // It's preferable to do the calculation as a matrix-matrix multiplication with n_tokens in dimension 1.
             // The permutations are noops and only change how the tensor data is interpreted.
             cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
-            cur = ggml_mul_mat(ctx0, v_mla, rotate_input_if_rotated(v_mla, cur));
+            cur = build_mm(v_mla, cur);
             cb(cur, "fattn_mla", il);
             cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
             cur = ggml_cont(ctx0, cur); // Needed because ggml_reshape_2d expects contiguous inputs.
@@ -2738,7 +2760,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
         if (v_mla) {
-            kqv = ggml_mul_mat(ctx0, v_mla, kqv);
+            kqv = build_mm(v_mla, kqv);
             cb(kqv, "kqv_mla", il);
         }
 
@@ -3679,13 +3701,13 @@ void llm_graph_context::build_dense_out(
     GGML_ASSERT(cur != nullptr && "missing t_embd_pooled/t_embd");
 
     if (dense_2) {
-        cur = ggml_mul_mat(ctx0, dense_2, rotate_input_if_rotated(dense_2, cur));
+        cur = build_mm(dense_2, cur);
     }
     if (dense_2_b) {
         cur = ggml_add(ctx0, cur, dense_2_b);
     }
     if (dense_3) {
-        cur = ggml_mul_mat(ctx0, dense_3, rotate_input_if_rotated(dense_3, cur));
+        cur = build_mm(dense_3, cur);
     }
     cb(cur, "result_embd_pooled", -1);
     res->t_embd_pooled = cur;
@@ -3750,7 +3772,7 @@ void llm_graph_context::build_pooling(
                 // classification head
                 // https://github.com/huggingface/transformers/blob/5af7d41e49bbfc8319f462eb45253dcb3863dfb7/src/transformers/models/roberta/modeling_roberta.py#L1566
                 if (cls) {
-                    cur = ggml_mul_mat(ctx0, cls, rotate_input_if_rotated(cls, cur));
+                    cur = build_mm(cls, cur);
                     if (cls_b) {
                         cur = ggml_add(ctx0, cur, cls_b);
                     }
@@ -3770,7 +3792,7 @@ void llm_graph_context::build_pooling(
                 // Single layer classification head (direct projection)
                 // https://github.com/huggingface/transformers/blob/f4fc42216cd56ab6b68270bf80d811614d8d59e4/src/transformers/models/bert/modeling_bert.py#L1476
                 if (cls_out) {
-                    cur = ggml_mul_mat(ctx0, cls_out, rotate_input_if_rotated(cls_out, cur));
+                    cur = build_mm(cls_out, cur);
                     if (cls_out_b) {
                         cur = ggml_add(ctx0, cur, cls_out_b);
                     }

@@ -1,12 +1,14 @@
 // Tests for GPTQ error feedback on the Hadamard-rotated (HQ) types: the factor of H^-1 (from an imatrix or a
 // full Gram), its cache, and the encoder.
 //
-// usage: test-hq-gptq [--quick]    (--quick skips the factor accuracy sweeps up to n = 17408)
+// usage: test-hq-gptq [--quick | --record]
+//   --quick skips the factor accuracy sweeps up to n = 17408; --record prints the hash tables from the current code
 
 #include "ggml.h"
 #include "ggml-quants.h"
 #include "llama-quant-gptq.h"
 
+#include <cctype>
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
@@ -118,7 +120,6 @@ static const int g_nthread = std::max(1u, std::thread::hardware_concurrency());
 
 static void test_factor() {
     printf("factor:\n");
-    std::vector<std::thread> workers;
     const uint64_t seed = 0x48512d524854ull;
     const float damp = LLAMA_GPTQ_DAMP_DEFAULT;
 
@@ -127,7 +128,7 @@ static void test_factor() {
             const std::vector<float> v = make_v(kind, n, 7 + n);
             std::vector<float> U;
             const auto t0 = std::chrono::steady_clock::now();
-            const bool ok = llama_gptq_factor(v.data(), n, seed, damp, U, workers, g_nthread);
+            const bool ok = llama_gptq_factor(v.data(), n, seed, damp, U, g_nthread);
             const double t = seconds_since(t0);
             const double err = ok ? uhu_error(U, v, damp, seed, 3) : 1e30;
             const double bound = 50*ldexp(1.0, -24)*sqrt(kappa(v, damp));
@@ -142,7 +143,7 @@ static void test_factor() {
         const std::vector<float> v = make_v(V_ONE_CHANNEL, n, 1);
         std::vector<float> U;
         const auto t0 = std::chrono::steady_clock::now();
-        const bool ok = llama_gptq_factor(v.data(), n, seed, LLAMA_GPTQ_DAMP_MIN, U, workers, g_nthread);
+        const bool ok = llama_gptq_factor(v.data(), n, seed, LLAMA_GPTQ_DAMP_MIN, U, g_nthread);
         const double t = seconds_since(t0);
         const double err = ok ? uhu_error(U, v, LLAMA_GPTQ_DAMP_MIN, seed, 5) : 1e30;
         const double k = kappa(v, LLAMA_GPTQ_DAMP_MIN);
@@ -158,7 +159,7 @@ static void test_factor() {
         const int64_t n = 1024;
         const std::vector<float> v = make_v(V_CONST, n, 1);
         std::vector<float> U;
-        llama_gptq_factor(v.data(), n, seed, damp, U, workers, g_nthread);
+        llama_gptq_factor(v.data(), n, seed, damp, U, g_nthread);
         const double want = 1.0/sqrt(1.0 + damp);
         double err = 0;
         for (int64_t j = 0; j < n; ++j) {
@@ -175,10 +176,10 @@ static void test_factor() {
         const std::vector<float> v = make_v(V_SPIKE, n, 1), zero(n, 0.0f);
         std::vector<float> neg = v;
         neg[5] = -1.0f;
-        check(!llama_gptq_factor(v.data(), n, seed, 0.0009f, U, workers, g_nthread), "damp 0.0009 is refused");
-        check(!llama_gptq_factor(zero.data(), n, seed, damp, U, workers, g_nthread), "an all-zero v is refused");
-        check(!llama_gptq_factor(neg.data(), n, seed, damp, U, workers, g_nthread), "a v with a negative entry is refused");
-        check(!llama_gptq_factor(v.data(), 1000, seed, damp, U, workers, g_nthread), "a width without an RHT is refused");
+        check(!llama_gptq_factor(v.data(), n, seed, 0.0009f, U, g_nthread), "damp 0.0009 is refused");
+        check(!llama_gptq_factor(zero.data(), n, seed, damp, U, g_nthread), "an all-zero v is refused");
+        check(!llama_gptq_factor(neg.data(), n, seed, damp, U, g_nthread), "a v with a negative entry is refused");
+        check(!llama_gptq_factor(v.data(), 1000, seed, damp, U, g_nthread), "a width without an RHT is refused");
         check(U.size() == 3 && U[0] == 7.0f, "... and U is left untouched");
     }
 
@@ -186,8 +187,8 @@ static void test_factor() {
         const int64_t n = 2048;
         const std::vector<float> v = make_v(V_ZEROS, n, 9);
         std::vector<float> U1, U8;
-        llama_gptq_factor(v.data(), n, seed, damp, U1, workers, 1);
-        llama_gptq_factor(v.data(), n, seed, damp, U8, workers, 8);
+        llama_gptq_factor(v.data(), n, seed, damp, U1, 1);
+        llama_gptq_factor(v.data(), n, seed, damp, U8, 8);
         check(U1.size() == U8.size() && memcmp(U1.data(), U8.data(), U1.size()*sizeof(float)) == 0,
               "1 and 8 threads give bitwise-identical U");
     }
@@ -281,7 +282,6 @@ static double m_bound(int64_t n, const std::function<void(std::vector<double> &)
 
 static void test_factor_full(bool quick) {
     printf("factor from a full Gram:\n");
-    std::vector<std::thread> workers;
     const uint64_t seed = 0x48512d524854ull;
     const float damp = LLAMA_GPTQ_DAMP_DEFAULT;
 
@@ -291,10 +291,10 @@ static void test_factor_full(bool quick) {
         std::vector<float> G((size_t) n*n, 0.0f);
         for (int64_t i = 0; i < n; ++i) G[(size_t) i*n + i] = v[i];
         std::vector<float> Ud, Uf, Ua;
-        llama_gptq_factor(v.data(), n, seed, damp, Ud, workers, g_nthread);
-        const auto read = [&](float * dst) { memcpy(dst, G.data(), G.size()*sizeof(float)); return true; };
-        const bool ok = llama_gptq_factor_full(read, n, seed, 0.0f, damp, Uf, workers, g_nthread);
-        const bool oka = llama_gptq_factor_full(read, n, seed, 1.0f, damp, Ua, workers, g_nthread);
+        llama_gptq_factor(v.data(), n, seed, damp, Ud, g_nthread);
+        const auto read = [&](float * dst, int64_t r0, int64_t nr) { memcpy(dst, G.data() + r0*n, nr*n*sizeof(float)); return true; };
+        const bool ok = llama_gptq_factor_full(read, n, seed, 0.0f, damp, Uf, g_nthread);
+        const bool oka = llama_gptq_factor_full(read, n, seed, 1.0f, damp, Ua, g_nthread);
         double err = 0, mx = 0, erra = 0;
         for (size_t i = 0; i < Ud.size(); ++i) {
             mx   = std::max(mx, (double) fabs(Ud[i]));
@@ -313,9 +313,9 @@ static void test_factor_full(bool quick) {
         const std::vector<float> G = random_gram(n, 256, 11);
         std::vector<float> v(n), Ud, Ua;
         for (int64_t i = 0; i < n; ++i) v[i] = G[(size_t) i*n + i];
-        llama_gptq_factor(v.data(), n, seed, damp, Ud, workers, g_nthread);
-        const auto read = [&](float * dst) { memcpy(dst, G.data(), G.size()*sizeof(float)); return true; };
-        llama_gptq_factor_full(read, n, seed, 1.0f, damp, Ua, workers, g_nthread);
+        llama_gptq_factor(v.data(), n, seed, damp, Ud, g_nthread);
+        const auto read = [&](float * dst, int64_t r0, int64_t nr) { memcpy(dst, G.data() + r0*n, nr*n*sizeof(float)); return true; };
+        llama_gptq_factor_full(read, n, seed, 1.0f, damp, Ua, g_nthread);
         double err = 0, mx = 0;
         for (size_t i = 0; i < Ud.size(); ++i) {
             mx  = std::max(mx, (double) fabs(Ud[i]));
@@ -332,8 +332,8 @@ static void test_factor_full(bool quick) {
                 for (float dmp : { LLAMA_GPTQ_DAMP_MIN, damp, 0.1f }) {
                     const std::vector<float> G = random_gram(n, m, 100 + n + m);
                     std::vector<float> U;
-                    const auto read = [&](float * dst) { memcpy(dst, G.data(), G.size()*sizeof(float)); return true; };
-                    const bool ok = llama_gptq_factor_full(read, n, seed, alpha, dmp, U, workers, g_nthread);
+                    const auto read = [&](float * dst, int64_t r0, int64_t nr) { memcpy(dst, G.data() + r0*n, nr*n*sizeof(float)); return true; };
+                    const bool ok = llama_gptq_factor_full(read, n, seed, alpha, dmp, U, g_nthread);
                     const auto apply_m = gram_m(G, n, alpha, dmp);
                     const double err = ok ? uhu_error_m(U, n, apply_m, seed, 3) : 1e30;
                     const double bound = m_bound(n, apply_m, dmp);
@@ -349,32 +349,46 @@ static void test_factor_full(bool quick) {
     {
         const int64_t n = 2048;
         const std::vector<float> G = random_gram(n, 512, 5);
-        const auto read = [&](float * dst) { memcpy(dst, G.data(), G.size()*sizeof(float)); return true; };
+        const auto read = [&](float * dst, int64_t r0, int64_t nr) { memcpy(dst, G.data() + r0*n, nr*n*sizeof(float)); return true; };
         std::vector<float> U1, U8;
-        llama_gptq_factor_full(read, n, seed, 0.25f, damp, U1, workers, 1);
-        llama_gptq_factor_full(read, n, seed, 0.25f, damp, U8, workers, 8);
+        llama_gptq_factor_full(read, n, seed, 0.25f, damp, U1, 1);
+        llama_gptq_factor_full(read, n, seed, 0.25f, damp, U8, 8);
         check(U1.size() == U8.size() && memcmp(U1.data(), U8.data(), U1.size()*sizeof(float)) == 0,
               "1 and 8 threads give bitwise-identical U");
 
         std::vector<float> U(3, 7.0f), bad = G;
         bad[7*n + 7] = -1.0f;
-        const auto read_bad  = [&](float * dst) { memcpy(dst, bad.data(), bad.size()*sizeof(float)); return true; };
-        const auto read_fail = [&](float *) { return false; };
-        check(!llama_gptq_factor_full(read, n, seed, 0.0f, 0.0009f, U, workers, g_nthread), "damp 0.0009 is refused");
-        check(!llama_gptq_factor_full(read, n, seed, 1.5f, damp, U, workers, g_nthread), "alpha 1.5 is refused");
-        check(!llama_gptq_factor_full(read_bad, n, seed, 0.0f, damp, U, workers, g_nthread), "a negative diagonal is refused");
-        check(!llama_gptq_factor_full(read_fail, n, seed, 0.0f, damp, U, workers, g_nthread), "a failed read is refused");
+        const auto read_bad  = [&](float * dst, int64_t r0, int64_t nr) { memcpy(dst, bad.data() + r0*n, nr*n*sizeof(float)); return true; };
+        const auto read_fail = [&](float *, int64_t, int64_t) { return false; };
+        const auto read_fail2 = [&](float * dst, int64_t r0, int64_t nr) { return r0 == 0 && read(dst, r0, nr); };
+        std::vector<std::pair<int64_t, int64_t>> slabs;
+        const auto read_log = [&](float * dst, int64_t r0, int64_t nr) { slabs.emplace_back(r0, nr); return read(dst, r0, nr); };
+        std::vector<float> Ul;
+        llama_gptq_factor_full(read_log, n, seed, 0.25f, damp, Ul, g_nthread);
+        bool in_order = slabs.size() > 1 && slabs[0].first == 0;
+        for (size_t k = 1; k < slabs.size(); ++k) {
+            in_order &= slabs[k].first == slabs[k - 1].first + slabs[k - 1].second;
+        }
+        in_order &= slabs.back().first + slabs.back().second == n;
+        check(in_order && Ul == U1, "the Gram is read in row slabs, each row once and in order");
+        check(!llama_gptq_factor_full(read, n, seed, 0.0f, 0.0009f, U, g_nthread), "damp 0.0009 is refused");
+        check(!llama_gptq_factor_full(read, n, seed, 1.5f, damp, U, g_nthread), "alpha 1.5 is refused");
+        check(!llama_gptq_factor_full(read_bad, n, seed, 0.0f, damp, U, g_nthread), "a negative diagonal is refused");
+        check(!llama_gptq_factor_full(read_fail, n, seed, 0.0f, damp, U, g_nthread), "a failed read is refused");
+        check(!llama_gptq_factor_full(read_fail2, n, seed, 0.0f, damp, U, g_nthread), "... so is one that fails after the first slab");
         check(U.size() == 3 && U[0] == 7.0f, "... and U is left untouched");
+
+        check(llama_gptq_build_bytes_full(17408) < (size_t) (10.5*17408*17408), "building a factor from a full Gram takes about 10 n^2 bytes");
 
         llama_gptq_cache cache(llama_gptq_build_bytes_full(n)*2);
         llama_gptq_cache::status st;
-        const float * a = cache.get_full("x", read, n, seed, 0.25f, damp, workers, g_nthread, &st);
+        const float * a = cache.get_full("x", read, n, seed, 0.25f, damp, g_nthread, &st);
         check(a && st == llama_gptq_cache::BUILT && memcmp(a, U1.data(), U1.size()*sizeof(float)) == 0, "cache: built, equals the factor");
-        const float * b = cache.get_full("x", read_fail, n, seed, 0.25f, damp, workers, g_nthread, &st);
+        const float * b = cache.get_full("x", read_fail, n, seed, 0.25f, damp, g_nthread, &st);
         check(b == a && st == llama_gptq_cache::HIT, "cache: the same key, alpha and damp hit without reading");
-        cache.get_full("x", read, n, seed, 0.5f, damp, workers, g_nthread, &st);
+        cache.get_full("x", read, n, seed, 0.5f, damp, g_nthread, &st);
         check(st == llama_gptq_cache::BUILT, "cache: another alpha rebuilds");
-        cache.get_full("y", read, n, seed, 0.25f, damp, workers, g_nthread, &st);
+        cache.get_full("y", read, n, seed, 0.25f, damp, g_nthread, &st);
         check(st == llama_gptq_cache::BUILT, "cache: another key rebuilds");
     }
 
@@ -387,10 +401,10 @@ static void test_factor_full(bool quick) {
                 u[i] = std::round(24*gauss(s))/8;
                 g[i] = u[i]*u[i] + (float) exp(2*gauss(s));
             }
-            const auto read = [&](float * dst) {
-                for (int64_t i = 0; i < n; ++i) {
+            const auto read = [&](float * dst, int64_t r0, int64_t nr) {
+                for (int64_t i = r0; i < r0 + nr; ++i) {
                     for (int64_t j = 0; j < n; ++j) {
-                        dst[(size_t) i*n + j] = i == j ? g[i] : u[i]*u[j];
+                        dst[(size_t) (i - r0)*n + j] = i == j ? g[i] : u[i]*u[j];
                     }
                 }
                 return true;
@@ -407,7 +421,7 @@ static void test_factor_full(bool quick) {
             };
             std::vector<float> U;
             const auto t0 = std::chrono::steady_clock::now();
-            const bool ok = llama_gptq_factor_full(read, n, seed, 0.0f, damp, U, workers, g_nthread);
+            const bool ok = llama_gptq_factor_full(read, n, seed, 0.0f, damp, U, g_nthread);
             const double t = seconds_since(t0);
             const double err = ok ? uhu_error_m(U, n, apply_m, seed, 9) : 1e30;
             const double bound = m_bound(n, apply_m, damp);
@@ -420,7 +434,6 @@ static void test_factor_full(bool quick) {
 
 static void test_cache() {
     printf("factor cache:\n");
-    std::vector<std::thread> workers;
     const int64_t n = 1024;
     const float damp = LLAMA_GPTQ_DAMP_DEFAULT;
     std::vector<std::vector<float>> vs;
@@ -432,39 +445,39 @@ static void test_cache() {
 
     llama_gptq_cache c(1ull << 30);
     llama_gptq_cache::status st;
-    const float * U0 = c.get(vs[0].data(), n, 1, damp, workers, g_nthread, &st);
+    const float * U0 = c.get(vs[0].data(), n, 1, damp, g_nthread, &st);
     check(U0 && st == llama_gptq_cache::BUILT, "the first input is built");
     std::vector<float> U;
-    llama_gptq_factor(vs[0].data(), n, 1, damp, U, workers, g_nthread);
+    llama_gptq_factor(vs[0].data(), n, 1, damp, U, g_nthread);
     check(memcmp(U0, U.data(), U.size()*sizeof(float)) == 0, "... and equals llama_gptq_factor");
-    check(c.get(v2.data(), n, 1, damp, workers, g_nthread, &st) == U0 && st == llama_gptq_cache::HIT, "2*v hits (same vbar)");
-    c.get(vs[0].data(), n, 2, damp, workers, g_nthread, &st);
+    check(c.get(v2.data(), n, 1, damp, g_nthread, &st) == U0 && st == llama_gptq_cache::HIT, "2*v hits (same vbar)");
+    c.get(vs[0].data(), n, 2, damp, g_nthread, &st);
     check(st == llama_gptq_cache::BUILT, "another seed misses");
-    c.get(vs[0].data(), n, 1, 0.1f, workers, g_nthread, &st);
+    c.get(vs[0].data(), n, 1, 0.1f, g_nthread, &st);
     check(st == llama_gptq_cache::BUILT, "another damp misses");
-    c.get(vs[1].data(), n, 1, damp, workers, g_nthread, &st);
+    c.get(vs[1].data(), n, 1, damp, g_nthread, &st);
     check(st == llama_gptq_cache::BUILT && c.size() == 4, "a new v misses; 4 entries");
-    c.get(vs[0].data(), n, 1, damp, workers, g_nthread, &st);
+    c.get(vs[0].data(), n, 1, damp, g_nthread, &st);
     check(st == llama_gptq_cache::HIT, "the first input still hits");
-    c.get(vs[2].data(), n, 1, damp, workers, g_nthread, &st);
+    c.get(vs[2].data(), n, 1, damp, g_nthread, &st);
     check(c.size() == 4, "the 5th distinct input evicts one");
-    c.get(vs[0].data(), n, 1, damp, workers, g_nthread, &st);
+    c.get(vs[0].data(), n, 1, damp, g_nthread, &st);
     check(st == llama_gptq_cache::HIT, "... the least recently used, not the first input");
-    c.get(vs[0].data(), n, 2, damp, workers, g_nthread, &st);
+    c.get(vs[0].data(), n, 2, damp, g_nthread, &st);
     check(st == llama_gptq_cache::BUILT, "... which was the seed-2 entry");
 
     const std::vector<float> zero(n, 0.0f);
-    check(!c.get(zero.data(), n, 1, damp, workers, g_nthread, &st) && st == llama_gptq_cache::REFUSED, "an all-zero v is refused");
+    check(!c.get(zero.data(), n, 1, damp, g_nthread, &st) && st == llama_gptq_cache::REFUSED, "an all-zero v is refused");
 
     llama_gptq_cache small(llama_gptq_build_bytes(n) - 1);
-    check(!small.get(vs[0].data(), n, 1, damp, workers, g_nthread, &st) && st == llama_gptq_cache::TOO_BIG && small.size() == 0,
+    check(!small.get(vs[0].data(), n, 1, damp, g_nthread, &st) && st == llama_gptq_cache::TOO_BIG && small.size() == 0,
           "memory cap: a factor that can't be built within the cap is refused");
     llama_gptq_cache one(llama_gptq_build_bytes(n) + llama_gptq_packed_bytes(n) - 1);
-    one.get(vs[0].data(), n, 1, damp, workers, g_nthread, &st);
-    one.get(vs[1].data(), n, 1, damp, workers, g_nthread, &st);
+    one.get(vs[0].data(), n, 1, damp, g_nthread, &st);
+    one.get(vs[1].data(), n, 1, damp, g_nthread, &st);
     check(st == llama_gptq_cache::BUILT && one.size() == 1 && one.bytes() == llama_gptq_packed_bytes(n),
           "memory cap: building a second factor evicts the first");
-    one.get(vs[0].data(), n, 1, damp, workers, g_nthread, &st);
+    one.get(vs[0].data(), n, 1, damp, g_nthread, &st);
     check(st == llama_gptq_cache::BUILT, "... so the first is built again");
 }
 
@@ -574,6 +587,61 @@ static const struct { ggml_type type; int64_t n; uint64_t hash; } hq_hashes[] = 
     { GGML_TYPE_HQ6_K,    2048, 0x83103140a87292b7ull },
 };
 
+// GPTQ's output (gptq_hash), recorded before the refactors of plans/hq_audit_fixes_plan.md; same caveat
+static const struct { ggml_type type; int64_t n; uint64_t hash; } hq_gptq_hashes[] = {
+    { GGML_TYPE_HQ4_K,     256, 0x352df265765b299full },
+    { GGML_TYPE_HQ4_K,     768, 0xc21a59f008ed6f9dull },
+    { GGML_TYPE_HQ4_K,    2048, 0x4edcd1259f5f2a91ull },
+    { GGML_TYPE_HQ5_K,     256, 0x60d703e90a6c8071ull },
+    { GGML_TYPE_HQ5_K,     768, 0x5bb6406627550b02ull },
+    { GGML_TYPE_HQ5_K,    2048, 0x5ed14b98618ca694ull },
+    { GGML_TYPE_HQ4_XS,    256, 0x882e74a9e35fbec6ull },
+    { GGML_TYPE_HQ4_XS,    768, 0x4523c26704103b17ull },
+    { GGML_TYPE_HQ4_XS,   2048, 0xb93c2be0ac3bcb3cull },
+    { GGML_TYPE_HQ4_NL,     96, 0x50a993413be0a328ull },
+    { GGML_TYPE_HQ4_NL,    800, 0xb2107f7304e93020ull },
+    { GGML_TYPE_HQ4_NL,   2048, 0xb0b9def8bb708996ull },
+    { GGML_TYPE_HQ3_S,     256, 0x69181ca3e2b33176ull },
+    { GGML_TYPE_HQ3_S,     768, 0xd324b62e03ce6769ull },
+    { GGML_TYPE_HQ3_S,    2048, 0x6109b9b0d6f4fe57ull },
+    { GGML_TYPE_HQ3_XXS,   256, 0x8b10df0ba54c373full },
+    { GGML_TYPE_HQ3_XXS,   768, 0x45ded7352db4247dull },
+    { GGML_TYPE_HQ3_XXS,  2048, 0x2ec02a95091bce14ull },
+    { GGML_TYPE_HQ2_S,     256, 0x2f7a977bb028b8f1ull },
+    { GGML_TYPE_HQ2_S,     768, 0x9a5585fccf4c9ee6ull },
+    { GGML_TYPE_HQ2_S,    2048, 0x4dc8ef276bead820ull },
+    { GGML_TYPE_HQ2_XS,    256, 0x33acf4de4fabb5beull },
+    { GGML_TYPE_HQ2_XS,    768, 0x5714b9c39ed68708ull },
+    { GGML_TYPE_HQ2_XS,   2048, 0x99607e716b335efcull },
+    { GGML_TYPE_HQ2_XXS,   256, 0x1dfe589ed0562f21ull },
+    { GGML_TYPE_HQ2_XXS,   768, 0x7784dc7cf2ac932full },
+    { GGML_TYPE_HQ2_XXS,  2048, 0x1c3b2c6dc9c3860bull },
+    { GGML_TYPE_HQ4_0,      96, 0xd406766003d964c4ull },
+    { GGML_TYPE_HQ4_0,     800, 0x691e118d86a790d6ull },
+    { GGML_TYPE_HQ4_0,    2048, 0x176b715ce83c2a86ull },
+    { GGML_TYPE_HQ4_1,      96, 0x6d71e68c6782fbedull },
+    { GGML_TYPE_HQ4_1,     800, 0x4c71b9fcc01dd1e3ull },
+    { GGML_TYPE_HQ4_1,    2048, 0xc56ce1b86d8aef93ull },
+    { GGML_TYPE_HQ5_0,      96, 0x2ffa0ff7fe73c893ull },
+    { GGML_TYPE_HQ5_0,     800, 0x9194e3c1e1052334ull },
+    { GGML_TYPE_HQ5_0,    2048, 0x2d2377fc3f14e777ull },
+    { GGML_TYPE_HQ5_1,      96, 0xa25977cc68ed4f33ull },
+    { GGML_TYPE_HQ5_1,     800, 0x3e4cbb5005dfb24bull },
+    { GGML_TYPE_HQ5_1,    2048, 0x3ea996c7ac8ac4b1ull },
+    { GGML_TYPE_HQ8_0,      96, 0x88e32be580b967e5ull },
+    { GGML_TYPE_HQ8_0,     800, 0xee5b9df245b62c8aull },
+    { GGML_TYPE_HQ8_0,    2048, 0xaf057949fc2cf263ull },
+    { GGML_TYPE_HQ2_K,     256, 0x43a42ef9118147c6ull },
+    { GGML_TYPE_HQ2_K,     768, 0x81508dd91f5e21e3ull },
+    { GGML_TYPE_HQ2_K,    2048, 0xa35fb620575c359bull },
+    { GGML_TYPE_HQ3_K,     256, 0x78ebe8d61c029eedull },
+    { GGML_TYPE_HQ3_K,     768, 0xab3f95ab3321d2a5ull },
+    { GGML_TYPE_HQ3_K,    2048, 0x1a7fdef05bbf4c67ull },
+    { GGML_TYPE_HQ6_K,     256, 0xab0d6ef5e143b7c2ull },
+    { GGML_TYPE_HQ6_K,     768, 0x38fa364391597ebbull },
+    { GGML_TYPE_HQ6_K,    2048, 0xd35ca220450d33d3ull },
+};
+
 static std::vector<uint8_t> quantize_uniform(ggml_type type, const std::vector<float> & x, int64_t n) {
     const int64_t nrows = (int64_t) x.size()/n;
     std::vector<uint8_t> q(nrows*ggml_row_size(type, n));
@@ -641,23 +709,60 @@ static std::vector<float> gauss_rows(int64_t nrows, int64_t n, uint64_t seed) {
     return x;
 }
 
-static void test_hashes() {
-    printf("quantize_hq output is unchanged (recorded hashes):\n");
+static uint64_t uniform_hash(ggml_type type, int64_t n) {
+    uint64_t hash = 0xcbf29ce484222325ull;
+    for (uint64_t seed = 1; seed <= 3; ++seed) {
+        const std::vector<uint8_t> q = quantize_uniform(type, hash_rows(8, n, seed), n);
+        hash = fnv1a(hash, q.data(), q.size());
+    }
+    return hash;
+}
+
+// the same rows through GPTQ with the diagonal factor of spiky_v(n, 3)
+static uint64_t gptq_hash(ggml_type type, int64_t n) {
+    const std::vector<float> v = spiky_v(n, 3);
+    std::vector<float> U;
+    llama_gptq_factor(v.data(), n, 0x48512d524854ull, LLAMA_GPTQ_DAMP_DEFAULT, U, g_nthread);
+    uint64_t hash = 0xcbf29ce484222325ull;
+    for (uint64_t seed = 1; seed <= 3; ++seed) {
+        const std::vector<uint8_t> q = quantize_gptq(type, hash_rows(8, n, seed), n, U);
+        hash = fnv1a(hash, q.data(), q.size());
+    }
+    return hash;
+}
+
+// prints both tables as recorded below, for a deliberate change of the encoders' output
+static void record_hashes() {
+    for (const auto & [name, fn] : { std::make_pair("hq_hashes", uniform_hash), std::make_pair("hq_gptq_hashes", gptq_hash) }) {
+        printf("%s:\n", name);
+        for (ggml_type type : all_types) {
+            for (int64_t n : widths(type)) {
+                std::string name = ggml_type_name(type);
+                for (char & c : name) c = (char) toupper((unsigned char) c);
+                printf("    { GGML_TYPE_%-8s %5" PRId64 ", 0x%016" PRIx64 "ull },\n", (name + ",").c_str(), n, fn(type, n));
+            }
+        }
+    }
+}
+
+template <typename T>
+static void check_hashes(const char * what, const T & table, uint64_t (*fn)(ggml_type, int64_t)) {
+    printf("%s is unchanged (recorded hashes):\n", what);
     for (ggml_type type : all_types) {
         bool ok = true;
         std::string ns;
-        for (const auto & h : hq_hashes) {
+        for (const auto & h : table) {
             if (h.type != type) continue;
-            uint64_t hash = 0xcbf29ce484222325ull;
-            for (uint64_t seed = 1; seed <= 3; ++seed) {
-                const std::vector<uint8_t> q = quantize_uniform(type, hash_rows(8, h.n, seed), h.n);
-                hash = fnv1a(hash, q.data(), q.size());
-            }
-            ok &= hash == h.hash;
+            ok &= fn(type, h.n) == h.hash;
             ns += (ns.empty() ? "" : ", ") + std::to_string(h.n);
         }
-        check(ok, std::string(ggml_type_name(type)) + ", n = " + ns);
+        check(ok && !ns.empty(), std::string(ggml_type_name(type)) + ", n = " + ns);
     }
+}
+
+static void test_hashes() {
+    check_hashes("quantize_hq output", hq_hashes, uniform_hash);
+    check_hashes("GPTQ output", hq_gptq_hashes, gptq_hash);
 }
 
 static void test_identity(const std::vector<ggml_type> & types) {
@@ -691,7 +796,7 @@ static void test_encoder(const std::vector<ggml_type> & types, double max_ratio)
         const std::vector<float> v = spiky_v(n, 3);
         std::vector<float> vbar, U;
         llama_gptq_normalize(v.data(), n, vbar);
-        llama_gptq_factor(v.data(), n, seed, LLAMA_GPTQ_DAMP_DEFAULT, U, workers, g_nthread);
+        llama_gptq_factor(v.data(), n, seed, LLAMA_GPTQ_DAMP_DEFAULT, U, g_nthread);
 
         const std::vector<float> x = gauss_rows(nrows, n, 11);
         const std::vector<uint8_t> qu = quantize_uniform(type, x, n);
@@ -732,6 +837,10 @@ static void test_encoder(const std::vector<ggml_type> & types, double max_ratio)
 
 int main(int argc, char ** argv) {
     const bool quick = argc > 1 && std::string(argv[1]) == "--quick";
+    if (argc > 1 && std::string(argv[1]) == "--record") {
+        record_hashes();
+        return 0;
+    }
 
     if (!quick) {
         test_factor();

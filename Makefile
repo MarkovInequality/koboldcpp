@@ -285,7 +285,7 @@ $(shell echo '$(NVCCFLAGS) $(CUBLAS_FLAGS) $(HIPFLAGS) $(CUBLAS_CXXFLAGS)' | cmp
 ggml/src/ggml-cuda/%.o: ggml/src/ggml-cuda/%.cu ggml/include/ggml.h ggml/src/ggml-common.h ggml/src/ggml-cuda/common.cuh $(CUDA_FLAGS_STAMP)
 	$(NVCC) $(NVCCFLAGS) $(subst -Ofast,-O3,$(CXXFLAGS)) $(CUBLAS_FLAGS) $(HIPFLAGS) $(CUBLAS_CXXFLAGS) -Wno-pedantic -MMD -MP -c $< -o $@
 -include $(wildcard ggml/src/ggml-cuda/*.d ggml/src/ggml-cuda/template-instances/*.d)
-ggml/src/ggml-cuda/rht.o: ggml/src/ggml-cuda/rht.cuh ggml/src/ggml-cuda/quantize.cuh ggml/src/ggml-hadamard.h ggml/src/ggml-hadamard-tables.h
+ggml/src/ggml-cuda/rht.o: ggml/src/ggml-cuda/rht.cuh ggml/src/ggml-cuda/rht-impl.cuh ggml/src/ggml-cuda/quantize.cuh ggml/src/ggml-hadamard.h ggml/src/ggml-hadamard-tables.h
 ggml-cuda.o: ggml/src/ggml-cuda/ggml-cuda.cu ggml/include/ggml-cuda.h ggml/include/ggml.h ggml/include/ggml-backend.h ggml/src/ggml-backend-impl.h ggml/src/ggml-common.h $(wildcard ggml/src/ggml-cuda/*.cuh) $(CUDA_FLAGS_STAMP)
 	$(NVCC) $(NVCCFLAGS) $(subst -Ofast,-O3,$(CXXFLAGS)) $(CUBLAS_FLAGS) $(HIPFLAGS) $(CUBLAS_CXXFLAGS) -Wno-pedantic -c $< -o $@
 ggml_v2-cuda.o: otherarch/ggml_v2-cuda.cu otherarch/ggml_v2-cuda.h
@@ -702,7 +702,7 @@ ggml-vulkan-shaders-noext.o: ggml/src/ggml-vulkan-shaders-noext.cpp ggml/include
 # intermediate objects
 llama.o: src/llama.cpp ggml/include/ggml.h ggml/include/ggml-alloc.h ggml/include/ggml-backend.h ggml/include/ggml-cuda.h ggml/include/ggml-metal.h include/llama.h otherarch/llama-util.h src/llama-chat.cpp src/llama-mmap.cpp src/llama-context.cpp src/llama-adapter.cpp src/llama-arch.cpp src/llama-batch.cpp src/llama-vocab.cpp src/llama-grammar.cpp src/llama-sampler.cpp src/llama-kv-cache.cpp src/llama-kv-cache-dsa.cpp src/llama-kv-cache-dsv4.cpp src/llama-kv-cache-iswa.cpp src/llama-kv-cache-msa.cpp src/llama-memory-hybrid.cpp src/llama-memory-hybrid-iswa.cpp src/llama-memory-recurrent.cpp src/llama-model-loader.cpp src/llama-model-saver.cpp src/llama-hessian.cpp src/llama-hessian.h src/llama-quant-gptq.cpp src/llama-quant-gptq.h src/llama-quant.cpp src/llama-hparams.cpp src/llama-graph.cpp src/llama-io.cpp src/llama-memory.cpp common/fit.cpp ggml/include/ggml.h ggml/include/ggml-cpu.h ggml/include/ggml-cuda.h include/llama.h otherarch/llama-util.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
-llama-model.o: src/llama-model.cpp src/llama-model.h src/models/models.h src/llama-graph.h src/llama-cparams.h ggml/include/ggml.h include/llama.h
+llama-model.o: src/llama-model.cpp src/llama-model.h src/models/models.h $(wildcard src/models/*.cpp) src/llama-graph.h src/llama-cparams.h ggml/include/ggml.h include/llama.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 common.o: common/common.cpp ggml/include/ggml.h common/common.h common/log.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
@@ -1012,59 +1012,69 @@ HADAMARD_TEST_OBJS = ggml.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-
 	ggml-quants.o ggml-cpu-quants.o kcpp-quantmapper.o kcpp-repackmapper.o ggml-threading.o \
 	ggml-cpu-cpp.o gguf.o sgemm.o ggml-rpc.o transport.o hash.o
 
+# llama-level tools and tests
+LLAMA_TOOL_OBJS      = ggml.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_default.o ggml-repack.o $(OBJS_FULL) $(OBJS)
+LLAMA_TOOL_OBJS_CUDA = ggml_v4_cublas.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_cublas.o ggml-repack.o $(CUBLAS_OBJS_V4) $(OBJS_FULL) $(OBJS)
+
 test-hadamard: tests/test-hadamard.cpp $(HADAMARD_TEST_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
 test-hadamard-quants: tests/test-hadamard-quants.cpp $(HADAMARD_TEST_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
-test-hadamard-llama: tests/test-hadamard-llama.cpp ggml.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_default.o ggml-repack.o $(OBJS_FULL) $(OBJS)
+test-hadamard-llama: tests/test-hadamard-llama.cpp $(LLAMA_TOOL_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
-test-hadamard-quantize: tests/test-hadamard-quantize.cpp ggml.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_default.o ggml-repack.o $(OBJS_FULL) $(OBJS)
+test-hadamard-archs: tests/test-hadamard-archs.cpp $(LLAMA_TOOL_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
-test-hq-gptq: tests/test-hq-gptq.cpp ggml.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_default.o ggml-repack.o $(OBJS_FULL) $(OBJS)
+test-hadamard-quantize: tests/test-hadamard-quantize.cpp $(LLAMA_TOOL_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
-test-hadamard-ppl: tests/test-hadamard-ppl.cpp tests/kl-eval.h ggml.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_default.o ggml-repack.o $(OBJS_FULL) $(OBJS)
+test-hq-gptq: tests/test-hq-gptq.cpp $(LLAMA_TOOL_OBJS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+
+test-hadamard-ppl: tests/test-hadamard-ppl.cpp tests/kl-eval.h $(LLAMA_TOOL_OBJS)
 	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
 
-tensor-kl: tests/tensor-kl.cpp tests/kl-eval.h common/imatrix-loader.cpp ggml.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_default.o ggml-repack.o $(OBJS_FULL) $(OBJS)
+tensor-kl: tests/tensor-kl.cpp tests/kl-eval.h common/imatrix-loader.cpp $(LLAMA_TOOL_OBJS)
 	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
 
-hessian-tokenize: tools/hessian/hessian-tokenize.cpp ggml.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_default.o ggml-repack.o $(OBJS_FULL) $(OBJS)
+hessian-tokenize: tools/hessian/hessian-tokenize.cpp $(LLAMA_TOOL_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
-hessian-collect: tools/hessian/hessian-collect.cpp ggml.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_default.o ggml-repack.o $(OBJS_FULL) $(OBJS)
+hessian-collect: tools/hessian/hessian-collect.cpp $(LLAMA_TOOL_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
-test-hessian: tests/test-hessian.cpp common/imatrix-loader.cpp ggml.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_default.o ggml-repack.o $(OBJS_FULL) $(OBJS)
+test-hessian: tests/test-hessian.cpp common/imatrix-loader.cpp $(LLAMA_TOOL_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
 # CUDA variants (LLAMA_CUBLAS=1). CUBLAS_OBJS also carries the legacy v2/v3 CUDA backends, which
 # need the v2/v3 cores - these tools only want the modern one
 CUBLAS_OBJS_V4 = ggml-cuda.o $(patsubst %.cu,%.o,$(filter-out ggml/src/ggml-cuda/ggml-cuda.cu, $(wildcard ggml/src/ggml-cuda/*.cu))) $(OBJS_CUDA_TEMP_INST)
 
-test-hadamard-ppl-cuda: tests/test-hadamard-ppl.cpp tests/kl-eval.h ggml_v4_cublas.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_cublas.o ggml-repack.o $(CUBLAS_OBJS_V4) $(OBJS_FULL) $(OBJS)
+test-hadamard-ppl-cuda: tests/test-hadamard-ppl.cpp tests/kl-eval.h $(LLAMA_TOOL_OBJS_CUDA)
 	$(CXX) $(CXXFLAGS) $(CUBLAS_FLAGS) $(filter-out %.h,$^) -o $@ $(CUBLASLD_FLAGS) $(LDFLAGS)
 
-tensor-kl-cuda: tests/tensor-kl.cpp tests/kl-eval.h common/imatrix-loader.cpp ggml_v4_cublas.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_cublas.o ggml-repack.o $(CUBLAS_OBJS_V4) $(OBJS_FULL) $(OBJS)
+tensor-kl-cuda: tests/tensor-kl.cpp tests/kl-eval.h common/imatrix-loader.cpp $(LLAMA_TOOL_OBJS_CUDA)
 	$(CXX) $(CXXFLAGS) $(CUBLAS_FLAGS) $(filter-out %.h,$^) -o $@ $(CUBLASLD_FLAGS) $(LDFLAGS)
 
-hessian-collect-cuda: tools/hessian/hessian-collect.cpp ggml_v4_cublas.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_cublas.o ggml-repack.o $(CUBLAS_OBJS_V4) $(OBJS_FULL) $(OBJS)
+hessian-collect-cuda: tools/hessian/hessian-collect.cpp $(LLAMA_TOOL_OBJS_CUDA)
 	$(CXX) $(CXXFLAGS) $(CUBLAS_FLAGS) $^ -o $@ $(CUBLASLD_FLAGS) $(LDFLAGS)
 
 maincuda: tools/completion/main.cpp tools/completion/completion.cpp common/arg.cpp common/preset.cpp $(COMMON_DOWNLOAD_SRCS) build-info.h ggml_v4_cublas.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o console.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_cublas.o ggml-repack.o $(CUBLAS_OBJS_V4) $(OBJS_FULL) $(OBJS)
 	$(CXX) $(CXXFLAGS) $(CUBLAS_FLAGS) $(filter-out %.h,$^) -o $@ $(CUBLASLD_FLAGS) $(LDFLAGS)
 
-test-hadamard-llama-cuda: tests/test-hadamard-llama.cpp ggml_v4_cublas.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o llama.o chat.o llama-model.o clip_default.o mtmd.o mtmd-helper.o mtmd-helper-gen.o mtmd-image.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg_cublas.o ggml-repack.o $(CUBLAS_OBJS_V4) $(OBJS_FULL) $(OBJS)
+test-hadamard-archs-cuda: tests/test-hadamard-archs.cpp $(LLAMA_TOOL_OBJS_CUDA)
+	$(CXX) $(CXXFLAGS) $(CUBLAS_FLAGS) $(filter-out %.h,$^) -o $@ $(CUBLASLD_FLAGS) $(LDFLAGS)
+
+test-hadamard-llama-cuda: tests/test-hadamard-llama.cpp $(LLAMA_TOOL_OBJS_CUDA)
 	$(CXX) $(CXXFLAGS) $(CUBLAS_FLAGS) $(filter-out %.h,$^) -o $@ $(CUBLASLD_FLAGS) $(LDFLAGS)
 
 test-backend-ops: tests/test-backend-ops.cpp $(filter-out ggml.o ggml-backend-reg_default.o,$(HADAMARD_TEST_OBJS)) ggml_v4_cublas.o ggml-backend-reg_cublas.o $(CUBLAS_OBJS_V4)
 	$(CXX) $(CXXFLAGS) $(CUBLAS_FLAGS) $(filter-out %.h,$^) -o $@ $(CUBLASLD_FLAGS) $(LDFLAGS)
 
-bench-rht: tests/bench-rht.cu ggml/src/ggml-cuda/quantize.cu ggml-hadamard.o ggml/src/ggml-cuda/rht.cuh ggml/src/ggml-cuda/quantize.cuh ggml/src/ggml-cuda/common.cuh ggml/src/ggml-hadamard.h ggml/src/ggml-hadamard-tables.h
+bench-rht: tests/bench-rht.cu ggml/src/ggml-cuda/quantize.cu ggml-hadamard.o ggml/src/ggml-cuda/rht-impl.cuh ggml/src/ggml-cuda/quantize.cuh ggml/src/ggml-cuda/common.cuh ggml/src/ggml-hadamard.h ggml/src/ggml-hadamard-tables.h
 	nvcc -O3 -std=c++17 -arch=native -use_fast_math -DGGML_USE_CUDA -Iggml/include -Iggml/src $(filter %.cu %.o,$^) -o $@
 
 

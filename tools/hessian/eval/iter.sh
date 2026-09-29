@@ -1,6 +1,6 @@
 #!/bin/bash
 # iter.sh NAME ALPHA DAMP [NOTE]: quantizes REF with TYPES' tensor types as HQ types and full-Hessian GPTQ from HESSIAN
-# (--hessian-alpha ALPHA, LLAMA_HQ_GPTQ_DAMP=DAMP; FTYPE, default Q4_K_M, covers the tensors TYPES doesn't list),
+# (--hessian-alpha ALPHA, --gptq-damp DAMP; FTYPE, default Q4_K_M, covers the tensors TYPES doesn't list),
 # scores it with eval.sh, appends a row to LOG (default WORK/tuning.md) and WORK/results.tsv, then deletes it.
 # iter.sh --baseline MODEL NAME: scores an existing model and logs it; nothing is deleted.
 set -euo pipefail
@@ -15,7 +15,7 @@ if [[ ! -f $LOG ]]; then
 # Full-Hessian GPTQ tuning: $(basename "$REF"), $(basename "$TYPES") as HQ types
 
 Each run quantizes \`$(basename "$REF")\` with \`--tensor-type-file $(basename "$TYPES") --hadamard --hessian
-$(basename "$HESSIAN") --hessian-alpha α\` (\`LLAMA_HQ_GPTQ_DAMP=damp\`); GPTQ uses
+$(basename "$HESSIAN") --hessian-alpha α --gptq-damp damp\`; GPTQ uses
 H = R·((1−α)·Ĝ + α·diag(Ĝ) + damp·I)·Rᵀ with Ĝ = G / mean(diag G), so α = 1 is the diagonal (imatrix) GPTQ.
 Scores are KL(reference ‖ model) and top-1 agreement with the reference, over the second half of each window
 (\`tools/hessian/eval/README.md\`):
@@ -48,7 +48,7 @@ fi
 name=$1 alpha=$2 damp=$3 note=${4:-}
 out=${QUANT_DIR:-$WORK}/tune-$name.gguf
 t0=$SECONDS
-LLAMA_HQ_GPTQ_DAMP=$damp "$QUANTIZE" --hadamard --tensor-type-file "$TYPES" --hessian "$HESSIAN" --hessian-alpha "$alpha" \
+"$QUANTIZE" --hadamard --tensor-type-file "$TYPES" --hessian "$HESSIAN" --hessian-alpha "$alpha" --gptq-damp "$damp" \
     "$REF" "$out" "${FTYPE:-Q4_K_M}" > "$WORK/quant-$name.log" 2>&1
 mins=$(( (SECONDS - t0 + 30)/60 ))
 res=$("$HERE/eval.sh" "$out")
