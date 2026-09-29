@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Drops every document that shares a word 13-gram (after lower-casing and collapsing whitespace) with the
-# evaluation texts: wiki.test.raw, build-hq/tech-eval.txt, and the GSM8K and MATH test sets (NuminaMath-CoT
-# contains problems from both). Reads the document files given (default: every work/gen document file) and
+# evaluation texts given with --eval (wiki.test.raw, dataset/tech-eval.txt) and the GSM8K and MATH test sets
+# (NuminaMath-CoT contains problems from both). Reads the document files given (default: every work/gen document file) and
 # writes the dropped ids to work/gen/decontam.json.
 
 import argparse
@@ -10,7 +10,6 @@ import collections
 from common import *
 
 N = 13
-EVAL_TEXTS = [ROOT / "build-hq/models/wikitext-2-raw/wiki.test.raw", ROOT / "build-hq/tech-eval.txt"]
 
 
 def grams(text):
@@ -18,10 +17,10 @@ def grams(text):
     return {hash(" ".join(w[i:i + N])) for i in range(len(w) - N + 1)}
 
 
-def eval_grams():
+def eval_grams(texts):
     g = set()
-    for p in EVAL_TEXTS:
-        g |= grams(p.read_text(errors="replace"))
+    for p in texts:
+        g |= grams(Path(p).read_text(errors="replace"))
     for row in read_jsonl(SOURCES / "gsm8k_test.jsonl"):
         g |= grams(row["question"]) | grams(row["answer"])
     for row in read_jsonl(SOURCES / "math_test.jsonl"):
@@ -35,9 +34,10 @@ def doc_files():
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--eval", action="append", required=True, metavar="TEXT", help="an evaluation text (repeatable)")
     ap.add_argument("files", nargs="*")
     args = ap.parse_args()
-    ev = eval_grams()
+    ev = eval_grams(args.eval)
     log(f"{len(ev)} evaluation 13-grams")
     dropped = {}
     n = 0

@@ -3,7 +3,7 @@
 # Integration tests for the Hadamard-rotated (HQ) types, on a small model (Qwen3-0.6B).
 #
 # usage:   tests-hq.sh <repo-root> <model-bf16.gguf> <wiki.test.raw> [work-dir]
-# example: tests-hq.sh . models/Qwen3-0.6B-BF16.gguf wikitext-2-raw/wiki.test.raw /tmp/hq
+# example: tests-hq.sh . tools/models/Qwen3-0.6B-BF16.gguf tools/models/wiki.test.raw /tmp/hq
 #
 # Needs the make targets quantize_gguf main test-hadamard test-hadamard-quants test-hadamard-quantize
 # test-hadamard-llama test-hadamard-ppl test-hq-gptq. With a CUDA build (make LLAMA_CUBLAS=1 maincuda

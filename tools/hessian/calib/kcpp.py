@@ -9,7 +9,7 @@ import requests
 from jinja2.ext import Extension, loopcontrols
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
-from common import CALIB, GEN_MODEL, ROOT, WORK, log
+from common import CALIB, ROOT, WORK, gen_model, log
 
 URL = "http://127.0.0.1:5002"
 MODE = "gen"
@@ -58,7 +58,7 @@ class _Tokenizer:
     """hessian-tokenize: llama_tokenize with the model's vocab, as hessian-collect tokenizes"""
 
     def __init__(self, detok=False):
-        self.args = [str(ROOT / "hessian-tokenize"), str(GEN_MODEL)] + (["--detokenize"] if detok else [])
+        self.args = [str(ROOT / "hessian-tokenize"), str(gen_model())] + (["--detokenize"] if detok else [])
         self.p = None
         self.lock = threading.Lock()
 

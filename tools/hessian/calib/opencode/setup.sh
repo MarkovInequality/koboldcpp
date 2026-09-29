@@ -1,5 +1,5 @@
 #!/bin/bash
-# Isolated OpenCode setup for the calibration sessions: XDG dirs under build-hq/calib/work/opencode/, a config
+# Isolated OpenCode setup for the calibration sessions: XDG dirs under tools/hessian/calib/work/opencode/, a config
 # that mirrors the user's (the same provider and model names, which OpenCode writes into its system prompt, and
 # the same reasoning-effort variants) pointed at the logging proxy, and a snapshot of the user's OpenCode data and
 # original repos to compare against afterwards. The provider's timeouts (5 min each by default) are off or an hour:
@@ -8,7 +8,7 @@
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../../../.." && pwd)
-OC=$ROOT/build-hq/calib/work/opencode
+OC=$ROOT/tools/hessian/calib/work/opencode
 mkdir -p "$OC"/xdg/{config/opencode,data,cache,state} "$OC"/captures "$OC"/runs
 
 cat > "$OC/xdg/config/opencode/opencode.json" <<'JSON'
@@ -53,7 +53,7 @@ JSON
 
 # the user's own config, pointed at the proxy, for the system-prompt/tool-list comparison
 mkdir -p "$OC/xdg-user/config/opencode" "$OC/xdg-user/data" "$OC/xdg-user/cache" "$OC/xdg-user/state"
-sed 's#"baseURL": *"[^"]*"#"baseURL": "http://127.0.0.1:5004/v1"#' "$HOME/.config/opencode/opencode.json" > "$OC/xdg-user/config/opencode/opencode.json"
+sed 's#"baseURL": *"[^"]*"#"baseURL": "http://127.0.0.1:5004/v1"#' "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/opencode.json" > "$OC/xdg-user/config/opencode/opencode.json"
 
 [[ -f $OC/snapshot-before.json ]] || python3 "$HERE/snapshot.py" "$OC/snapshot-before.json"
 echo "set up $OC"

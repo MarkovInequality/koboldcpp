@@ -5,8 +5,9 @@
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../../../.." && pwd)
-OC=$ROOT/build-hq/calib/work/opencode
-OPENCODE=$HOME/.opencode/bin/opencode
+OC=$ROOT/tools/hessian/calib/work/opencode
+OPENCODE=${OPENCODE:-$(command -v opencode || true)}
+[[ -x $OPENCODE ]] || { echo "opencode not found: put it on PATH or set OPENCODE" >&2; exit 1; }
 TASK=$1
 
 field() { python3 -c "import json,sys; t=json.loads(sys.argv[1]); v=t.get(sys.argv[2]); print(v if isinstance(v, str) else json.dumps(v))" "$TASK" "$1"; }
@@ -16,8 +17,8 @@ variant=$(field variant)
 prompt=$(field prompt)
 
 case $repo in
-    user:*)   src=$HOME/Sandbox/${repo#user:}; depth=50 ;;
-    public:*) r=${repo#public:}; src=$ROOT/build-hq/calib/work/sources/repos/${r/\//__}; depth=1 ;;
+    user:*)   src=${USER_REPOS:?set USER_REPOS to the directory holding the user repos}/${repo#user:}; depth=50 ;;
+    public:*) r=${repo#public:}; src=$ROOT/tools/hessian/calib/work/sources/repos/${r/\//__}; depth=1 ;;
 esac
 copy=$OC/copies/$id
 rm -rf "$copy"

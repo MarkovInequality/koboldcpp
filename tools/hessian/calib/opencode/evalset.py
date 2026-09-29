@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import kcpp  # noqa: E402
 from common import *  # noqa: E402,F403
 
-DB = Path.home() / ".local/share/opencode"
+DB = opencode_data()
 
 
 def template_request(capture):

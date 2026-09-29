@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Downloads slices of the calibration sources into build-hq/calib/work/sources/. Parquet files are read by
+# Downloads slices of the calibration sources into work/sources/. Parquet files are read by
 # row group over HTTP range requests, so multi-GB shards are never downloaded whole. Revisions and commits
 # left null in sources.json are pinned to the current ones and written back.
 
@@ -192,7 +192,7 @@ def main():
         fetch_pg19(cfg["pg19"])
         save_sources(cfg)
     if not only or "template" in only:
-        (WORK / "chat_template.jinja").write_text(gguf_string(GEN_MODEL, "tokenizer.chat_template"))
+        (WORK / "chat_template.jinja").write_text(gguf_string(gen_model(), "tokenizer.chat_template"))
     if not only or "repos" in only:
         for name, spec in cfg["repos"].items():
             fetch_repo(name, spec)

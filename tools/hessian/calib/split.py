@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Merges the generated, raw and OpenCode documents, drops the decontamination hits, and writes the kept
-# dataset to build-hq/calib/qwen38-calib-v1/: calib.jsonl and heldout.jsonl (split by source unit, which each
+# dataset qwen38-calib-v1 to tools/hessian/calib/dataset/: calib.jsonl and heldout.jsonl (split by source unit, which each
 # document carries from its prompt), calib-heldout.txt, and manifest.json with sources, token counts, drops,
 # generation throughput and the sha256 of every kept file.
 
@@ -166,7 +166,7 @@ def main():
         "name": NAME,
         "dataset_tag": f"{NAME}:{files['calib.jsonl'][:12]}",
         "created": datetime.date.today().isoformat(),
-        "generator": {"model": GEN_MODEL.name, "server": "koboldcpp (this fork), tools/hessian/calib/serve.sh",
+        "generator": {"model": gen_model().name, "server": "koboldcpp (this fork), tools/hessian/calib/serve.sh",
                       "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}, "max_new_tokens": "min(6144, 8192 - prompt)",
                       "thinking_mix": {"xhigh": 0.45, "medium": 0.15, "low": 0.15, "off": 0.25, "math": "xhigh 0.6, medium 0.2, low 0.2"},
                       "loop_filter": {"span": 64, "min_occurrences": 3, "compression_ratio_threshold": gen_state.get("ratio_threshold")}},

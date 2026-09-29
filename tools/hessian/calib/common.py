@@ -9,13 +9,34 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 CALIB = Path(__file__).resolve().parent
-BUILD = ROOT / "build-hq" / "calib"
-WORK = BUILD / "work"
+WORK = CALIB / "work"
 SOURCES = WORK / "sources"
 GEN = WORK / "gen"
-OUT = BUILD / "qwen38-calib-v1"
-MODEL_DIR = Path.home() / "Sandbox" / "unquantized" / "Qwen3.8-27B-gguf"
-GEN_MODEL = MODEL_DIR / "Qwen3.8-27B-HQ8_0.gguf"
+OUT = CALIB / "dataset"
+
+
+def gen_model():
+    """the generator's GGUF, from $GEN_MODEL (Qwen3.8-27B-HQ8_0.gguf for qwen38-calib-v1)"""
+    p = os.environ.get("GEN_MODEL")
+    if not p:
+        sys.exit("set GEN_MODEL to the generator model's GGUF (Qwen3.8-27B-HQ8_0.gguf for qwen38-calib-v1)")
+    return Path(p)
+
+
+def user_repos():
+    """the directory holding the user's own repos that the OpenCode tasks' user: entries name, from $USER_REPOS"""
+    p = os.environ.get("USER_REPOS")
+    if not p:
+        sys.exit("set USER_REPOS to the directory holding the repos the OpenCode tasks' user: entries name")
+    return Path(p)
+
+
+def opencode_data():
+    return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "opencode"
+
+
+def opencode_config():
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "opencode"
 
 SEED = 20260927
 

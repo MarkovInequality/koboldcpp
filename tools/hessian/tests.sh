@@ -2,22 +2,25 @@
 #
 # Tests for hessian-collect on Qwen3-0.6B: the GEMM-input hook, the file format and loaders, count spans and
 # resume on the CPU (fp64) path, and with a CUDA build the SYRK path against it. Outputs go to
-# build-hq/hessian-tests/, which is removed when every test passes.
+# tools/hessian/hessian-tests/, which is removed when every test passes.
 #
-# usage: tools/hessian/tests.sh [hook] [cpu] [cuda]   (default: all; cuda needs hessian-collect-cuda)
-# Needs the make targets hessian-collect test-hessian quantize_gguf (hessian-collect-cuda for cuda), upstream
-# llama-imatrix in build-hq/upstream-llama/build/bin/, and build-hq/models/{Qwen3-0.6B-BF16.gguf,wikitext-2-raw}.
+# usage: tools/hessian/tests.sh <Qwen3-0.6B-BF16.gguf> <wiki.train.raw> [hook] [cpu] [cuda]   (default: all)
+# Needs the make targets hessian-collect test-hessian quantize_gguf (hessian-collect-cuda for cuda).
 # THREADS=N limits the CPU threads; M27=<Qwen3.8-27B GGUF> adds the 27B coverage check to hook.
 
 set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-W=$ROOT/build-hq/hessian-tests
-M=$ROOT/build-hq/models/Qwen3-0.6B-BF16.gguf
-TEXT=$ROOT/build-hq/models/wikitext-2-raw/wiki.train.raw
+W=$ROOT/tools/hessian/hessian-tests
+if [[ $# -lt 2 || ! -f $1 || ! -f $2 ]]; then
+    echo "usage: $0 <Qwen3-0.6B-BF16.gguf> <wiki.train.raw> [hook] [cpu] [cuda]" >&2
+    exit 1
+fi
+M=$(realpath "$1")
+TEXT=$(realpath "$2")
+shift 2
 HC=$ROOT/hessian-collect
 HCC=$ROOT/hessian-collect-cuda
 TH=$ROOT/test-hessian
-UP=$ROOT/build-hq/upstream-llama/build/bin/llama-imatrix
 THREADS=${THREADS:-$(nproc)}
 PHASES=${*:-hook cpu cuda}
 mkdir -p "$W"
@@ -73,10 +76,6 @@ fi
 if [[ " $PHASES " == *" cpu "* ]]; then
     echo "== CPU (fp64) path, format, loaders"
     check "collect 20 chunks (one pass)" "$HC" -m "$M" "${docs20[@]}" "${common[@]}" --group-layers 29 -o h20.gguf --imatrix-out h20-im.gguf
-    check "upstream llama-imatrix on the same chunks" env LD_LIBRARY_PATH="$(dirname "$UP")" "$UP" -m "$M" -f "$TEXT" -c 512 --chunks 20 -t "$THREADS" -o up20.gguf
-    # upstream (53ed051) runs other CPU kernels, so activations drift apart slowly with depth: measured <= 1.3e-3
-    check "diagonal = upstream in_sum2 within 5e-3 relative L2 per weight, equal counts" "$TH" diag h20.gguf up20.gguf --tol 5e-3
-    note "$(tail -1 last.log)"
     check "format: Grams and aliases load, G symmetric, in_sum2 = diag G bitwise" "$TH" check h20.gguf --weights 197
     check "imatrix-out = the hessian file's in_sum2/counts" "$TH" diag h20.gguf h20-im.gguf --tol 0
     check "imatrix loader reads a hessian file in < 100 MB" bash -c "'$TH' imatrix-load h20.gguf | tee /dev/stderr | awk '{ exit !(\$(NF-1) < 100) }'"

@@ -1,17 +1,18 @@
 #!/bin/bash
 # Runs OpenCode tasks from tasks.jsonl one at a time against koboldcpp (serve.sh opencode, port 5003) through
 # the logging proxy (port 5004), then renders each capture into its document. Every run is sandboxed: a
-# user + mount namespace overlays $HOME with a throwaway layer in /tmp, so nothing the agent writes, its working
+# user + mount namespace overlays $HOME with a throwaway layer in $TMPDIR (default /tmp), so nothing the agent writes, its working
 # copy included, reaches the real files; only the isolated XDG dirs are mounted through. The layer is deleted
 # once the run is rendered, also on failure or interrupt.
 #
 # usage: run.sh [--user-config] [TASK_ID ...]   (default: every task not yet rendered without failure)
 #   --user-config: one request with the user's own OpenCode config instead, for the prompt comparison
+# Needs USER_REPOS (see ../common.py) and opencode on PATH or in OPENCODE; PY is the Python (default python3).
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../../../.." && pwd)
-OC=$ROOT/build-hq/calib/work/opencode
-PY=$ROOT/build-hq/calib/work/venv/bin/python
+OC=$ROOT/tools/hessian/calib/work/opencode
+PY=${PY:-python3}
 TASKS=$HERE/tasks.jsonl
 PROXY_PID=
 LAYER=
@@ -35,7 +36,8 @@ start_proxy() {
 # sandbox XDG_DIR COMMAND...: runs COMMAND with $HOME overlaid by a throwaway layer, XDG_DIR mounted through
 sandbox() {
     local xdg=$1; shift
-    LAYER=$(mktemp -d /tmp/hessian-oc.XXXXXX)
+    LAYER=$(mktemp -d "${TMPDIR:-/tmp}/hessian-oc.XXXXXX")
+    [[ $(realpath "$LAYER") != "$(realpath "$HOME")"/* ]] || { echo "TMPDIR must be outside \$HOME: the layer overlays it"; return 1; }
     mkdir -p "$LAYER"/{upper,work,xdg}
     unshare --user --map-root-user --mount -- bash -c '
         set -e

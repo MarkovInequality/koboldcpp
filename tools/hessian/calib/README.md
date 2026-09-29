@@ -13,7 +13,7 @@ on both sides.
 
 ## The dataset (`dataset/`)
 
-A copy of `build-hq/calib/qwen38-calib-v1/`, the kept output. It is git-ignored (`dataset/.gitignore`): it holds
+The kept output, written here by `split.py` and `opencode/evalset.py`. It is git-ignored (`dataset/.gitignore`): it holds
 third-party text under the licences of its sources, and `eval-opencode.jsonl` holds the user's own OpenCode
 sessions.
 
@@ -57,17 +57,27 @@ the whole document counts. The OpenCode documents use it to:
     does, so counts and spans match what the collector sees.
   - Don't tokenize through koboldcpp's `/api/extra/tokenize`: it writes into a shared static buffer, so concurrent
     calls corrupt each other and crashed its batch server.
-- **Python:** a venv at `build-hq/calib/work/venv` with `pyarrow requests numpy jinja2 pyyaml`.
-- **Model:** `~/Sandbox/unquantized/Qwen3.8-27B-gguf/Qwen3.8-27B-HQ8_0.gguf` (`MODEL=` overrides it in `serve.sh`).
-- **OpenCode:** v1.18.32 at `~/.opencode/bin/opencode`, for the OpenCode part.
-- **Resources:** about 3 GB of disk in `build-hq/calib/work/` while building, and a 32 GB GPU.
+- **Python:** any Python 3 with `pyarrow requests numpy jinja2 pyyaml`, as `PY` (`opencode/run.sh` reads it too;
+  default `python3`).
+- **`GEN_MODEL`:** the generator model's GGUF, `Qwen3.8-27B-HQ8_0.gguf` for `qwen38-calib-v1`. `serve.sh` serves it,
+  `fetch.py` takes its chat template, the tokenizer loads it, and `split.py` records its name.
+- **`USER_REPOS`:** the directory holding your own repos that `opencode/tasks.jsonl`'s `user:` entries name (airi,
+  hegel-rust, neovim, remove-refusals-with-transformers, voicebox, xet-core). They're only cloned from, and
+  `opencode/snapshot.py` checks they're unchanged afterwards.
+- **OpenCode:** v1.18.32 on `PATH` (or `OPENCODE=<binary>`), for the OpenCode part. Your own OpenCode data and config
+  are read from their XDG locations, `$XDG_DATA_HOME/opencode` and `$XDG_CONFIG_HOME/opencode` (default
+  `~/.local/share` and `~/.config`).
+- **`TMPDIR`** (default `/tmp`), outside `$HOME`: where `opencode/run.sh` puts each run's throwaway layer.
+- **Resources:** about 3 GB of disk in `work/` (git-ignored) while building, and a 32 GB GPU.
 
 ## Building it
 
-Run from `tools/hessian/calib/`, in this order. Everything temporary goes to `build-hq/calib/work/`.
+Run from `tools/hessian/calib/`, in this order. Everything temporary goes to `work/`.
 
 ```
-PY=../../../build-hq/calib/work/venv/bin/python
+export PY=python3                                  # with the packages above
+export GEN_MODEL=/path/to/Qwen3.8-27B-HQ8_0.gguf
+export USER_REPOS=/path/to/your/repos
 
 $PY fetch.py                      # 1. sources -> work/sources/, pins revisions in sources.json
 $PY prompts.py                    # 2. prompt list -> work/gen/prompts.jsonl
@@ -76,11 +86,15 @@ $PY generate.py                   # 4. replies -> work/gen/docs.jsonl (about 4.5
 $PY raw.py                        # 5. untemplated documents -> work/gen/raw_docs.jsonl
 ./serve.sh opencode               # 6. koboldcpp as the user runs it (port 5003)
 opencode/setup.sh                 # 7. isolated OpenCode config, snapshot of what must not change
+opencode/run.sh --user-config < /dev/null     # 8a. prompt check: a request with the user's own config,
+opencode/run.sh e01-ripgrep-loc < /dev/null   #     one short task, and the comparison (see ../GUIDE.md)
+$PY opencode/promptdiff.py work/opencode/captures/_user-config.jsonl work/opencode/captures/e01-ripgrep-loc.jsonl
 opencode/run.sh < /dev/null       # 8. the OpenCode tasks -> work/opencode/docs.jsonl (about 6.5 h)
 ./serve.sh stop
 $PY opencode/evalset.py           # 9. the user's sessions -> eval-opencode.jsonl
-$PY decontam.py                   # 10. 13-gram filter against the evaluation texts
-$PY split.py                      # 11. calib/heldout split, budgets, manifest -> build-hq/calib/qwen38-calib-v1/
+$PY techeval.py                   # 10a. the out-of-domain evaluation text -> dataset/tech-eval.txt
+$PY decontam.py --eval ../../models/wiki.test.raw --eval dataset/tech-eval.txt   # 10. 13-gram filter against the evaluation texts
+$PY split.py                      # 11. calib/heldout split, budgets, manifest -> dataset/
 $PY stats.py                      # 12. the checks
 ./cleanup.sh                      # 13. removes work/
 python3 stats.py --after-cleanup  #     work/ gone, kept files match the manifest
@@ -145,7 +159,7 @@ Every step can be rerun. `generate.py` and `opencode/run.sh` resume where they s
   - The permission deny list covers `git push`, `sudo`, `curl`/`wget` and package installs, plus anything outside
     the working copy.
 - **`run.sh [--user-config] [TASK_ID ...]`:** runs the tasks one at a time.
-  - **Sandbox:** each run is in a user and mount namespace that overlays `$HOME` with a throwaway layer in /tmp,
+  - **Sandbox:** each run is in a user and mount namespace that overlays `$HOME` with a throwaway layer in `$TMPDIR`,
     with the isolated XDG dirs mounted through. Nothing the agent writes, its working copy included, reaches the
     real files. The layer is deleted after the run, also on failure or interrupt.
   - **Capture:** the proxy records every request, and `render.py` turns the capture into documents.
@@ -167,13 +181,21 @@ Every step can be rerun. `generate.py` and `opencode/run.sh` resume where they s
   - **Output:** documents and their count spans go to `work/opencode/docs.jsonl`, checks to `checks/<id>.json`.
 - **`evalset.py [CAPTURE]`:** renders the user's recorded Qwen3.8 sessions from a copy of `opencode.db` (the
   original is only read). The system prompt and tools come from a capture of the current OpenCode version.
+- **`promptdiff.py A.jsonl B.jsonl`:** compares the prompt in two captures: the tool list, each tool's schema, and
+  the system prompt as a diff. For the `--user-config` check: the probe against a calibration task should differ
+  only in the working-directory line.
 - **`snapshot.py OUT | --compare BEFORE`:** row counts of the user's `opencode.db` (read from a copy), hashes of
-  `~/.config/opencode`, and HEAD and `git status` of the user's repos, compared after the runs.
+  the OpenCode config dir, and HEAD and `git status` of the `user:` repos in `USER_REPOS`, compared after the runs.
 
 ### Finishing
 
-- **`decontam.py [FILES]`:** drops documents that share a word 13-gram (lower-cased, whitespace collapsed) with
-  `wiki.test.raw`, `build-hq/tech-eval.txt`, or the GSM8K and MATH test sets.
+- **`techeval.py [--rev REV] [OUT]`:** builds `tech-eval.txt`, the out-of-domain evaluation text: the repo's
+  top-level docs (`README.md`, `docs/*.md`, `tools/*/README*.md`) cut at 115,000 bytes, then the first 95,000 bytes of
+  `src/llama-model.cpp`, read from git at `REV`. The default `7957c3ad6` reproduces the original; any revision serves
+  the same purpose, since the calibration set takes no text from this repo.
+- **`decontam.py --eval TEXT [--eval TEXT...] [FILES]`:** drops documents that share a word 13-gram (lower-cased,
+  whitespace collapsed) with the evaluation texts (`wiki.test.raw` and `dataset/tech-eval.txt` for `qwen38-calib-v1`)
+  or the GSM8K and MATH test sets.
 - **`split.py`:** writes the kept dataset.
   - **Generated documents:** taken per bucket in generation order up to the targets.
   - **OpenCode:** each session's longest chain is kept (a document costs its whole length in every Hessian pass,
@@ -194,8 +216,8 @@ Every step can be rerun. `generate.py` and `opencode/run.sh` resume where they s
   - the user's OpenCode data and repos unchanged
 
   With `--after-cleanup`: the work dir is gone and the kept files match their hashes.
-- **`cleanup.sh`:** stops a server if one is running, removes `build-hq/calib/work/` and leftover sandbox layers,
-  and lists anything left outside the kept dataset.
+- **`cleanup.sh`:** stops a server if one is running, removes `work/` and leftover sandbox layers, and lists the
+  kept dataset.
 
 ## Build notes (v1)
 

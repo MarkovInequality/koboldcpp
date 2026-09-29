@@ -56,7 +56,7 @@ Single types use `--pure --token-embedding-type q6_K`.
 | HQ4_K with `--imatrix` today (ignored; tensor data byte-identical to HQ4_K) | 0.1685 | 79.7 | 0.1176 | 85.2 |
 | **HQ4_K + GPTQ (prototype)** | **0.0549** | **88.0** | **0.0457** | **90.7** |
 
-`tech-eval` (`build-hq/tech-eval.txt`) is 115 KB of the repo's docs and plans plus 95 KB of C++.
+`tech-eval` (`tools/hessian/calib/dataset/tech-eval.txt`) is 115 KB of the repo's docs plus 95 KB of C++ (`tools/hessian/calib/techeval.py` rebuilds it).
 It lies outside the calibration domain, and the GPTQ gain holds there: 37 % below Q4_K + imatrix,
 against 36 % on wiki.test.
 
@@ -444,10 +444,10 @@ As in `plans/full_row_rht_quantization_plan.md`:
 
 | item | path |
 |---|---|
-| model | `build-hq/models/Qwen3-0.6B-BF16.gguf` |
+| model | `tools/models/Qwen3-0.6B-BF16.gguf` |
 | imatrix | `build-hq/imatrix-06.gguf`: upstream `llama-imatrix` on wikitext-2 train, 100 × 512 tokens, 196 entries |
-| evaluation, in domain | `build-hq/models/wikitext-2-raw/wiki.test.raw`, reference cache `build-hq/q06-80.kl` |
-| evaluation, out of domain | `build-hq/tech-eval.txt`, reference cache `build-hq/q06-tech.kl` |
+| evaluation, in domain | `tools/models/wiki.test.raw`, reference cache `build-hq/q06-80.kl` |
+| evaluation, out of domain | `tools/hessian/calib/dataset/tech-eval.txt`, reference cache `build-hq/q06-tech.kl` |
 | driver to extend | `build-hq/q06cmp.sh` (Q4_K only so far) |
 | Q4_K baselines | `build-hq/q06/`: `Q4_K-plain`, `Q4_K-im`, `Q4_K-hq`, and the prototype's `Q4_K-hq-gptqim` |
 
@@ -794,7 +794,7 @@ Research code, not in the tree: `build-hq/investigate/` (git-ignored), built wit
 | Routing, the pre-pass count, the imatrix lookup, the slab loop | `src/llama-quant.cpp`: pre-pass `:1306–1337`, lookup `:1504`, rotation and quantize call `:1583–1598` |
 | Worker helpers | `llama_parallel_rows` `src/llama-quant.cpp:885`, `llama_tensor_quantize_impl` `:753` |
 | Tests to change / add | `tests/test-hadamard.cpp`, `tests/test-hadamard-quantize.cpp` (imatrix checks at `:291–324`), new `tests/test-hq-gptq.cpp`, `tools/quantize/tests-hq.sh` |
-| Benchmark (Phase 5) | `build-hq/models/Qwen3-0.6B-BF16.gguf`, `build-hq/imatrix-06.gguf`; texts `build-hq/models/wikitext-2-raw/wiki.test.raw`, `build-hq/tech-eval.txt`; caches `build-hq/q06-80.kl`, `build-hq/q06-tech.kl`; driver `build-hq/q06cmp.sh` |
+| Benchmark (Phase 5) | `tools/models/Qwen3-0.6B-BF16.gguf`, `build-hq/imatrix-06.gguf`; texts `tools/models/wiki.test.raw`, `tools/hessian/calib/dataset/tech-eval.txt`; caches `build-hq/q06-80.kl`, `build-hq/q06-tech.kl`; driver `build-hq/q06cmp.sh` |
 | Larger-model follow-up (Future work) | 4B: `build-hq/imatrix-4b.gguf`, caches `build-hq/q4b-ref.kl`, `build-hq/tech-ref.kl`; 27B: `~/Sandbox/unquantized/Qwen3.8-27B` (safetensors, `imatrix_unsloth.gguf`) |
 
 ## Risks and sequencing

@@ -1,5 +1,7 @@
 # hessian-collect
 
+*The end-to-end walkthrough, from building a calibration dataset to quantizing with the Hessian, is `GUIDE.md`.*
+
 Collects, for every distinct input `x` of a model's weight GEMMs, the full Gram matrix `G = Σ x·xᵀ` over a set
 of documents: GPTQ's Hessian (`H = 2·XXᵀ`) up to scale, taken **before** any Hadamard rotation, so one file
 serves every HQ seed and every plain type. The design and the measurements behind it are in
@@ -95,12 +97,18 @@ equal-length split gives one ubatch per batch; padding never reaches a counted r
 
 ## Tests
 
-`tools/hessian/tests.sh [hook] [cpu] [cuda]` on Qwen3-0.6B: the hook (coverage, groups, layouts, logits
-unchanged), the diagonal against upstream `llama-imatrix`, natural-space capture on an HQ8_0 model, the format and
+`tools/hessian/tests.sh <Qwen3-0.6B-BF16.gguf> <wiki.train.raw> [hook] [cpu] [cuda]` (default: all three), e.g.
+`tools/hessian/tests.sh tools/models/Qwen3-0.6B-BF16.gguf tools/models/wiki.train.raw`, on Qwen3-0.6B: the hook (coverage, groups, layouts, logits
+unchanged), natural-space capture on an HQ8_0 model, the format and
 loaders, `--imatrix` byte-identity, resume, count spans and packing, and on CUDA fp32 SYRK against fp64, pass
-invariance and host inputs. `build-hq/hessian-tests/` is removed when everything passes.
+invariance and host inputs. `tools/hessian/hessian-tests/` (git-ignored) is removed when everything passes.
+
+## Scoring quantizations (`tools/hessian/eval/`)
+
+Scripts that score quantized models against their BF16 model by KL and top-1 agreement on wikitext and two chat
+sets, and that ran the full-Hessian GPTQ tuning and the rotated-vs-unrotated comparison. See `eval/README.md`.
 
 ## The calibration set (`tools/hessian/calib/`)
 
-`qwen38-calib-v1` and the scripts that build it are documented in `calib/README.md`. A copy of the dataset is in
-`calib/dataset/` (git-ignored: third-party text and the user's own OpenCode sessions).
+`qwen38-calib-v1` and the scripts that build it are documented in `calib/README.md`. The scripts write the dataset
+to `calib/dataset/` (git-ignored: third-party text and the user's own OpenCode sessions).

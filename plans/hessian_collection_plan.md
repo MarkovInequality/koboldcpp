@@ -145,8 +145,8 @@ Out of scope:
   `src/llama-memory-hybrid.cpp:89`), so one `llama_decode` can run several graphs.
 - **Op offload:** with a batch of at least 32 (`GGML_OP_OFFLOAD_MIN_BATCH`), a GEMM whose weight is
   in RAM runs on the GPU, and the weight is copied over once per ubatch.
-- **Available tools:** upstream `llama-imatrix` at 53ed051 is built in
-  `build-hq/upstream-llama/build/bin/`. The fork itself has no imatrix tool.
+- **Available tools:** upstream `llama-imatrix` at 53ed051 was built in
+  `build-hq/upstream-llama/build/bin/` (deleted 2026-09-28). The fork itself has no imatrix tool.
 - **`common_imatrix_load`** reads every tensor of a file into RAM (`no_alloc = false`).
 
 **Machine:**
@@ -169,18 +169,18 @@ Everything this plan writes, where it goes, and when it's removed. `build-hq/` i
 | what | where | fate |
 |---|---|---|
 | scripts and tool sources | `tools/hessian/calib/`, `tools/hessian/hessian-collect.cpp`, `common/hessian-loader.{h,cpp}`, `src/` | committed |
-| downloaded dataset shards, pinned repo clones | `build-hq/calib/work/sources/` | deleted at the end of Phase 1 |
-| generation state and logs (resume files, raw completions) | `build-hq/calib/work/gen/` | deleted at the end of Phase 1 |
-| OpenCode working copies | `build-hq/calib/work/opencode/copies/` | each deleted right after its run is captured and rendered, also on failure or interrupt |
-| OpenCode's isolated config / data / cache dirs, proxy logs | `build-hq/calib/work/opencode/` | deleted at the end of Phase 1 |
-| 0.6B test outputs | `build-hq/hessian-tests/` | deleted by `tools/hessian/tests.sh` when the tests pass (kept on failure, for debugging) |
-| diagnostic Grams (split-half, position buckets; about 5 GB per run) | `build-hq/calib/work/diag/` | deleted at the end of Phase 5, once their numbers are recorded |
-| **calibration set** | `build-hq/calib/qwen38-calib-v1/`: `calib.jsonl`, `heldout.jsonl`, `calib-heldout.txt`, `manifest.json` | **kept** |
-| **evaluation set** (the user's recorded OpenCode sessions, rendered) | `build-hq/calib/qwen38-calib-v1/eval-opencode.jsonl` | **kept**, for the next plan |
+| downloaded dataset shards, pinned repo clones | `tools/hessian/calib/work/sources/` | deleted at the end of Phase 1 |
+| generation state and logs (resume files, raw completions) | `tools/hessian/calib/work/gen/` | deleted at the end of Phase 1 |
+| OpenCode working copies | `tools/hessian/calib/work/opencode/copies/` | each deleted right after its run is captured and rendered, also on failure or interrupt |
+| OpenCode's isolated config / data / cache dirs, proxy logs | `tools/hessian/calib/work/opencode/` | deleted at the end of Phase 1 |
+| 0.6B test outputs | `tools/hessian/hessian-tests/` | deleted by `tools/hessian/tests.sh` when the tests pass (kept on failure, for debugging) |
+| diagnostic Grams (split-half, position buckets; about 5 GB per run) | `tools/hessian/calib/work/diag/` | deleted at the end of Phase 5, once their numbers are recorded |
+| **calibration set** | `tools/hessian/calib/dataset/` (git-ignored; was `build-hq/calib/qwen38-calib-v1/` until 2026-09-28): `calib.jsonl`, `heldout.jsonl`, `calib-heldout.txt`, `manifest.json` | **kept** |
+| **evaluation set** (the user's recorded OpenCode sessions, rendered) | `tools/hessian/calib/dataset/eval-opencode.jsonl` | **kept**, for the next plan |
 | **the Hessian** | `~/Sandbox/unquantized/Qwen3.8-27B-gguf/qwen38-27b-hessian-v1.gguf` (100.8 GB) | **kept** |
 | **its diagonal as a plain imatrix** | `~/Sandbox/unquantized/Qwen3.8-27B-gguf/qwen38-27b-imatrix-v1.gguf` (about 14 MB) | **kept** |
 
-- **`tools/hessian/calib/cleanup.sh`** removes `build-hq/calib/work/` and then lists anything that
+- **`tools/hessian/calib/cleanup.sh`** removes `tools/hessian/calib/work/` and then lists anything that
   remains outside the kept paths. Phases 1 and 5 end with it.
 - **What stays on disk:**
   - The calibration set is a few MB. Its manifest records the sha256 of each file, and that hash
@@ -303,7 +303,7 @@ and keywords.
 - **Server:** koboldcpp serving HQ8_0 with the user's settings (`jinja`, `jinja_tools`, flash
   attention, q5_1 KV cache), a 65536-token context, and one session at a time.
 - **Isolation:** OpenCode runs with its own `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`
-  and `XDG_STATE_HOME` under `build-hq/calib/work/opencode/`. The user's config and session
+  and `XDG_STATE_HOME` under `tools/hessian/calib/work/opencode/`. The user's config and session
   database are never touched.
 - **The config mirrors the user's:**
   - the same provider type, the same per-variant `reasoningEffort` options, and a model id
@@ -321,7 +321,7 @@ and keywords.
   - Cargo runs offline (`CARGO_NET_OFFLINE=true`), so builds and tests use only what's already
     cached.
 - **Working copies:** every session runs in a fresh clone of one repo, in
-  `build-hq/calib/work/opencode/copies/`, with the git remotes removed.
+  `tools/hessian/calib/work/opencode/copies/`, with the git remotes removed.
   - The repo is either one of the user's own (`~/Sandbox/airi`, `neovim`, `hegel-rust`,
     `voicebox`, `xet-core`, `remove-refusals-with-transformers`) or one of the pinned public repos.
   - Sessions never run in the originals or in this repository.
@@ -389,7 +389,7 @@ Many short OpenCode runs with the same setup, repos, capture, rendering, checks 
   (attention sinks, DeltaNet state growth) are represented.
 
 **Keeping the evaluation texts clean:**
-- Drop any document that shares a 13-gram with `wiki.test.raw` or `build-hq/tech-eval.txt`, after
+- Drop any document that shares a 13-gram with `wiki.test.raw` or `tools/hessian/calib/dataset/tech-eval.txt`, after
   lower-casing and collapsing whitespace.
 - Take no text from this repository, since tech-eval is built from it. No OpenCode run happens
   here.
@@ -632,7 +632,7 @@ As in the earlier plans:
 
 ## Phase 1 — Calibration set (`tools/hessian/calib/`)
 
-1. **`fetch.py`** downloads the sources into `build-hq/calib/work/sources/`: a few parquet shards
+1. **`fetch.py`** downloads the sources into `tools/hessian/calib/work/sources/`: a few parquet shards
    per dataset, pinned by revision (PG-19 and FineWeb-Edu are never downloaded whole), and the code
    repos at fixed commits with their licence files.
 2. **`prompts.py`** builds the prompt list per category, with categories, languages and the
@@ -654,9 +654,9 @@ As in the earlier plans:
    - **`opencode/evalset.py`** renders the user's recorded sessions into the evaluation set.
 6. **`decontam.py`** does the 13-gram filter.
 7. **`split.py`** makes the held-out split by source unit, writes the kept files to
-   `build-hq/calib/qwen38-calib-v1/` and the manifest with their sha256.
+   `tools/hessian/calib/dataset/` (first `build-hq/calib/qwen38-calib-v1/`) and the manifest with their sha256.
 8. **`stats.py`** reports the checks below.
-9. **`cleanup.sh`** removes `build-hq/calib/work/` once the checks pass, and lists anything left
+9. **`cleanup.sh`** removes `tools/hessian/calib/work/` once the checks pass, and lists anything left
    outside the kept paths.
 
 **Checks:**
@@ -677,7 +677,7 @@ As in the earlier plans:
   - the user's `~/.local/share/opencode/opencode.db` and `~/.config/opencode` are unchanged (row
     counts and mtimes before and after)
   - the original repos are unchanged (`git status` clean, same HEAD)
-- **After `cleanup.sh`:** `build-hq/calib/work/` is gone, and the kept files match the manifest's
+- **After `cleanup.sh`:** `tools/hessian/calib/work/` is gone, and the kept files match the manifest's
   hashes.
 - Generation throughput and drop counts are in the manifest.
 
@@ -707,10 +707,11 @@ The tool on its CPU (fp64) path:
 Plus the loader changes (§8).
 
 **Tests** (Qwen3-0.6B, with logits at every position, since Qwen3 selects output rows inside its
-last layer; outputs in `build-hq/hessian-tests/`):
+last layer; outputs in `tools/hessian/hessian-tests/`):
 - **Diagonal vs upstream:** `hessian-collect --text wiki.train.raw --chunk 512` on 20 chunks
   against upstream `llama-imatrix` with the same chunks. `in_sum2 / counts` agree per weight
-  within 10⁻³ relative, and the counts are equal.
+  within 10⁻³ relative, and the counts are equal. *(Removed from `tests.sh` on 2026-09-28 along with the
+  upstream build; it passed at 1.25e-3 while it ran, see "Test tolerances changed".)*
 - **Natural space:** Grams from the HQ8_0 0.6B and from BF16 on the same documents differ by at
   most 10⁻² in `max |ΔG_ij| / √(G_ii·G_jj)`. A rotated capture would differ by O(1).
 - **Format:**
@@ -762,7 +763,7 @@ write. Optionally, prefix sharing via `llama_memory_seq_cp` (§6).
     agreement: same model, different text.
   - Channel 3994's share of the attention-input energy in early layers is recorded. The GPTQ plan
     measured 93–98 % from Unsloth's imatrix.
-- **Split-half check** (Grams in `build-hq/calib/work/diag/`):
+- **Split-half check** (Grams in `tools/hessian/calib/work/diag/`):
   - Collect layers 0, 31 and 63 (`--layers`) from two disjoint halves A and B of the set.
   - For each input, report `ε = ‖(G_B + λI)^{-1/2}(G_A − G_B)(G_B + λI)^{-1/2}‖₂`, with
     `λ = 0.01·mean(diag G_B)`, both Grams normalized by their counts. Also report the relative
@@ -794,7 +795,7 @@ write. Optionally, prefix sharing via `llama_memory_seq_cp` (§6).
 | rendered prompts match koboldcpp's token counts; earlier reasoning present | 1 |
 | user's OpenCode data and original repos untouched; work dir removed; kept files match hashes | 1 |
 | hook coverage, groups, layouts, positions/sequence ids, flag-off/on logits identical | 2 |
-| diagonal vs upstream `llama-imatrix` | 3 |
+| diagonal vs upstream `llama-imatrix` (removed from `tests.sh` 2026-09-28, with the upstream build) | 3 |
 | HQ vs BF16 natural-space Gram | 3 |
 | format round trip, aliases, symmetry, `in_sum2 = diag` | 3 |
 | `--imatrix <hessian>` byte-identical quantize, lazy loader RSS | 3 |
@@ -806,7 +807,7 @@ write. Optionally, prefix sharing via `llama_memory_seq_cp` (§6).
 | 27B sanity checks, split-half and position diagnostics | 5 |
 
 `tools/hessian/tests.sh` runs Phases 2–4 on 0.6B, like `tools/quantize/tests-hq.sh`, and removes
-`build-hq/hessian-tests/` when everything passes.
+`tools/hessian/hessian-tests/` when everything passes.
 
 ## Implementation record
 
@@ -1009,7 +1010,8 @@ tech-eval). Not done: GPTQ for the plain types, tool-call validity, the low-rank
   diagonal-plus-rank-one Grams at `n = 5120` and `17408`; refusals, thread invariance and the cache.
   End to end on Qwen3-0.6B (Q4_K_M, wikitext calibration and test): `α = 1` changes 0.2 % of the bytes of
   `--imatrix` GPTQ and the same KL (0.0421 vs 0.0419); `α = 0` 0.0319, `α = 0.25` 0.0273, `α = 0.5` 0.0290.
-- **Evaluation harness:** `build-hq/hessian-eval/` (`ref.sh`, `eval.sh`, `iter.sh`, `queue.sh`). BF16 reference
+- **Evaluation harness:** `tools/hessian/eval/` (`ref.sh`, `eval.sh`, `iter.sh`, `queue.sh`, `compare.sh`; see its
+  README; first `build-hq/hessian-eval/`). BF16 reference
   log-probs with `test-hadamard-ppl-cuda --ref-ngl 33` (2 min per set); each model at `-ngl 99`.
   - wiki: wikitext-2 test, 80 × 512
   - heldout: the 45 held-out documents, 9000 characters each, 64 × 1024
@@ -1096,10 +1098,10 @@ tech-eval). Not done: GPTQ for the plain types, tool-call validity, the low-rank
 | scheduler callback | `ggml/src/ggml-backend.cpp:1751–1787` |
 | imatrix loader | `common/imatrix-loader.{h,cpp}` |
 | koboldcpp template rendering, reasoning streaming | `koboldcpp.py:4018` (`format_jinja`), `:5917–5970` |
-| upstream collector (reference) | `git show 511f9c137:tools/imatrix/imatrix.cpp`; binary `build-hq/upstream-llama/build/bin/llama-imatrix` (53ed051) |
+| upstream collector (reference) | `git show 511f9c137:tools/imatrix/imatrix.cpp`; the 53ed051 build in `build-hq/upstream-llama/` was deleted 2026-09-28 |
 | tool pattern to follow (internal headers, `-ot`, CUDA link) | `tests/tensor-kl.cpp`, `tests/kl-eval.h`, Makefile `tensor-kl-cuda` |
 | the user's OpenCode | `~/.opencode/bin/opencode` (v1.18.32), `~/.config/opencode/opencode.json`, `~/.local/share/opencode/opencode.db` (read-only here) |
-| 0.6B test assets | `build-hq/models/Qwen3-0.6B-BF16.gguf`, `build-hq/models/wikitext-2-raw/`, `build-hq/imatrix-06.gguf` |
+| 0.6B test assets | `tools/models/Qwen3-0.6B-BF16.gguf`, `tools/models/wiki.train.raw`, `tools/models/wiki.test.raw` (`build-hq/imatrix-06.gguf` was deleted 2026-09-28) |
 
 ## References
 

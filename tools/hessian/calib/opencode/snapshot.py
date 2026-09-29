@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # State of what the OpenCode runs must not touch: the user's OpenCode database (row counts, read from a copy)
-# and config, and the original repos (HEAD and git status). With two arguments, compares a snapshot to now.
+# and config (their XDG locations), and the original repos in $USER_REPOS that tasks.jsonl's user: entries name
+# (HEAD and git status). With two arguments, compares a snapshot to now.
 #
 # usage: snapshot.py OUT.json | snapshot.py --compare BEFORE.json
 
@@ -14,12 +15,15 @@ import sys
 import tempfile
 from pathlib import Path
 
-HOME = Path.home()
-REPOS = ["airi", "neovim", "hegel-rust", "voicebox", "xet-core", "remove-refusals-with-transformers"]
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from common import opencode_config, opencode_data, user_repos  # noqa: E402
+
+TASKS = Path(__file__).resolve().parent / "tasks.jsonl"
+REPOS = sorted({t["repo"][len("user:"):] for t in map(json.loads, open(TASKS)) if t["repo"].startswith("user:")})
 
 
 def db_state():
-    src = HOME / ".local/share/opencode"
+    src = opencode_data()
     out = {"files": {}}
     for p in sorted(src.glob("opencode.db*")):
         st = p.stat()
@@ -36,16 +40,17 @@ def db_state():
 
 def config_state():
     out = {}
-    for p in sorted((HOME / ".config/opencode").rglob("*")):
+    base = opencode_config()
+    for p in sorted(base.rglob("*")):
         if p.is_file() and "node_modules" not in p.parts:
-            out[str(p.relative_to(HOME))] = hashlib.sha256(p.read_bytes()).hexdigest()
+            out[str(p.relative_to(base))] = hashlib.sha256(p.read_bytes()).hexdigest()
     return out
 
 
 def repo_state():
     out = {}
     for r in REPOS:
-        d = HOME / "Sandbox" / r
+        d = user_repos() / r
         head = subprocess.run(["git", "-C", str(d), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
         status = subprocess.run(["git", "-C", str(d), "status", "--porcelain"], capture_output=True, text=True).stdout
         out[r] = {"head": head, "status": hashlib.sha256(status.encode()).hexdigest(), "n_changed": len(status.splitlines())}
@@ -66,7 +71,7 @@ def main():
         if before["opencode_db"]["files"] != now["opencode_db"]["files"]:
             problems.append("opencode.db files changed (size or mtime)")
         if before["opencode_config"] != now["opencode_config"]:
-            problems.append("~/.config/opencode changed")
+            problems.append("the OpenCode config changed")
         for r, s in before["repos"].items():
             if now["repos"][r] != s:
                 problems.append(f"repo {r} changed: {s} -> {now['repos'][r]}")

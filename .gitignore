@@ -65,6 +65,10 @@ models-mnt
 /hessian-collect*
 /hessian-tokenize
 /test-hessian
+/tools/hessian/hessian-tests/
+/tools/hessian/calib/work/
+/tools/hessian/eval/work/
+/tools/hessian/eval/texts/
 /gguf-split
 /test-backend-ops
 /bench-rht
@@ -173,3 +177,6 @@ conda/
 
 # Jetbrains idea folder
 .idea/
+
+# the tests' model and texts, passed in as arguments (tools/quantize/README.md, "Tests")
+/tools/models/

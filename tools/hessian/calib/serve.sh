@@ -1,12 +1,11 @@
 #!/bin/bash
-# koboldcpp serving Qwen3.8-27B-HQ8_0 for the calibration set.
+# koboldcpp serving the generator model ($GEN_MODEL, Qwen3.8-27B-HQ8_0) for the calibration set.
 #   serve.sh gen       raw completions, 8 parallel requests, port 5002
 #   serve.sh opencode  the user's OpenCode settings (jinja, tools, q5_1 KV, MTP), one session, 128k context, port 5003
 #   serve.sh stop
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
-WORK=$ROOT/build-hq/calib/work
-MODEL=${MODEL:-$HOME/Sandbox/unquantized/Qwen3.8-27B-gguf/Qwen3.8-27B-HQ8_0.gguf}
+WORK=$ROOT/tools/hessian/calib/work
 PIDFILE=$WORK/server.pid
 mkdir -p "$WORK"
 
@@ -22,9 +21,10 @@ stop() {
 start() {
     local log=$WORK/server-$1.log port=$2
     shift 2
+    [[ -n ${GEN_MODEL:-} ]] || { echo "set GEN_MODEL to the generator GGUF (Qwen3.8-27B-HQ8_0.gguf for qwen38-calib-v1)"; return 1; }
     stop
     cd "$ROOT"
-    nohup python3 koboldcpp.py --model "$MODEL" --usecuda normal 0 --gpulayers 99 --skiplauncher --quiet \
+    nohup python3 koboldcpp.py --model "$GEN_MODEL" --usecuda normal 0 --gpulayers 99 --skiplauncher --quiet \
         --threads 7 --port "$port" "$@" > "$log" 2>&1 &
     echo $! > "$PIDFILE"
     for _ in $(seq 600); do
