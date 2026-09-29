@@ -891,6 +891,13 @@ struct llm_graph_fused_node {
     int il;
 };
 
+// a weight GEMM's input, before any Hadamard rotation of it
+struct llm_graph_mm_input {
+    ggml_tensor * x;
+    ggml_tensor * w;
+    bool          id; // MUL_MAT_ID
+};
+
 class llm_graph_result {
 public:
     llm_graph_result(int64_t max_nodes);
@@ -947,6 +954,8 @@ public:
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
+
+    std::vector<llm_graph_mm_input> mm_inputs; // filled when cparams.collect_mm_inputs is set
 
     ggml_context_ptr ctx_compute;
 
@@ -1049,7 +1058,7 @@ struct llm_graph_context {
     void cb(ggml_tensor * cur, const char * name, int il) const;
 
     // R*cur if w is rotated, else cur; each activation is rotated once for all its consumers
-    ggml_tensor * rotate_input_if_rotated(ggml_tensor * w, ggml_tensor * cur) const;
+    ggml_tensor * rotate_input_if_rotated(ggml_tensor * w, ggml_tensor * cur, bool id = false) const;
 
     mutable std::map<std::pair<ggml_tensor *, uint64_t>, ggml_tensor *> hadamard_rot_cache; // (input, seed)
 

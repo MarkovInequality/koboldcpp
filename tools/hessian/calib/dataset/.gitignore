@@ -1,0 +1,3 @@
+# third-party text and the user's own OpenCode sessions: never commit
+*
+!.gitignore

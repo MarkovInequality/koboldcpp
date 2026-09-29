@@ -3,7 +3,8 @@
 Status: implemented (2026-09-26), phases 1–6; see the Implementation record. Builds on
 `plans/full_row_rht_quantization_plan.md` (the HQ types) and supersedes its §8.1 ("no imatrix for HQ
 types"). A research prototype (`build-hq/investigate/requant3.cpp`, see "The prototype") produced the
-measurements quoted before the Implementation record.
+measurements quoted before the Implementation record. *(`build-hq/investigate/` was deleted on
+2026-09-27. Its measurements survive only as quoted here.)*
 
 ## Summary
 
@@ -77,7 +78,7 @@ against 36 % on wiki.test.
 - **Outside the calibration domain (tech-eval),** Q4_K rows: imatrix 0.0327, HQ 0.0513,
   HQ + GPTQ 0.0219.
 
-**Why uniform rounding loses** (investigation in `build-hq/investigate/`):
+**Why uniform rounding loses** (investigation in `build-hq/investigate/`, deleted 2026-09-27):
 - **It's not activation quantization.** Dequantizing to F32 gives the same KLs.
 - **A few input channels carry most of the activation energy** (massive activations
   [Sun et al. 2024] / attention sinks). In Qwen3-4B `blk.6.ffn_down`, 4 channels hold 99.8 % of
@@ -605,7 +606,9 @@ against base + imatrix.
 
 **A/B tests with code variants** (`build-hq/quantize-ab`, built from the patched copy
 `build-hq/investigate/ggml-quants-hq-ab.c` with `link-quantize-ab.sh`; byte-identical to
-`quantize_gguf` with the switches `GGML_HQ_AB_METRIC` and `GGML_HQ_AB_RESEARCH` off):
+`quantize_gguf` with the switches `GGML_HQ_AB_METRIC` and `GGML_HQ_AB_RESEARCH` off). *(The patched
+source and the link script were deleted with `build-hq/investigate/` on 2026-09-27; only the
+`quantize-ab` binary remains.)*
 - **Codebook group metric:** picking each group in `diag((U_ggᵀU_gg)⁻¹)` instead of plain L2 changes
   nothing measurable. For all five codebook types, every KL is within 0.1 % (e.g. HQ3_S 0.1804 /
   0.1523, HQ2_XXS 1.554 / 1.400). The rotated `H` has a flat diagonal, so those weights are nearly
@@ -697,8 +700,10 @@ of the same activations):
 **Held-out KL isn't measured yet,** and it decides whether to go ahead.
 - In-sample error favours richer Hessians: full covariance on Qwen3-0.6B had output error 0.207
   in-sample against 0.409 held out.
-- The five models are in `build-hq/investigate/q4b/Q4_K-hq-gptq-*.gguf`, and `lowrank4b.sh`
-  holds the evaluation commands (wiki.test and tech-eval).
+- The five models were in `build-hq/investigate/q4b/Q4_K-hq-gptq-*.gguf`, with the evaluation
+  commands in `lowrank4b.sh` (wiki.test and tech-eval). *(All deleted 2026-09-27, along with the
+  prototype and the captured activations they were built from. Running this test now means
+  rebuilding them.)*
 - Go ahead only if the held-out KL beats diag.
 
 **Size:** `n·k` floats per distinct input. At k = 64 that's about 175 MB for Qwen3-4B and 0.55 GB
@@ -731,7 +736,7 @@ than a fixed number.
 - **Mean term only:** diag + `μμᵀ`, the k = 1 case above. It needs `Σx` per channel next to
   `Σx²`, a small addition to any collector.
 - **GPU factorization** when a CUDA build runs the quantizer: the prototype's cuSOLVER path,
-  `gpufactor.cu`.
+  `gpufactor.cu` (deleted 2026-09-27; its approach is described in "The prototype").
 - **Half the factor memory:** factor the fp64 matrix in packed, panel-major storage. That's
   `6·n²` bytes instead of `10·n²`, and it raises the width limit under the default cap to about
   37 000. It's worth doing only if models that wide appear.
@@ -740,6 +745,10 @@ than a fixed number.
   rotation still adds value.
 
 ## The prototype
+
+> **Deleted 2026-09-27:** `build-hq/investigate/` was removed, along with everything this section
+> describes: the source, the build script, the drivers, and the captured activations
+> (`act4b`, `act06`). The description is kept as a record of what the prototype did.
 
 Research code, not in the tree: `build-hq/investigate/` (git-ignored), built with
 `./build.sh requant3 "" gpu`.
@@ -770,7 +779,8 @@ Research code, not in the tree: `build-hq/investigate/` (git-ignored), built wit
   `gpu_xtx`, `gpu_quad` for output error, and `gpu_topk_eig` (`Ssyevdx`) for the low-rank mode.
 - **`capture.cpp`** dumps every weight-GEMM input via `cb_eval`: `act4b` (Qwen3-4B) and `act06`
   (0.6B) on wiki.train.
-- **Drivers:** `lowrank4b.sh` (the low-rank sweep) and `../q06cmp.sh` (the 0.6B table).
+- **Drivers:** `lowrank4b.sh` (the low-rank sweep) and `../q06cmp.sh` (the 0.6B table;
+  `build-hq/q06cmp.sh` still exists).
 
 ## Key file index
 

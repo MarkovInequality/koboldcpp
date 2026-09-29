@@ -1,6 +1,7 @@
 #pragma once
 
-// GPTQ error feedback for the Hadamard-rotated (HQ) types, with H = R*diag(v)*R^T from an imatrix v
+// GPTQ error feedback for the Hadamard-rotated (HQ) types, with H = R*diag(v)*R^T from an imatrix v, or from a full
+// input Gram G (hessian-collect)
 
 #include "ggml.h"
 
@@ -8,7 +9,9 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <list>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -51,7 +54,18 @@ bool llama_gptq_normalize(const float * v, int64_t n, std::vector<float> & vbar)
 bool llama_gptq_factor(const float * v, int64_t n, uint64_t seed, float damp, std::vector<float> & U,
                        std::vector<std::thread> & workers, int nthread);
 
-// the most recently used factors, keyed by (vbar, n, seed, damp); the cache and a factor being built
+// bytes of building a factor from a full Gram
+size_t llama_gptq_build_bytes_full(int64_t n);
+
+// U as llama_gptq_factor builds it, for H = R*((1 - alpha)*Gbar + alpha*diag(Gbar) + damp*I)*R^T with Gbar =
+// G/mean(diag G): alpha = 1 is the diagonal H of llama_gptq_factor. read_gram fills the n x n Gram. false for damp <
+// LLAMA_GPTQ_DAMP_MIN, alpha outside [0, 1], a width without an RHT, a Gram that can't be read or has a negative or
+// all-zero diagonal, or a breakdown of the factorization
+bool llama_gptq_factor_full(const std::function<bool(float *)> & read_gram, int64_t n, uint64_t seed, float alpha, float damp,
+                            std::vector<float> & U, std::vector<std::thread> & workers, int nthread);
+
+// the most recently used factors, keyed by (vbar, n, seed, damp), or for full Grams by (key, n, seed, alpha, damp);
+// the cache and a factor being built
 // together stay within cap bytes
 struct llama_gptq_cache {
     // REFUSED: v or damp is refused by llama_gptq_factor; FAILED: the factorization broke down
@@ -63,15 +77,21 @@ struct llama_gptq_cache {
     const float * get(const float * v, int64_t n, uint64_t seed, float damp,
                       std::vector<std::thread> & workers, int nthread, status * st = nullptr);
 
+    // the full-Gram factor of the input named key (its owner weight); read_gram is called only to build it
+    const float * get_full(const std::string & key, const std::function<bool(float *)> & read_gram, int64_t n, uint64_t seed,
+                           float alpha, float damp, std::vector<std::thread> & workers, int nthread, status * st = nullptr);
+
     size_t size()  const { return entries.size(); }
     size_t bytes() const;
 
 private:
     struct entry {
         std::vector<float> vbar;
+        std::string key; // empty for an imatrix factor
         int64_t  n;
         uint64_t seed;
         float    damp;
+        float    alpha;
         std::vector<float> U;
     };
 

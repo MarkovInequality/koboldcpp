@@ -79,10 +79,11 @@ static bool common_imatrix_load_legacy(const std::string & fname, common_imatrix
     return true;
 }
 
+// only the .in_sum2 and .counts data are read, so a hessian file's Grams (.in_gram) are never loaded
 bool common_imatrix_load(const std::string & fname, common_imatrix & imatrix) {
     struct ggml_context * ctx = nullptr;
     struct gguf_init_params meta_gguf_params = {
-        /* .no_alloc = */ false,
+        /* .no_alloc = */ true,
         /* .ctx      = */ &ctx,
     };
     struct gguf_context * ctx_gguf = gguf_init_from_file(fname.c_str(), meta_gguf_params);
@@ -132,6 +133,16 @@ bool common_imatrix_load(const std::string & fname, common_imatrix & imatrix) {
         }
     }
 
+    std::ifstream in(fname, std::ios::binary);
+    const size_t data_offset = gguf_get_data_offset(ctx_gguf);
+    auto read_f32 = [&](const struct ggml_tensor * t, std::vector<float> & out) {
+        out.resize(ggml_nelements(t));
+        in.seekg((std::streamoff) (data_offset + gguf_get_tensor_offset(ctx_gguf, gguf_find_tensor(ctx_gguf, t->name))));
+        in.read((char *) out.data(), out.size()*sizeof(float));
+        return !in.fail();
+    };
+    std::vector<float> sums_data, counts_data;
+
     for (const auto & sc : sums_counts_for) {
         const std::string &        name    = sc.first;
         const struct ggml_tensor * in_sum2 = sc.second.first;
@@ -151,19 +162,18 @@ bool common_imatrix_load(const std::string & fname, common_imatrix & imatrix) {
             return false;
         }
 
-        auto & e = imatrix.entries[name];
-
-        const int64_t nval    = ggml_nelements(in_sum2);
-        const int64_t ncounts = ggml_nelements(counts);
-
-        e.sums.resize(nval);
-        for (int64_t j = 0; j < nval; ++j) {
-            e.sums[j] = ((const float *) in_sum2->data)[j];
+        if (!read_f32(in_sum2, sums_data) || !read_f32(counts, counts_data)) {
+            LOG_ERR("%s: failed reading data for %s from %s\n", __func__, name.c_str(), fname.c_str());
+            gguf_free(ctx_gguf);
+            ggml_free(ctx);
+            return false;
         }
 
-        e.counts.resize(ncounts);
-        for (int64_t j = 0; j < ncounts; ++j) {
-            e.counts[j] = std::lround(((const float *) counts->data)[j]);
+        auto & e = imatrix.entries[name];
+        e.sums = sums_data;
+        e.counts.resize(counts_data.size());
+        for (size_t j = 0; j < counts_data.size(); ++j) {
+            e.counts[j] = std::lround(counts_data[j]);
         }
     }
 

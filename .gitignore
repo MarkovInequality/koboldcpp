@@ -62,6 +62,9 @@ models-mnt
 /test-hadamard*
 /test-hq-gptq
 /tensor-kl*
+/hessian-collect*
+/hessian-tokenize
+/test-hessian
 /gguf-split
 /test-backend-ops
 /bench-rht

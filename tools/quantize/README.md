@@ -57,7 +57,9 @@ Options:
 * `--hadamard` rotate each weight row by a randomized Hadamard transform and store the tensor as its [HQ type](#hadamard-rotated-hq-quantization), improving quality at the same file size
 * `--hadamard-seed N` seed of the rotation's random signs (default: a fixed seed, so builds are reproducible)
 * `--lora FILE[:scale]` merge a LoRA adapter into the weights while quantizing (may be repeated)
-* `--imatrix file_name` use data in file_name as importance matrix for quant optimizations
+* `--imatrix file_name` use data in file_name as importance matrix for quant optimizations. A hessian file from `hessian-collect` (`tools/hessian/`) works here too: only its `in_sum2`/`counts` are read, not its Grams
+* `--hessian file_name` a hessian file from `hessian-collect`: HQ tensors use each input's full Gram in GPTQ (see "With a hessian file" below); it is also the importance matrix unless `--imatrix` is given
+* `--hessian-alpha A` with `--hessian`, shrink each Gram toward its diagonal, `(1−A)·G + A·diag(G)`: 0.1 by default (the best measured), 0 is the full Gram, 1 the imatrix's diagonal GPTQ
 * `--include-weights tensor_name` use importance matrix for this tensor (can be specified multiple times)
 * `--exclude-weights tensor_name` use importance matrix for the tensors **not** specified (include/exclude cannot be mixed)
 * `--output-tensor-type` use a specific quant type for the output.weight tensor
@@ -236,6 +238,55 @@ GPTQ uses the imatrix `v` as a diagonal Hessian of the unrotated inputs, rotated
 * **Tensors without an imatrix entry** use uniform weights, with one warning that counts them, and so do the experts of a 3D tensor whose imatrix slice is all zero. The unrotated types in the same mix use the imatrix as usual.
 * **Metadata:** `quantize.hq.gptq_damp` records the damping when GPTQ ran, and is kept when HQ tensors are copied from a file that has it; nothing reads it.
 * **Developer switches:** `LLAMA_HQ_GPTQ=0` turns GPTQ off (HQ tensors then ignore the imatrix, byte-identical to a run without one), and `LLAMA_HQ_GPTQ_DAMP=<x>` sets the damping (default 0.01, at least 0.001).
+
+### With a hessian file: full-Hessian GPTQ
+
+`--hessian FILE` takes each weight's input Gram `G = Σ x·xᵀ` from a `hessian-collect` file (`tools/hessian/`) in place of
+the imatrix's diagonal: `H = R·((1−α)·Ĝ + α·diag(Ĝ) + damp·I)·Rᵀ` with `Ĝ = G / mean(diag G)` and `α` from
+`--hessian-alpha` (default 0.1), so `α = 1` is the diagonal GPTQ above (the same factor up to rounding). The full
+Gram also captures the correlations between input channels, which the diagonal can't. Its smallest eigenvalues are
+poorly determined by a finite calibration set, which is what `α` and the damping trade off.
+
+```
+# Qwen3.8-27B with Unsloth's UD-Q4_K_M tensor types as HQ types, full-Hessian GPTQ at the defaults (α 0.1, damp 0.01)
+./quantize_gguf --hadamard --tensor-type-file Qwen3.8-27B-UD-Q4_K_M.tensor-types.txt \
+    --hessian qwen38-27b-hessian-v1.gguf Qwen3.8-27B-bf16.gguf Qwen3.8-27B-HQ-Q4_K_M-fullH.gguf Q4_K_M
+```
+
+`--hessian` is also the importance matrix, so no `--imatrix` is needed; the `Q4_K_M` argument only covers tensors the
+types file doesn't list. On 8 cores this takes about 27 minutes and 8 GB of RAM at peak.
+
+* **What uses it:** every HQ tensor that has a Gram in the file (a 2D weight whose input the collector saw), is in the
+  importance matrix (so `--include-weights`/`--exclude-weights` apply) and isn't disabled by `LLAMA_HQ_GPTQ=0`. The
+  other HQ tensors fall back to the imatrix. Tensors that share an input (q/k/v, gate/up, the DeltaNet inputs) share
+  one Gram and one factor.
+* **Cost:** the factor comes from a Cholesky of the `n × 2n` matrix `[J·H·J | I]` (`J` reverses the index order), about
+  11 s at `n = 17408` on 8 cores, and needs `20·n²` bytes (6.1 GB at `n = 17408`), capped by `--max-buffer-size`: a
+  wider input is refused. Each Gram is read once from the file (`4·n²` bytes).
+* **Metadata:** `quantize.hq.gptq_hessian_alpha`, and `quantize.hq.gptq_hessian` (the file's dataset tag).
+
+**Measured on Qwen3.8-27B** (the command above at 4.818 bpw, the same size as Unsloth's UD-Q4_K_M; the Hessian from
+`qwen38-calib-v1`, 1.0M tokens). Mean KL to BF16 / top-1 agreement:
+
+- **wiki:** wikitext-2 test, 80 × 512 tokens
+- **heldout:** the calibration set's held-out chat, agentic, coding and math documents, 64 × 1024
+- **opencode:** the user's own OpenCode sessions, never calibrated on, 36 × 2048
+
+heldout and opencode are scored with `test-hadamard-ppl --chat-mask`: only the assistant's own turns.
+
+| quantization | wiki | heldout | opencode |
+|---|---|---|---|
+| UD-Q4_K_M (Unsloth) | 0.00904 / 95.68 % | 0.01210 / 96.39 % | 0.00843 / 97.11 % |
+| `--hessian-alpha 1` (the diagonal) | 0.01015 / 95.56 % | 0.00911 / 96.99 % | 0.00724 / 97.41 % |
+| `--hessian-alpha 0` (the full Gram) | 0.00948 / 95.84 % | 0.00856 / 97.30 % | 0.00568 / 97.68 % |
+| **`--hessian-alpha 0.1`** (default) | **0.00912 / 96.08 %** | **0.00794 / 97.25 %** | **0.00582 / 97.69 %** |
+
+- **The full Gram beats the diagonal on every set:** 31–34 % below UD-Q4_K_M's KL on chat and agentic text.
+  wikitext stays about level with UD, because the calibration set has little wiki-style prose.
+- **The exact setting matters little.** α from 0 to 0.1 and damping (`LLAMA_HQ_GPTQ_DAMP`) from 0.003 to 0.1 all
+  land within a few percent of each other, while α = 0.25 is worse (0.01002 / 0.00812 / 0.00660).
+- **The per-run log**, with every setting tried, is in `plans/hessian_collection_plan.md` ("Follow-up: full-Hessian
+  GPTQ").
 
 ### Measured quality
 
@@ -452,11 +503,11 @@ Some take a small model and a text file: a BF16 GGUF of Qwen3-0.6B (e.g. `Qwen3-
 | `test-hadamard` | The rotation itself: every Hadamard matrix (`H·Hᵀ = K·I`, the set of orders, row orientation), the width rule, the random signs (golden vectors), the transform against a dense `R` built from its definition, thread safety, that every way of splitting the work gives the same bytes, the HQ types' traits, pairing and names, row validation, and the CPU op with 1, 4 and 16 threads. | `./test-hadamard` |
 | `test-hadamard-quants` | The HQ quantizers: the base quantizers are unchanged (output hashes), HQ output decodes with the base type's kernels, no imatrix is needed or used, first-use initialization, determinism across threads, and a quantize → dequantize → un-rotate round trip. Also reports MSE against the base quantizers and how often the IQ2/IQ3 neighbour search differs from an exhaustive one. About a minute. | `./test-hadamard-quants` |
 | `test-hadamard-quantize` | The quantizer tool, through `llama_model_quantize` on a two-layer copy of the model: stored rows are `R·w` with the file's seed; the same seed gives identical files, any thread count gives identical files, and `--hadamard-seed` changes only the HQ tensors and the key; `hadamard.seed` is the only HQ metadata without an imatrix; with a synthetic imatrix, GPTQ runs by default (one info line, `quantize.hq.gptq_damp`), tensors without an entry get the uniform bytes with one warning, `LLAMA_HQ_GPTQ=0` gives the uniform bytes, `LLAMA_HQ_GPTQ_DAMP` is checked and recorded, files are identical across thread counts, and HQ → the same HQ stays a copy; unsupported widths keep their type (and an explicit HQ type for one is refused); the refusals (HQ token embeddings, a missing seed, a conflicting seed, HQ → unrotated); the requantize rules, including GPTQ in the source's seed; the `--lora` merge math, with and without an imatrix, and its refusals; and per-expert factors for a 3D tensor. About a minute. | `./test-hadamard-quantize <workdir> <Qwen3-0.6B-BF16.gguf>` |
-| `test-hq-gptq` | GPTQ for the HQ types: the fp64 factor of `H⁻¹` (`U·H·Uᵀ = I` for widths up to 17 408 and several imatrix shapes, the worst case at the damping floor, the refusals, the same bytes for any thread count, and its timing), the factor cache (hits, LRU eviction, the memory cap), `quantize_hq`'s output unchanged for all seventeen types (hashes recorded before GPTQ went in, or when a type was added), a scaled identity factor giving the uniform bytes, and for every type: the output error under `H` against uniform rounding, valid output that decodes with the base type's kernels, sign parity, and the same bytes for any row grouping and thread count. About a minute; `--quick` skips the factor sweep. | `./test-hq-gptq [--quick]` |
+| `test-hq-gptq` | GPTQ for the HQ types: the fp64 factor of `H⁻¹` (`U·H·Uᵀ = I` for widths up to 17 408 and several imatrix shapes, the worst case at the damping floor, the refusals, the same bytes for any thread count, and its timing), the factor from a full Gram (equal to the imatrix factor for a diagonal Gram and at `α = 1`, `U·H·Uᵀ = I` for random Grams of full and low rank at several `α` and dampings and for `n = 5120` and `17 408`, the refusals, thread invariance, its cache), the factor cache (hits, LRU eviction, the memory cap), `quantize_hq`'s output unchanged for all seventeen types (hashes recorded before GPTQ went in, or when a type was added), a scaled identity factor giving the uniform bytes, and for every type: the output error under `H` against uniform rounding, valid output that decodes with the base type's kernels, sign parity, and the same bytes for any row grouping and thread count. About a minute; `--quick` skips the factor sweep. | `./test-hq-gptq [--quick]` |
 | `test-hadamard-llama` | Loading and running HQ models. It takes plain quantizations and relabels their eligible tensors as HQ (the data isn't rotated; that doesn't matter here). Checks: HQ tensors load as their base type with the same bytes and buffer types (including the CPU repack), the loader still reports the HQ types, a saved model round-trips with its types and seed, one rotation per distinct rotated activation, no Hadamard graph inputs, the LoRA branch uses the unrotated input, the graph guard refuses every misuse of a rotated weight (wrong input, GET_ROWS, ADD, writes, views), a missing seed and a rotated `token_embd` are refused, and a model with an RPC device (an in-process server on 127.0.0.1:50931) is refused. The `-cuda` build also loads a real HQ model on the GPU and compares its logits with the CPU's. | `./quantize_gguf --pure <model-bf16.gguf> pure-q4k.gguf Q4_K`, then `./test-hadamard-llama <workdir> pure-q4k.gguf [more plain quantizations]` (same for `-cuda`) |
 | `test-backend-ops` | Upstream's backend test harness plus this fork's cases (`make_test_cases_fork`): the RHT op on CUDA against the CPU for every kernel, Hadamard order and width class, row counts, strides and 3D inputs; that CUDA accepts every width the rule accepts; and the graphs where the rotation writes the matmuls' 8-bit input directly, including every case that must fall back. | `./test-backend-ops -o RHT -b CUDA0`, also `-o MUL_MAT` and `-o MUL_MAT_ID`; repeat with `GGML_CUDA_DISABLE_FUSION=1` (all fusion off) and `GGML_CUDA_RHT_F32=1` (only the direct 8-bit output off) |
 | `bench-rht` | The CUDA kernels against the reference transform for every width class, the 8-bit outputs byte for byte against `quantize.cu`, and the device sign generator; then timings as CSV: µs per rotation in a CUDA graph for decode, and bandwidth against a copy for 512 rows. | `./bench-rht`; `--sweep` adds the kernel variants, `--once` launches each once for `ncu`, `-n N[,N...]`, `-r ROWS`, `-k A\|B` restrict the shapes |
-| `test-hadamard-ppl` | Quality against a reference model: perplexity, mean and 99th-percentile KL divergence, top-token agreement and bits per weight, over windows of a text file. The reference's log-probabilities are cached to a file (FP16, about 6 GB for 80 windows with a 152k vocabulary) and reused, also for runs with fewer windows. `--lora` applies an adapter to every model. | `./test-hadamard-ppl-cuda -ngl 99 --chunks 80 [--cache FILE] [--lora FILE] wiki.test.raw <reference-bf16.gguf> <model.gguf>...` (CPU: `./test-hadamard-ppl` without `-ngl`) |
+| `test-hadamard-ppl` | Quality against a reference model: perplexity, mean and 99th-percentile KL divergence, top-token agreement and bits per weight, over windows of a text file. The reference's log-probabilities are cached to a file (FP16, about 6 GB for 80 windows with a 152k vocabulary) and reused, also for runs with fewer windows; with a cache the reference is only read for its vocabulary, and its row comes from the cache. `--ref-ngl N` places the reference while its log-probs are computed (a BF16 model larger than VRAM); `--parallel N` decodes N windows per batch; `--special` parses special tokens in the text, and `--chat-mask` then scores only the tokens a chat model generates (its own turns and text outside any turn: chat models aren't trained to predict system, user and tool turns, and the KL there is noise); `--lora` applies an adapter to every model. | `./test-hadamard-ppl-cuda -ngl 99 --chunks 80 [--ref-ngl N] [--parallel N] [--cache FILE] [--lora FILE] [--special [--chat-mask]] wiki.test.raw <reference-bf16.gguf> <model.gguf>...` (CPU: `./test-hadamard-ppl` without `-ngl`) |
 | `tensor-kl` | Per-weight quantization sensitivity at a model's operating point; see [Per-weight sensitivity](#per-weight-sensitivity-tensor-kl). | `./tensor-kl-cuda [options] wiki.test.raw <reference-bf16.gguf> <model.gguf>` |
 
 `tools/quantize/tests-hq.sh` runs the whole set end to end on Qwen3-0.6B. It checks that no backend references the HQ types, runs the unit tests above, and quantizes and generates with `--hadamard` for Q8_0, Q4_K_M, Q5_K_M, Q4_0, IQ4_XS, Q3_K_M, IQ3_S, IQ3_XS, Q2_K and IQ2_XXS (the 4–8 bit ones must answer "Paris"). It then checks HQ5_K → HQ4_XS requantizing, runtime LoRA and `--lora` merges by KL (it writes a synthetic adapter with Python, so it needs `python3` and `numpy`), and, with `CUDA=1` on a build with CUDA graphs, that graphs on and off give identical output. About 10–15 minutes on the CPU, 5 on the GPU:

@@ -3,6 +3,7 @@
 #include "llama-model-loader.h"
 #include "llama-ext.h"
 #include "llama-quant-gptq.h"
+#include "llama-hessian.h"
 #include "llama.h"
 
 #include <algorithm>
@@ -212,6 +213,7 @@ struct tensor_metadata {
     bool            allows_quantization;
     bool            requires_imatrix;
     bool            use_gptq = false;
+    bool            use_gptq_full = false; // from the hessian file's Gram
 };
 
 //
@@ -1122,6 +1124,21 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         }
     }
 
+    std::unique_ptr<llama_hessian> hessian;
+    if (params->hessian) {
+        hessian = std::make_unique<llama_hessian>();
+        if (!hessian->open(params->hessian)) {
+            throw std::runtime_error(format("failed to read the hessian file %s", params->hessian));
+        }
+        if (!hessian->complete) {
+            throw std::runtime_error(format("%s is an incomplete hessian-collect run", params->hessian));
+        }
+        if (!(params->hessian_alpha >= 0.0f && params->hessian_alpha <= 1.0f)) {
+            throw std::runtime_error(format("hessian_alpha %g: needs 0 to 1", params->hessian_alpha));
+        }
+        LLAMA_LOG_INFO("%s: hessian file with %zu weights' Grams\n", __func__, hessian->weights().size());
+    }
+
     // GPTQ for the HQ types with an imatrix: on unless LLAMA_HQ_GPTQ=0; LLAMA_HQ_GPTQ_DAMP for experiments
     const char * gptq_env = getenv("LLAMA_HQ_GPTQ");
     const bool   hq_gptq  = !(gptq_env && strcmp(gptq_env, "0") == 0);
@@ -1248,6 +1265,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     size_t n_rotated_out      = 0;
     size_t n_imatrix_ignored  = 0;
     size_t n_gptq             = 0;
+    size_t n_gptq_full        = 0;
     size_t n_gptq_missing     = 0;
     size_t n_gptq_zero_slices = 0;
     size_t n_hq_copied        = 0;
@@ -1316,8 +1334,20 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             n_rotated_out++;
             const bool quantized = tensor->type != metadata[i].target_type || lora_deltas.count(orig_names.at(it));
             n_hq_copied += !quantized;
-            if (imatrix_data && quantized) {
-                const auto im = imatrix_data->find(remap_imatrix(tensor->name, mapped));
+            const int64_t n_in = tensor->ne[0];
+            const std::string im_name = remap_imatrix(tensor->name, mapped);
+            if (hessian && imatrix_data && imatrix_data->count(im_name) && quantized && hq_gptq && tensor->ne[2] == 1 &&
+                hessian->n(im_name) == n_in) {
+                if (llama_gptq_build_bytes_full(n_in) > max_buf_size) {
+                    throw std::runtime_error(format("%s: the full-Hessian GPTQ factor for width %" PRId64 " needs %.1f GiB, more than "
+                        "--max-buffer-size", tensor->name, n_in, llama_gptq_build_bytes_full(n_in)/1024.0/1024.0/1024.0));
+                }
+                metadata[i].use_gptq      = true;
+                metadata[i].use_gptq_full = true;
+                n_gptq++;
+                n_gptq_full++;
+            } else if (imatrix_data && quantized) {
+                const auto im = imatrix_data->find(im_name);
                 const int64_t n = tensor->ne[0];
                 if (!hq_gptq) {
                     n_imatrix_ignored += im != imatrix_data->end();
@@ -1375,10 +1405,24 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     }
     // a source's key still describes the HQ tensors copied from it
     if (n_gptq > 0) {
-        LLAMA_LOG_INFO("%s: %zu HQ tensors use the imatrix through GPTQ (damp %g)\n", __func__, n_gptq, gptq_damp);
+        if (n_gptq_full == 0) {
+            LLAMA_LOG_INFO("%s: %zu HQ tensors use the imatrix through GPTQ (damp %g)\n", __func__, n_gptq, gptq_damp);
+        } else {
+            LLAMA_LOG_INFO("%s: %zu HQ tensors use GPTQ (damp %g), %zu of them with the full Hessian (alpha %g)\n", __func__,
+                           n_gptq, gptq_damp, n_gptq_full, params->hessian_alpha);
+        }
         gguf_set_val_f32(ctx_outs[0].get(), "quantize.hq.gptq_damp", gptq_damp);
     } else if (n_hq_copied == 0) {
         gguf_remove_key(ctx_outs[0].get(), "quantize.hq.gptq_damp");
+    }
+    if (n_gptq_full > 0) {
+        gguf_set_val_f32(ctx_outs[0].get(), "quantize.hq.gptq_hessian_alpha", params->hessian_alpha);
+        if (!hessian->datasets.empty()) {
+            gguf_set_val_str(ctx_outs[0].get(), "quantize.hq.gptq_hessian", hessian->datasets[0].c_str());
+        }
+    } else {
+        gguf_remove_key(ctx_outs[0].get(), "quantize.hq.gptq_hessian_alpha");
+        gguf_remove_key(ctx_outs[0].get(), "quantize.hq.gptq_hessian");
     }
     if (n_gptq_missing > 0) {
         LLAMA_LOG_WARN("%s: WARNING: %zu HQ tensors have no usable imatrix entry - they use uniform weights\n", __func__, n_gptq_missing);
@@ -1586,7 +1630,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     throw std::runtime_error(format("requantizing from type %s is disabled", ggml_type_name(tensor->type)));
                 }
 
-                LLAMA_LOG_INFO("converting to %s%s .. ", ggml_type_name(new_type), tm.use_gptq ? " (gptq)" : "");
+                LLAMA_LOG_INFO("converting to %s%s .. ", ggml_type_name(new_type), tm.use_gptq_full ? " (gptq, full H)" : tm.use_gptq ? " (gptq)" : "");
                 fflush(stdout);
                 double t_factor = 0, t_encode = 0;
 
@@ -1612,7 +1656,18 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
                     // one factor per expert; an all-zero slice keeps uniform weights
                     const float * gptq_U = nullptr;
-                    if (tm.use_gptq && imatrix_03) {
+                    if (tm.use_gptq_full) {
+                        GGML_ASSERT(f32_copy);
+                        const auto t0 = std::chrono::steady_clock::now();
+                        const std::string & w = tm.remapped_imatrix_name;
+                        llama_gptq_cache::status st;
+                        gptq_U = gptq_cache.get_full(hessian->owner(w), [&](float * dst) { return hessian->read(w, dst); }, n_per_row,
+                                                     hadamard_seed, params->hessian_alpha, gptq_damp, workers, nthread, &st);
+                        t_factor += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                        if (!gptq_U) {
+                            throw std::runtime_error(format("%s: the full-Hessian GPTQ factorization failed", tensor->name));
+                        }
+                    } else if (tm.use_gptq && imatrix_03) {
                         GGML_ASSERT(f32_copy);
                         const auto t0 = std::chrono::steady_clock::now();
                         llama_gptq_cache::status st;
@@ -1741,6 +1796,8 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.hadamard_seed               =*/ LLAMA_HADAMARD_SEED_DEFAULT,
         /*.hadamard_seed_set           =*/ false,
         /*.loras                       =*/ nullptr,
+        /*.hessian                     =*/ nullptr,
+        /*.hessian_alpha               =*/ 0.1f,
     };
 
     return result;

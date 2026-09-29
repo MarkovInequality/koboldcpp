@@ -120,7 +120,7 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
 [[noreturn]]
 static void usage(const char * executable) {
     printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--hadamard] [--hadamard-seed] [--lora]\n", executable);
-    printf("       [--imatrix] [--include-weights]\n");
+    printf("       [--imatrix] [--hessian] [--hessian-alpha] [--include-weights]\n");
     printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--tensor-type-file]\n");
     printf("       [--prune-layers] [--keep-split] [--override-kv] [--dry-run] [--max-buffer-size]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
@@ -148,6 +148,12 @@ static void usage(const char * executable) {
     printf("                                      Merging into a quantized source quantizes twice\n");
     printf("  --imatrix file_name\n");
     printf("                                      use data in file_name as importance matrix for quant optimizations\n");
+    printf("  --hessian file_name\n");
+    printf("                                      a hessian-collect file: HQ tensors use each input's full Gram in GPTQ; also\n");
+    printf("                                      the importance matrix unless --imatrix is given\n");
+    printf("  --hessian-alpha A\n");
+    printf("                                      with --hessian, shrink the Grams toward their diagonals: (1-A) G + A diag(G)\n");
+    printf("                                      (default 0.1; 0 is the full Gram, 1 gives --imatrix's GPTQ)\n");
     printf("  --include-weights tensor_name\n");
     printf("                                      use importance matrix for this/these tensor(s)\n");
     printf("  --exclude-weights tensor_name\n");
@@ -415,6 +421,7 @@ int llama_quantize(int argc, char ** argv) {
 
     int arg_idx = 1;
     std::string imatrix_file;
+    std::string hessian_file;
     std::vector<std::string> included_weights, excluded_weights;
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<std::string> lora_paths;
@@ -502,6 +509,22 @@ int llama_quantize(int argc, char ** argv) {
             } else {
                 usage(argv[0]);
             }
+        } else if (strcmp(argv[arg_idx], "--hessian") == 0) {
+            if (arg_idx < argc-1) {
+                hessian_file = argv[++arg_idx];
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--hessian-alpha") == 0) {
+            if (arg_idx == argc-1) {
+                usage(argv[0]);
+            }
+            char * end = nullptr;
+            params.hessian_alpha = strtof(argv[++arg_idx], &end);
+            if (*end != '\0' || !(params.hessian_alpha >= 0.0f && params.hessian_alpha <= 1.0f)) {
+                fprintf(stderr, "%s: invalid --hessian-alpha '%s'\n", __func__, argv[arg_idx]);
+                return 1;
+            }
         } else if (strcmp(argv[arg_idx], "--include-weights") == 0) {
             if (arg_idx < argc-1) {
                 included_weights.emplace_back(argv[++arg_idx]);
@@ -537,6 +560,13 @@ int llama_quantize(int argc, char ** argv) {
     }
     if (!included_weights.empty() && !excluded_weights.empty()) {
         usage(argv[0]);
+    }
+
+    if (!hessian_file.empty()) {
+        params.hessian = hessian_file.c_str();
+        if (imatrix_file.empty()) {
+            imatrix_file = hessian_file;
+        }
     }
 
     std::vector<std::string> imatrix_datasets;

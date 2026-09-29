@@ -1211,6 +1211,19 @@ void llama_context::set_causal_attn(bool value) {
     sched_need_reserve = true;
 }
 
+void llama_context::set_collect_mm_inputs(bool value) {
+    if (cparams.collect_mm_inputs == value) {
+        return;
+    }
+
+    cparams.collect_mm_inputs = value;
+    gf_res_prev->reset();
+}
+
+llama_context::mm_inputs_state llama_context::get_mm_inputs() const {
+    return { &gf_res_prev->mm_inputs, ubatch_cur, gf_res_prev->get_gf(), n_graph_builds };
+}
+
 void llama_context::set_warmup(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1374,6 +1387,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         gf = model.build_graph(gparams);
+        n_graph_builds++;
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1400,7 +1414,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    ubatch_cur = &ubatch;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    ubatch_cur = nullptr;
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;

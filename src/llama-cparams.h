@@ -53,6 +53,7 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
+    bool collect_mm_inputs = false; // record each weight GEMM's input in llm_graph_result::mm_inputs
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

@@ -119,6 +119,19 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
+    // records each weight GEMM's input (unrotated) in the graph result; forces a graph rebuild
+    void set_collect_mm_inputs(bool value);
+
+    struct mm_inputs_state {
+        const std::vector<llm_graph_mm_input> * inputs;
+        const llama_ubatch * ubatch; // the ubatch being computed, or nullptr outside of a compute
+        ggml_cgraph        * gf;
+        uint64_t             graph_id; // changes whenever the graph is rebuilt
+    };
+
+    // valid from within the eval callback, while the graph runs
+    mm_inputs_state get_mm_inputs() const;
+
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -377,6 +390,9 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    const llama_ubatch * ubatch_cur = nullptr;
+    uint64_t n_graph_builds = 0;
 
     // perf
     mutable int64_t t_start_us  = 0;

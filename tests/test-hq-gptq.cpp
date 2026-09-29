@@ -1,7 +1,7 @@
-// Tests for GPTQ error feedback on the Hadamard-rotated (HQ) types: the factor of H^-1, its cache, and
-// the encoder.
+// Tests for GPTQ error feedback on the Hadamard-rotated (HQ) types: the factor of H^-1 (from an imatrix or a
+// full Gram), its cache, and the encoder.
 //
-// usage: test-hq-gptq [--quick]    (--quick skips the factor accuracy sweep up to n = 17408)
+// usage: test-hq-gptq [--quick]    (--quick skips the factor accuracy sweeps up to n = 17408)
 
 #include "ggml.h"
 #include "ggml-quants.h"
@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -189,6 +190,231 @@ static void test_factor() {
         llama_gptq_factor(v.data(), n, seed, damp, U8, workers, 8);
         check(U1.size() == U8.size() && memcmp(U1.data(), U8.data(), U1.size()*sizeof(float)) == 0,
               "1 and 8 threads give bitwise-identical U");
+    }
+}
+
+// ||U*H*U^T*y - y||/||y||, H = R*M*R^T with M applied in place by apply_m, all in fp64
+static double uhu_error_m(const std::vector<float> & U, int64_t n, const std::function<void(std::vector<double> &)> & apply_m,
+                          uint64_t seed, uint64_t yseed) {
+    std::vector<double> y(n), z(n, 0.0);
+    uint64_t s = yseed;
+    for (auto & x : y) x = gauss(s);
+    for (int64_t j = 0; j < n; ++j) {
+        for (int64_t k = j; k < n; ++k) {
+            z[k] += (double) U[upos(n, j, k)]*y[j];
+        }
+    }
+    ggml_rht_inv_f64(z.data(), n, seed);
+    apply_m(z);
+    ggml_rht_ref_f64(z.data(), n, seed);
+    double err = 0, ny = 0;
+    for (int64_t j = 0; j < n; ++j) {
+        double acc = 0;
+        for (int64_t k = j; k < n; ++k) {
+            acc += (double) U[upos(n, j, k)]*z[k];
+        }
+        err += (acc - y[j])*(acc - y[j]);
+        ny  += y[j]*y[j];
+    }
+    return sqrt(err/ny);
+}
+
+// G = X X^T for n x m Gaussian X with lognormal row scales: anisotropic, rank m
+static std::vector<float> random_gram(int64_t n, int64_t m, uint64_t seed) {
+    std::vector<double> X((size_t) n*m);
+    uint64_t s = seed;
+    for (int64_t i = 0; i < n; ++i) {
+        const double scale = exp(1.5*gauss(s));
+        for (int64_t k = 0; k < m; ++k) {
+            X[(size_t) i*m + k] = scale*gauss(s);
+        }
+    }
+    std::vector<float> G((size_t) n*n);
+    for (int64_t i = 0; i < n; ++i) {
+        for (int64_t j = 0; j <= i; ++j) {
+            double acc = 0;
+            for (int64_t k = 0; k < m; ++k) {
+                acc += X[(size_t) i*m + k]*X[(size_t) j*m + k];
+            }
+            G[(size_t) i*n + j] = G[(size_t) j*n + i] = (float) acc;
+        }
+    }
+    return G;
+}
+
+// M = (1 - alpha)*G/mean + alpha*diag(G)/mean + damp*I, from the fp32 Gram as the factor reads it
+static std::function<void(std::vector<double> &)> gram_m(const std::vector<float> & G, int64_t n, float alpha, float damp) {
+    double mean = 0;
+    for (int64_t i = 0; i < n; ++i) mean += G[(size_t) i*n + i];
+    mean /= n;
+    return [&G, n, alpha, damp, mean](std::vector<double> & z) {
+        std::vector<double> out(n);
+        for (int64_t i = 0; i < n; ++i) {
+            double acc = 0;
+            for (int64_t j = 0; j < n; ++j) {
+                acc += (double) G[(size_t) i*n + j]*z[j];
+            }
+            out[i] = (1.0 - alpha)*acc/mean + alpha*G[(size_t) i*n + i]/mean*z[i] + damp*z[i];
+        }
+        z = out;
+    };
+}
+
+// 50 ulp * sqrt(kappa), as for the imatrix factor, with kappa <= lambda_max/damp (M - damp*I is PSD)
+static double m_bound(int64_t n, const std::function<void(std::vector<double> &)> & apply_m, float damp) {
+    std::vector<double> z(n);
+    uint64_t s = 17;
+    for (auto & x : z) x = gauss(s);
+    double lambda = 0;
+    for (int it = 0; it < 50; ++it) {
+        double nz = 0;
+        for (double x : z) nz += x*x;
+        nz = sqrt(nz);
+        for (auto & x : z) x /= nz;
+        apply_m(z);
+        double nm = 0;
+        for (double x : z) nm += x*x;
+        lambda = sqrt(nm);
+    }
+    return 50*ldexp(1.0, -24)*sqrt(1.1*lambda/damp);
+}
+
+static void test_factor_full(bool quick) {
+    printf("factor from a full Gram:\n");
+    std::vector<std::thread> workers;
+    const uint64_t seed = 0x48512d524854ull;
+    const float damp = LLAMA_GPTQ_DAMP_DEFAULT;
+
+    {
+        const int64_t n = 1024;
+        const std::vector<float> v = make_v(V_LOGNORMAL, n, 3);
+        std::vector<float> G((size_t) n*n, 0.0f);
+        for (int64_t i = 0; i < n; ++i) G[(size_t) i*n + i] = v[i];
+        std::vector<float> Ud, Uf, Ua;
+        llama_gptq_factor(v.data(), n, seed, damp, Ud, workers, g_nthread);
+        const auto read = [&](float * dst) { memcpy(dst, G.data(), G.size()*sizeof(float)); return true; };
+        const bool ok = llama_gptq_factor_full(read, n, seed, 0.0f, damp, Uf, workers, g_nthread);
+        const bool oka = llama_gptq_factor_full(read, n, seed, 1.0f, damp, Ua, workers, g_nthread);
+        double err = 0, mx = 0, erra = 0;
+        for (size_t i = 0; i < Ud.size(); ++i) {
+            mx   = std::max(mx, (double) fabs(Ud[i]));
+            err  = std::max(err, (double) fabs(Ud[i] - Uf[i]));
+            erra = std::max(erra, (double) fabs(Ud[i] - Ua[i]));
+        }
+        char buf[256];
+        snprintf(buf, sizeof(buf), "diagonal Gram: equals the imatrix factor, max |dU|/max |U| = %.2e (alpha 0), %.2e (alpha 1)",
+                 err/mx, erra/mx);
+        check(ok && oka && Uf.size() == Ud.size() && err/mx < 1e-5 && erra/mx < 1e-5, buf);
+    }
+
+    {
+        // alpha = 1 keeps only the diagonal of a dense Gram
+        const int64_t n = 1024;
+        const std::vector<float> G = random_gram(n, 256, 11);
+        std::vector<float> v(n), Ud, Ua;
+        for (int64_t i = 0; i < n; ++i) v[i] = G[(size_t) i*n + i];
+        llama_gptq_factor(v.data(), n, seed, damp, Ud, workers, g_nthread);
+        const auto read = [&](float * dst) { memcpy(dst, G.data(), G.size()*sizeof(float)); return true; };
+        llama_gptq_factor_full(read, n, seed, 1.0f, damp, Ua, workers, g_nthread);
+        double err = 0, mx = 0;
+        for (size_t i = 0; i < Ud.size(); ++i) {
+            mx  = std::max(mx, (double) fabs(Ud[i]));
+            err = std::max(err, (double) fabs(Ud[i] - Ua[i]));
+        }
+        char buf[256];
+        snprintf(buf, sizeof(buf), "dense Gram, alpha 1: equals the imatrix factor of its diagonal, %.2e", err/mx);
+        check(err/mx < 1e-5, buf);
+    }
+
+    for (int64_t n : { 256, 1024, 2048 }) {
+        for (int64_t m : { n/8, 2*n }) {
+            for (float alpha : { 0.0f, 0.5f }) {
+                for (float dmp : { LLAMA_GPTQ_DAMP_MIN, damp, 0.1f }) {
+                    const std::vector<float> G = random_gram(n, m, 100 + n + m);
+                    std::vector<float> U;
+                    const auto read = [&](float * dst) { memcpy(dst, G.data(), G.size()*sizeof(float)); return true; };
+                    const bool ok = llama_gptq_factor_full(read, n, seed, alpha, dmp, U, workers, g_nthread);
+                    const auto apply_m = gram_m(G, n, alpha, dmp);
+                    const double err = ok ? uhu_error_m(U, n, apply_m, seed, 3) : 1e30;
+                    const double bound = m_bound(n, apply_m, dmp);
+                    char buf[256];
+                    snprintf(buf, sizeof(buf), "n = %4" PRId64 ", rank %4" PRId64 ", alpha %.1f, damp %.3f: |U H U^T y - y|/|y| = %.2e < %.2e",
+                             n, std::min(n, m), alpha, dmp, err, bound);
+                    check(ok && err < bound, buf);
+                }
+            }
+        }
+    }
+
+    {
+        const int64_t n = 2048;
+        const std::vector<float> G = random_gram(n, 512, 5);
+        const auto read = [&](float * dst) { memcpy(dst, G.data(), G.size()*sizeof(float)); return true; };
+        std::vector<float> U1, U8;
+        llama_gptq_factor_full(read, n, seed, 0.25f, damp, U1, workers, 1);
+        llama_gptq_factor_full(read, n, seed, 0.25f, damp, U8, workers, 8);
+        check(U1.size() == U8.size() && memcmp(U1.data(), U8.data(), U1.size()*sizeof(float)) == 0,
+              "1 and 8 threads give bitwise-identical U");
+
+        std::vector<float> U(3, 7.0f), bad = G;
+        bad[7*n + 7] = -1.0f;
+        const auto read_bad  = [&](float * dst) { memcpy(dst, bad.data(), bad.size()*sizeof(float)); return true; };
+        const auto read_fail = [&](float *) { return false; };
+        check(!llama_gptq_factor_full(read, n, seed, 0.0f, 0.0009f, U, workers, g_nthread), "damp 0.0009 is refused");
+        check(!llama_gptq_factor_full(read, n, seed, 1.5f, damp, U, workers, g_nthread), "alpha 1.5 is refused");
+        check(!llama_gptq_factor_full(read_bad, n, seed, 0.0f, damp, U, workers, g_nthread), "a negative diagonal is refused");
+        check(!llama_gptq_factor_full(read_fail, n, seed, 0.0f, damp, U, workers, g_nthread), "a failed read is refused");
+        check(U.size() == 3 && U[0] == 7.0f, "... and U is left untouched");
+
+        llama_gptq_cache cache(llama_gptq_build_bytes_full(n)*2);
+        llama_gptq_cache::status st;
+        const float * a = cache.get_full("x", read, n, seed, 0.25f, damp, workers, g_nthread, &st);
+        check(a && st == llama_gptq_cache::BUILT && memcmp(a, U1.data(), U1.size()*sizeof(float)) == 0, "cache: built, equals the factor");
+        const float * b = cache.get_full("x", read_fail, n, seed, 0.25f, damp, workers, g_nthread, &st);
+        check(b == a && st == llama_gptq_cache::HIT, "cache: the same key, alpha and damp hit without reading");
+        cache.get_full("x", read, n, seed, 0.5f, damp, workers, g_nthread, &st);
+        check(st == llama_gptq_cache::BUILT, "cache: another alpha rebuilds");
+        cache.get_full("y", read, n, seed, 0.25f, damp, workers, g_nthread, &st);
+        check(st == llama_gptq_cache::BUILT, "cache: another key rebuilds");
+    }
+
+    if (!quick) {
+        // diagonal plus rank one, so that H is cheap to apply at full size; u in eighths keeps u*u^T exact in fp32
+        for (int64_t n : { 5120, 17408 }) {
+            std::vector<float> g(n), u(n);
+            uint64_t s = n;
+            for (int64_t i = 0; i < n; ++i) {
+                u[i] = std::round(24*gauss(s))/8;
+                g[i] = u[i]*u[i] + (float) exp(2*gauss(s));
+            }
+            const auto read = [&](float * dst) {
+                for (int64_t i = 0; i < n; ++i) {
+                    for (int64_t j = 0; j < n; ++j) {
+                        dst[(size_t) i*n + j] = i == j ? g[i] : u[i]*u[j];
+                    }
+                }
+                return true;
+            };
+            double mean = 0;
+            for (int64_t i = 0; i < n; ++i) mean += g[i];
+            mean /= n;
+            const auto apply_m = [&](std::vector<double> & z) {
+                double dot = 0;
+                for (int64_t i = 0; i < n; ++i) dot += (double) u[i]*z[i];
+                for (int64_t i = 0; i < n; ++i) {
+                    z[i] = ((double) u[i]*dot + ((double) g[i] - (double) u[i]*u[i])*z[i])/mean + damp*z[i];
+                }
+            };
+            std::vector<float> U;
+            const auto t0 = std::chrono::steady_clock::now();
+            const bool ok = llama_gptq_factor_full(read, n, seed, 0.0f, damp, U, workers, g_nthread);
+            const double t = seconds_since(t0);
+            const double err = ok ? uhu_error_m(U, n, apply_m, seed, 9) : 1e30;
+            const double bound = m_bound(n, apply_m, damp);
+            char buf[256];
+            snprintf(buf, sizeof(buf), "n = %5" PRId64 ", diagonal + rank one: |U H U^T y - y|/|y| = %.2e < %.2e (%.1f s)", n, err, bound, t);
+            check(ok && err < bound, buf);
+        }
     }
 }
 
@@ -510,6 +736,7 @@ int main(int argc, char ** argv) {
     if (!quick) {
         test_factor();
     }
+    test_factor_full(quick);
     test_cache();
     test_hashes();
     test_identity({ std::begin(all_types), std::end(all_types) });

@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <fcntl.h>
 #include <string>
 #include <thread>
@@ -23,15 +24,48 @@ struct cache_header {
     uint64_t token_hash;
 };
 
-static std::vector<llama_token> tokenize_file(const llama_vocab * vocab, const std::string & text) {
+static std::vector<llama_token> tokenize_file(const llama_vocab * vocab, const std::string & text, bool parse_special = false) {
     std::vector<llama_token> tokens(text.size() + 16);
-    const int n = llama_tokenize(vocab, text.c_str(), (int32_t) text.size(), tokens.data(), (int32_t) tokens.size(), true, false);
+    const int n = llama_tokenize(vocab, text.c_str(), (int32_t) text.size(), tokens.data(), (int32_t) tokens.size(), true, parse_special);
     if (n < 0) {
         fprintf(stderr, "tokenization failed (%d)\n", n);
         return {};
     }
     tokens.resize(n);
     return tokens;
+}
+
+// 1 for the tokens a chat model generates: its own turns (<|im_start|>assistant\n ... <|im_end|>) and text outside any
+// turn; 0 for turn headers and system/user/tool turns, where chat models aren't trained to predict. <|endoftext|>
+// ends a turn.
+static std::vector<uint8_t> chat_mask(const llama_vocab * vocab, const std::vector<llama_token> & tokens) {
+    auto id = [&](const char * s) {
+        llama_token t[4];
+        return llama_tokenize(vocab, s, (int32_t) strlen(s), t, 4, false, true) == 1 ? t[0] : LLAMA_TOKEN_NULL;
+    };
+    const llama_token im_start = id("<|im_start|>"), im_end = id("<|im_end|>"), eot = id("<|endoftext|>");
+    const llama_token assistant = id("assistant"), nl = id("\n");
+    enum { NONE, HEADER, ASSISTANT, OTHER } role = NONE;
+    std::vector<uint8_t> mask(tokens.size(), 1);
+    for (size_t k = 0; k < tokens.size(); ++k) {
+        const llama_token t = tokens[k];
+        if (t == im_start) {
+            role = HEADER;
+            mask[k] = 0;
+        } else if (role == HEADER) {
+            mask[k] = 0;
+            role = t == assistant ? ASSISTANT : OTHER;
+            if (k + 1 < tokens.size() && tokens[k + 1] == nl) {
+                mask[++k] = 0;
+            }
+        } else if (t == eot) {
+            role = NONE;
+        } else {
+            mask[k] = role != OTHER;
+            role = t == im_end ? NONE : role;
+        }
+    }
+    return mask;
 }
 
 static bool read_text_file(const char * path, std::string & text) {
@@ -205,9 +239,9 @@ static bool cache_write(llama_context * ctx, const std::string & path, int n_voc
 }
 
 // KL(reference || model), top-1 agreement and NLL of ctx's model over the first n_chunks windows of an open
-// cache; n_par as given to make_ctx
+// cache; n_par as given to make_ctx; with a mask, only the predictions of the tokens it marks
 static bool score(llama_context * ctx, FILE * cache, const std::vector<llama_token> & tokens, int n_ctx, int n_chunks,
-                  int n_vocab, int nth, window_stats & tot, int n_par = 1) {
+                  int n_vocab, int nth, window_stats & tot, int n_par = 1, const std::vector<uint8_t> * mask = nullptr) {
     const int    n_per_chunk = scored_per_chunk(n_ctx);
     const size_t row_bytes   = (size_t) n_vocab*sizeof(ggml_fp16_t);
     fseeko(cache, sizeof(cache_header), SEEK_SET);
@@ -229,6 +263,9 @@ static bool score(llama_context * ctx, FILE * cache, const std::vector<llama_tok
                           POSIX_FADV_DONTNEED);
             const llama_token * window = tokens.data() + (size_t) c*n_ctx;
             scored_logprobs(ctx, c - c0, n_ctx, n_vocab, nth, [&](int i, const std::vector<float> & logp) {
+                if (mask && !(*mask)[(size_t) c*n_ctx + n_ctx/2 + i + 1]) {
+                    return;
+                }
                 const int t = i % nth;
                 auto & s = st[t];
                 std::vector<float> & rp = ref_rows[t];

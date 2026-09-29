@@ -1337,6 +1337,7 @@ void llm_graph_result::reset() {
 
     inputs.clear();
     fused_nodes.clear();
+    mm_inputs.clear();
 
     buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
 
@@ -1510,7 +1511,11 @@ ggml_tensor * llm_graph_context::build_cvec(
     return cvec->apply_to(ctx0, cur, il);
 }
 
-ggml_tensor * llm_graph_context::rotate_input_if_rotated(ggml_tensor * w, ggml_tensor * cur) const {
+ggml_tensor * llm_graph_context::rotate_input_if_rotated(ggml_tensor * w, ggml_tensor * cur, bool id) const {
+    if (cparams.collect_mm_inputs) {
+        res->mm_inputs.push_back({ cur, w, id });
+    }
+
     // a draft can use tensors of the model in ctx_other (EAGLE3/DFlash borrow its output), rotated with that model's seed
     const llama_model * owner = hq_model && hq_model->is_rotated(w) ? hq_model : nullptr;
     if (!owner && cparams.ctx_other) {
@@ -1622,7 +1627,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * w_s) const {
-    ggml_tensor * cur_rot = rotate_input_if_rotated(w, cur);
+    ggml_tensor * cur_rot = rotate_input_if_rotated(w, cur, true);
 
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur_rot, ids);
 

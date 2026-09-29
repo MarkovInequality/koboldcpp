@@ -1,0 +1,282 @@
+{
+  "datasets": {
+    "wildchat": {
+      "repo": "allenai/WildChat-1M",
+      "revision": "7d6490e462285cf85d91eabea0f9a954fbddcd1f",
+      "files": [
+        "data/train-00000-of-00014.parquet",
+        "data/train-00007-of-00014.parquet"
+      ],
+      "columns": [
+        "conversation_hash",
+        "conversation",
+        "language",
+        "toxic",
+        "redacted",
+        "hashed_ip",
+        "openai_moderation",
+        "detoxify_moderation"
+      ],
+      "rows": 30000
+    },
+    "oasst2": {
+      "repo": "OpenAssistant/oasst2",
+      "revision": "179dd21fc55192153d94adb0e0ce8f69e222bf75",
+      "files": [
+        "data/train-00000-of-00001-88ba0162028a73fc.parquet",
+        "data/validation-00000-of-00001-1deeef95c3248fe0.parquet"
+      ],
+      "columns": [
+        "message_id",
+        "parent_id",
+        "message_tree_id",
+        "role",
+        "text",
+        "lang",
+        "deleted",
+        "review_result",
+        "rank"
+      ],
+      "rows": 1000000
+    },
+    "hermes_tools": {
+      "repo": "interstellarninja/hermes_reasoning_tool_use",
+      "revision": "c27e454925db6295b160d20ad8a756aa75bfdb77",
+      "files": [
+        "data/train-00000-of-00001.parquet"
+      ],
+      "columns": null,
+      "rows": 6000
+    },
+    "numina": {
+      "repo": "AI-MO/NuminaMath-CoT",
+      "revision": "9d8d210c9f6a36c8f3cd84045668c9b7800ef517",
+      "files": [
+        "data/train-00000-of-00005.parquet",
+        "data/train-00003-of-00005.parquet"
+      ],
+      "columns": [
+        "source",
+        "problem"
+      ],
+      "rows": 40000
+    },
+    "aya": {
+      "repo": "CohereLabs/aya_dataset",
+      "revision": "f9ea04583f02a8f86404ff6c58bf75fe637df8a2",
+      "files": [
+        "data/train-00000-of-00001.parquet"
+      ],
+      "columns": [
+        "inputs",
+        "language",
+        "language_code",
+        "annotation_type",
+        "user_id"
+      ],
+      "rows": 1000000
+    },
+    "fineweb2": {
+      "repo": "HuggingFaceFW/fineweb-2",
+      "revision": "af9c13333eb981300149d5ca60a8e9d659b276b9",
+      "files": [
+        "data/cmn_Hani/train/000_00000.parquet",
+        "data/jpn_Jpan/train/000_00000.parquet",
+        "data/kor_Hang/train/000_00000.parquet",
+        "data/spa_Latn/train/000_00000.parquet",
+        "data/fra_Latn/train/000_00000.parquet",
+        "data/deu_Latn/train/000_00000.parquet",
+        "data/rus_Cyrl/train/000_00000.parquet",
+        "data/arb_Arab/train/000_00000.parquet",
+        "data/por_Latn/train/000_00000.parquet",
+        "data/vie_Latn/train/000_00000.parquet"
+      ],
+      "columns": [
+        "id",
+        "text",
+        "language"
+      ],
+      "rows": 1500
+    },
+    "wikipedia": {
+      "repo": "wikimedia/wikipedia",
+      "revision": "b04c8d1ceb2f5cd4588862100d08de323dccfbaa",
+      "files": [
+        "20231101.en/train-00000-of-00041.parquet",
+        "20231101.en/train-00020-of-00041.parquet",
+        "20231101.zh/train-00000-of-00006.parquet"
+      ],
+      "columns": [
+        "id",
+        "url",
+        "title",
+        "text"
+      ],
+      "rows": 2500
+    },
+    "fineweb_edu": {
+      "repo": "HuggingFaceFW/fineweb-edu",
+      "revision": "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9",
+      "files": [
+        "sample/10BT/000_00000.parquet"
+      ],
+      "columns": [
+        "id",
+        "text",
+        "url"
+      ],
+      "rows": 4000
+    },
+    "gsm8k_test": {
+      "repo": "openai/gsm8k",
+      "revision": "740312add88f781978c0658806c59bc2815b9866",
+      "files": [
+        "main/test-00000-of-00001.parquet"
+      ],
+      "columns": [
+        "question",
+        "answer"
+      ],
+      "rows": 1000000
+    },
+    "math_test": {
+      "repo": "EleutherAI/hendrycks_math",
+      "revision": "21a5633873b6a120296cce3e2df9d5550074f4a3",
+      "files": [
+        "algebra/test-00000-of-00001.parquet",
+        "counting_and_probability/test-00000-of-00001.parquet",
+        "geometry/test-00000-of-00001.parquet",
+        "intermediate_algebra/test-00000-of-00001.parquet",
+        "number_theory/test-00000-of-00001.parquet",
+        "prealgebra/test-00000-of-00001.parquet",
+        "precalculus/test-00000-of-00001.parquet"
+      ],
+      "columns": [
+        "problem",
+        "solution"
+      ],
+      "rows": 1000000
+    }
+  },
+  "pg19": {
+    "repo": "deepmind/pg19",
+    "revision": "4d28bd77e66947ad3835cf78ed7aaeb4dd87ad8b",
+    "asset_root": "https://storage.googleapis.com/deepmind-gutenberg/",
+    "books": 40
+  },
+  "repos": {
+    "honojs/hono": {
+      "lang": "ts",
+      "commit": "52f6c7ec865b31001a14eed9b323a0235f0a3156",
+      "licence_found": "MIT (LICENSE)"
+    },
+    "colinhacks/zod": {
+      "lang": "ts",
+      "commit": "2bf7b0630d5378033e90bcee82cb32b0fe04628e",
+      "licence_found": "MIT (LICENSE)"
+    },
+    "vitejs/vite": {
+      "lang": "ts",
+      "commit": "bc598a6a8a6b7d6e157e9f19c16911cff8d2360c",
+      "licence_found": "MIT (LICENSE)"
+    },
+    "expressjs/express": {
+      "lang": "ts",
+      "commit": "9a34acf03cb818ff3f8bc40e44176e277a25cbb9",
+      "licence_found": "MIT (LICENSE)"
+    },
+    "psf/requests": {
+      "lang": "py",
+      "commit": "611c6162cbc4ac2020a2f91c7cfa4f3abf9bbb60",
+      "licence_found": "Apache-2.0 (LICENSE)"
+    },
+    "pallets/flask": {
+      "lang": "py",
+      "commit": "d73fa1cdcbd8b1465c151db8924ba58b1dd14e35",
+      "licence_found": "BSD-3-Clause (LICENSE.txt)"
+    },
+    "encode/httpx": {
+      "lang": "py",
+      "commit": "b5addb64f0161ff6bfe94c124ef76f6a1fba5254",
+      "licence_found": "BSD-3-Clause (LICENSE.md)"
+    },
+    "pydantic/pydantic": {
+      "lang": "py",
+      "commit": "bb6da4cfbb1f559885ea2fa207ec93853bfeac64",
+      "licence_found": "MIT (LICENSE)"
+    },
+    "BurntSushi/ripgrep": {
+      "lang": "rust",
+      "commit": "3fce3b5bb0236da2df6d99672afb8a719642eca7",
+      "licence_found": "MIT (LICENSE-MIT)"
+    },
+    "tokio-rs/axum": {
+      "lang": "rust",
+      "commit": "bc8d4912435204a4a073cea70355ae0328d263fe",
+      "licence_found": "MIT (LICENSE)"
+    },
+    "serde-rs/serde": {
+      "lang": "rust",
+      "commit": "6693a89cca77e0151437da1c7f890090b9ebf04c",
+      "licence_found": "Apache-2.0 (LICENSE-APACHE)"
+    },
+    "fmtlib/fmt": {
+      "lang": "c",
+      "commit": "04820018751ec4b1077a0a23296273884c0b281a",
+      "licence_found": "MIT (LICENSE)"
+    },
+    "google/leveldb": {
+      "lang": "c",
+      "commit": "7ee830d02b623e8ffe0b95d59a74db1e58da04c5",
+      "licence_found": "BSD-3-Clause (LICENSE)"
+    },
+    "curl/curl": {
+      "lang": "c",
+      "commit": "49eaaddd263c2ab181c40c9878f50ded517f99f3",
+      "licence_found": "ISC (COPYING)"
+    },
+    "libuv/libuv": {
+      "lang": "c",
+      "commit": "abe835d41317b55b16260990821f89b4ee9e437b",
+      "licence_found": "MIT (LICENSE)"
+    },
+    "sqlite/sqlite": {
+      "lang": "c",
+      "commit": "2acb2ea9089c604d5786f56ee3e50a0479a268dd",
+      "licence_found": "public-domain (LICENSE.md)"
+    },
+    "Dao-AILab/flash-attention": {
+      "lang": "c",
+      "commit": "e9cf2c1651d2303191eb40a739a3c135fda00999",
+      "paths": [
+        "csrc"
+      ],
+      "licence": "BSD-3-Clause",
+      "licence_found": "BSD-3-Clause (LICENSE)"
+    },
+    "NVIDIA/cutlass": {
+      "lang": "c",
+      "commit": "0b55a2f691d69981583568fd9eb69687b1f0de8a",
+      "paths": [
+        "examples"
+      ],
+      "licence": "BSD-3-Clause",
+      "licence_found": "BSD-3-Clause (LICENSE.txt)"
+    },
+    "spf13/cobra": {
+      "lang": "other",
+      "commit": "adbc8813901bba65827259daa8e22ff94ec1f30e",
+      "licence_found": "Apache-2.0 (LICENSE.txt)"
+    },
+    "google/gson": {
+      "lang": "other",
+      "commit": "854c8255b625cf1e13c701a83ea9ccb4caaa576a",
+      "licence_found": "Apache-2.0 (LICENSE)"
+    },
+    "square/okhttp": {
+      "lang": "other",
+      "commit": "40a3b8749deaacf60a04c890aed052cb14ad36ee",
+      "licence_found": "Apache-2.0 (LICENSE.txt)"
+    }
+  }
+}

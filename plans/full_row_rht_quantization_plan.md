@@ -1321,7 +1321,7 @@ Mixes (plain / imatrix / `--hadamard`): Q4_K_M 0.0690 / 0.0451 / 0.0561; IQ4_XS 
 - **HQ4_XS / HQ4_NL even lose to plain IQ4** (no imatrix), while HQ4_K / HQ5_K / HQ3_S beat their
   plain types. HQ4_XS ≈ HQ4_K did not happen; once HQ errors are isotropic, KL follows weight MSE and
   HQ4_K has more bits.
-- **Cause (investigated, `build-hq/investigate/`):** not activation quantization (dequantized F32
+- **Cause (investigated, `build-hq/investigate/`, deleted 2026-09-27):** not activation quantization (dequantized F32
   runs give the same KL). A few massive-activation channels (attention sinks: e.g. 4 channels at
   ±1000–5572 carrying 99 % of an `ffn_down` input's energy) dominate KL. Plain IQ4 happens to be
   2× more accurate than HQ in exactly those weight columns (near-zero weights plus block maxima,
