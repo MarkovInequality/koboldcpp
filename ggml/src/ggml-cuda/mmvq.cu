@@ -1335,7 +1335,8 @@ void ggml_cuda_mul_mat_vec_q(
         quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
         src1_q8_1_d = src1_q8_1.get();
     } else {
-        GGML_ASSERT(src1_fmt == GGML_CUDA_SRC1_Q8_1 && !ids);
+        // written by the RHT in its own row order, which is src1's (i11, i12, i13) order as src1 is contiguous
+        GGML_ASSERT(src1_fmt == GGML_CUDA_SRC1_Q8_1 && ggml_is_contiguous(src1));
         src1_q8_1_d = src1->data;
     }
 

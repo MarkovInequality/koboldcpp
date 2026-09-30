@@ -1518,19 +1518,26 @@ static bool llm_graph_keeps_rows(const ggml_tensor * w) {
            w->view_offs % root->nb[1] == 0;
 }
 
+const llama_model * llm_graph_context::rotation_owner(const ggml_tensor * w) const {
+    if (hq_model && hq_model->is_rotated(w)) {
+        return hq_model;
+    }
+    // a draft can use tensors of the model in ctx_other (EAGLE3/DFlash borrow its output), rotated with that model's seed
+    if (cparams.ctx_other) {
+        const llama_model * other = llama_get_model(cparams.ctx_other);
+        if (other && other->is_rotated(w)) {
+            return other;
+        }
+    }
+    return nullptr;
+}
+
 ggml_tensor * llm_graph_context::rotate_input_if_rotated(ggml_tensor * w, ggml_tensor * cur, bool id) const {
     if (cparams.collect_mm_inputs) {
         res->mm_inputs.push_back({ cur, w, id });
     }
 
-    // a draft can use tensors of the model in ctx_other (EAGLE3/DFlash borrow its output), rotated with that model's seed
-    const llama_model * owner = hq_model && hq_model->is_rotated(w) ? hq_model : nullptr;
-    if (!owner && cparams.ctx_other) {
-        const llama_model * other = llama_get_model(cparams.ctx_other);
-        if (other && other->is_rotated(w)) {
-            owner = other;
-        }
-    }
+    const llama_model * owner = rotation_owner(w);
     if (!owner) {
         return cur;
     }
@@ -1538,12 +1545,30 @@ ggml_tensor * llm_graph_context::rotate_input_if_rotated(ggml_tensor * w, ggml_t
         throw std::runtime_error(format("Hadamard-rotated weight %s is used through a view that splits its stored rows", w->name));
     }
 
-    auto & cur_rot = hadamard_rot_cache[{ cur, owner->hadamard_seed }];
-    if (!cur_rot) {
+    const uint64_t seed = owner->hadamard_seed;
+    ggml_tensor * & cur_rot = hadamard_rot_cache[{ cur, seed }];
+    if (cur_rot) {
+        return cur_rot;
+    }
+
+    // The rotation is per row, so a reshape that keeps the rows shares the RHT of its source: R*reshape(x) =
+    // reshape(R*x). The MoE experts read a 3D reshape of the input the shared expert reads.
+    ggml_tensor * src = cur;
+    while (src->op == GGML_OP_RESHAPE && src->src[0]->ne[0] == src->ne[0]) {
+        src = src->src[0];
+    }
+    ggml_tensor * & src_rot = hadamard_rot_cache[{ src, seed }];
+    if (!src_rot) {
         // RHT is F32-only; a model feeding F16 here needs a ggml_cast to F32 first
-        GGML_ASSERT(cur->type == GGML_TYPE_F32);
-        ggml_tensor * x = ggml_is_contiguous_rows(cur) ? cur : ggml_cont(ctx0, cur);
-        cur_rot = ggml_rht(ctx0, x, owner->hadamard_seed);
+        GGML_ASSERT(src->type == GGML_TYPE_F32);
+        ggml_tensor * x = ggml_is_contiguous_rows(src) ? src : ggml_cont(ctx0, src);
+        src_rot = ggml_rht(ctx0, x, seed);
+        // placed right after its input rather than wherever the first consumer lands, so a backend can fuse the
+        // input's producer (RMS norm, GLU) into the rotation
+        ggml_build_forward_expand(gf, src_rot);
+    }
+    if (src != cur) {
+        cur_rot = ggml_reshape_4d(ctx0, src_rot, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
     }
 
     return cur_rot;
@@ -1600,6 +1625,17 @@ void llm_graph_check_hadamard_rotation(ggml_cgraph * gf, const llama_model & mod
             }
         }
     }
+}
+
+// With a rotated gate, the gate and up GEMMs read an RHT that the graph allocator frees once both are allocated,
+// so the GLU output can land on it; the CUDA backend then refuses to fuse gate/up/GLU into one kernel, which reads
+// that RHT while writing the GLU. Written over the gate's output (its only consumer is the GLU), it never overlaps
+// the RHT. Rotated models run only on the CPU and CUDA backends, whose GLU kernels work in place.
+ggml_tensor * llm_graph_context::build_glu_split(ggml_tensor * g, ggml_tensor * u, const ggml_tensor * w_gate, ggml_glu_op op) const {
+    if (rotation_owner(w_gate) && ggml_is_contiguous(g)) {
+        return ggml_glu_split_inplace(ctx0, g, u, op);
+    }
+    return ggml_glu_split(ctx0, g, u, op);
 }
 
 ggml_tensor * llm_graph_context::build_mm(ggml_tensor * w, ggml_tensor * cur) const {
@@ -1903,7 +1939,7 @@ ggml_tensor * llm_graph_context::build_ffn(
                     }
                 }
 
-                cur = ggml_swiglu_split(ctx0, cur, tmp);
+                cur = build_glu_split(cur, tmp, gate, GGML_GLU_OP_SWIGLU);
                 cb(cur, "ffn_swiglu", il);
                 type_gate = LLM_FFN_SEQ;
             } else {
@@ -1912,7 +1948,7 @@ ggml_tensor * llm_graph_context::build_ffn(
             } break;
         case LLM_FFN_GELU:
             if (gate && type_gate == LLM_FFN_PAR) {
-                cur = ggml_geglu_split(ctx0, cur, tmp);
+                cur = build_glu_split(cur, tmp, gate, GGML_GLU_OP_GEGLU);
                 cb(cur, "ffn_geglu", il);
                 type_gate = LLM_FFN_SEQ;
             } else {

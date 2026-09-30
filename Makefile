@@ -1074,7 +1074,7 @@ test-hadamard-llama-cuda: tests/test-hadamard-llama.cpp $(LLAMA_TOOL_OBJS_CUDA)
 test-backend-ops: tests/test-backend-ops.cpp $(filter-out ggml.o ggml-backend-reg_default.o,$(HADAMARD_TEST_OBJS)) ggml_v4_cublas.o ggml-backend-reg_cublas.o $(CUBLAS_OBJS_V4)
 	$(CXX) $(CXXFLAGS) $(CUBLAS_FLAGS) $(filter-out %.h,$^) -o $@ $(CUBLASLD_FLAGS) $(LDFLAGS)
 
-bench-rht: tests/bench-rht.cu ggml/src/ggml-cuda/quantize.cu ggml-hadamard.o ggml/src/ggml-cuda/rht-impl.cuh ggml/src/ggml-cuda/quantize.cuh ggml/src/ggml-cuda/common.cuh ggml/src/ggml-hadamard.h ggml/src/ggml-hadamard-tables.h
+bench-rht: tests/bench-rht.cu ggml/src/ggml-cuda/quantize.cu ggml-hadamard.o ggml/src/ggml-cuda/rht-impl.cuh ggml/src/ggml-cuda/quantize.cuh ggml/src/ggml-cuda/unary.cuh ggml/src/ggml-cuda/common.cuh ggml/src/ggml-hadamard.h ggml/src/ggml-hadamard-tables.h
 	nvcc -O3 -std=c++17 -arch=native -use_fast_math -DGGML_USE_CUDA -Iggml/include -Iggml/src $(filter %.cu %.o,$^) -o $@
 
 

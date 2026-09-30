@@ -27,8 +27,10 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <map>
 #include <random>
 #include <regex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -531,8 +533,39 @@ static llama_model_ptr make_model(gguf_context * gguf_ctx, size_t seed, ggml_bac
     return model;
 }
 
-static llama_context_ptr make_ctx(llama_model * model, bool encode, bool fa) {
+// Each activation is rotated once: no two RHT nodes of a graph read the same rows (one tensor, or reshapes of it
+// that keep the row width). Seen through the eval callback's queries, which leave the graph unsplit.
+struct rht_census {
+    std::map<const ggml_tensor *, std::set<const ggml_tensor *>> by_rows;
+    std::set<const ggml_tensor *> seen;
+    std::string twice; // a rows tensor rotated by more than one RHT node
+};
+
+static bool rht_census_cb(ggml_tensor * t, bool ask, void * user_data) {
+    auto * c = (rht_census *) user_data;
+    if (ask && t->op == GGML_OP_RHT) {
+        if (!c->seen.insert(t).second) {
+            // the next evaluation of the graph (reused, or rebuilt in the same memory)
+            c->by_rows.clear();
+            c->seen = { t };
+        }
+        const ggml_tensor * x = t->src[0];
+        while (x->op == GGML_OP_RESHAPE && x->src[0]->ne[0] == x->ne[0]) {
+            x = x->src[0];
+        }
+        if (c->by_rows[x].insert(t).second && c->by_rows[x].size() > 1 && c->twice.empty()) {
+            c->twice = x->name;
+        }
+    }
+    return false;
+}
+
+static llama_context_ptr make_ctx(llama_model * model, bool encode, bool fa, rht_census * census = nullptr) {
     llama_context_params cp = llama_context_default_params();
+    if (census) {
+        cp.cb_eval           = rht_census_cb;
+        cp.cb_eval_user_data = census;
+    }
     cp.flash_attn_type = fa ? LLAMA_FLASH_ATTN_TYPE_AUTO : LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cp.n_ctx = 0;
     cp.n_threads = 4;
@@ -668,9 +701,13 @@ int main(int argc, char ** argv) {
             try {
                 llama_model_ptr model = make_model(gguf_ctx.get(), seed, dev);
                 n_rot = rotate_weights(model.get());
-                llama_context_ptr ctx = make_ctx(model.get(), encode, fa);
+                rht_census census;
+                llama_context_ptr ctx = make_ctx(model.get(), encode, fa, &census);
                 err = nmse(ref, get_logits(model.get(), ctx.get(), tokens, encode));
                 status = n_rot > 0 && err < 1e-6 ? "PASS" : "FAIL";
+                if (!census.twice.empty()) {
+                    status = "FAIL (" + census.twice + " rotated by two RHT nodes)";
+                }
             } catch (const std::exception & e) {
                 status = std::string("FAIL (") + e.what() + ")";
             }

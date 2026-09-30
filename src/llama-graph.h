@@ -1057,8 +1057,14 @@ struct llm_graph_context {
 
     void cb(ggml_tensor * cur, const char * name, int il) const;
 
+    // the model whose rotation (seed) w carries, if w is a rotated (HQ) weight
+    const llama_model * rotation_owner(const ggml_tensor * w) const;
+
     // R*cur if w is rotated, else cur; each activation is rotated once for all its consumers
     ggml_tensor * rotate_input_if_rotated(ggml_tensor * w, ggml_tensor * cur, bool id = false) const;
+
+    // ggml_glu_split(g, u, op), written over g when the gate weight w_gate is rotated
+    ggml_tensor * build_glu_split(ggml_tensor * g, ggml_tensor * u, const ggml_tensor * w_gate, ggml_glu_op op) const;
 
     mutable std::map<std::pair<ggml_tensor *, uint64_t>, ggml_tensor *> hadamard_rot_cache; // (input, seed)
 

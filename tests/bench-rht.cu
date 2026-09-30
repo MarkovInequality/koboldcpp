@@ -4,6 +4,9 @@
 //   bench-rht --sweep    also time the runtime variants (warps per CTA, K = 1 chunk width)
 //   bench-rht --once     launch each timed variant once, for ncu
 //   -n N[,N...], -r ROWS, -k A|B  restrict the timed shapes
+//
+// The prologues (a fused RMS norm or GLU in front of the rotation) are checked against the host reference, the GLU
+// ones also bitwise against their unfused F32, and timed against a producer kernel followed by the rotation.
 
 #include "ggml-cuda/rht-impl.cuh"
 #include "ggml-threading.h"
@@ -108,13 +111,22 @@ static rht_case make_case_4d(int64_t n, int64_t ne1, int64_t ne2, int64_t ne3, i
     return c;
 }
 
+static const float EPS = 1e-6f;
+
+// src2: the norm's weight (n floats) or the GLU's u, laid out as src
 static void launch(const rht_shape & sh, const rht_cfg & cfg, const rht_case & c, const float * src, void * dst, float * tmp, cudaStream_t st,
-        const ggml_cuda_src1_fmt out = GGML_CUDA_SRC1_F32) {
+        const ggml_cuda_src1_fmt out = GGML_CUDA_SRC1_F32, const int pro = RHT_PRO_NONE, const float * src2 = nullptr) {
     size_t nb[4];
     for (int i = 0; i < 4; ++i) {
         nb[i] = c.st[i]*sizeof(float);
     }
-    const rht_args a = rht_make_args(sh, src, c.ne, nb, dst, out, SEED, tmp);
+    rht_args a = rht_make_args(sh, src, c.ne, nb, dst, out, SEED, tmp);
+    a.pro  = pro;
+    a.src2 = (const char *) src2;
+    a.nb21 = nb[1];
+    a.nb22 = nb[2];
+    a.nb23 = nb[3];
+    a.eps  = EPS;
     rht_launch(a, sh, cfg, st);
 }
 
@@ -370,7 +382,7 @@ static bool q8_1_identical(const rht_case & c, const rht_cfg & cfg, const ggml_c
 static void check_q8_1_all(cudaStream_t st) {
     int n_cases = 0;
     int n_bad   = 0;
-    for (int64_t n : {2560ll, 5376ll, 11008ll, 4608ll, 12ll << 11, 36ll*16, 252ll*16, 1024ll, 4096ll, 17408ll, 3072ll}) {
+    for (int64_t n : {2560ll, 5376ll, 11008ll, 4608ll, 12ll << 11, 36ll*16, 252ll*16, 32ll, 64ll, 256ll, 512ll, 1024ll, 4096ll, 17408ll, 3072ll}) {
         for (int kernel : {1, 2}) {
             rht_cfg cfg;
             cfg.kernel = kernel;
@@ -389,6 +401,179 @@ static void check_q8_1_all(cudaStream_t st) {
     }
     n_failed += n_bad;
     printf("# q8_1 outputs: %d cases, %d not byte-identical to quantize.cu\n", n_cases, n_bad);
+}
+
+static const char * pro_name(const int pro) {
+    switch (pro) {
+        case RHT_PRO_NORM:   return "norm";
+        case RHT_PRO_SWIGLU: return "swiglu";
+        case RHT_PRO_GEGLU:  return "geglu";
+        default:             return "none";
+    }
+}
+
+// the unfused producer: what RMS_NORM + MUL or the GLU kernel would write, as contiguous rows
+static __global__ void produce(const float * x, const float * x2, float * y, const int64_t n, const int64_t ne1, const int64_t ne2,
+        const int64_t s1, const int64_t s2, const int64_t s3, const int pro) {
+    const int64_t row = blockIdx.x;
+    const int64_t off = (row % ne1)*s1 + ((row / ne1) % ne2)*s2 + (row / (ne1*ne2))*s3;
+    const float * xr  = x + off;
+    float       * yr  = y + row*n;
+    if (pro == RHT_PRO_NORM) {
+        __shared__ float part[32];
+        float ss = 0.0f;
+        for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
+            ss += xr[i]*xr[i];
+        }
+        ss = warp_reduce_sum(ss);
+        if (threadIdx.x % WARP_SIZE == 0) {
+            part[threadIdx.x/WARP_SIZE] = ss;
+        }
+        __syncthreads();
+        float sum = 0.0f;
+        for (int i = 0; i < (int) blockDim.x/WARP_SIZE; ++i) {
+            sum += part[i];
+        }
+        const float scale = rsqrtf(sum/n + EPS);
+        for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
+            yr[i] = (xr[i]*scale)*x2[i];
+        }
+        return;
+    }
+    const float * ur = x2 + off;
+    for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
+        yr[i] = (pro == RHT_PRO_SWIGLU ? ggml_cuda_op_silu_single(xr[i]) : ggml_cuda_op_gelu_single(xr[i]))*ur[i];
+    }
+}
+
+static void produce_launch(const rht_case & c, const float * x, const float * x2, float * y, const int pro, cudaStream_t st) {
+    produce<<<(unsigned) c.rows(), 256, 0, st>>>(x, x2, y, c.n, c.ne[1], c.ne[2], c.st[1], c.st[2], c.st[3], pro);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// One prologue on one case: F32 against the host reference; the GLU ones bitwise against producer + rotation
+// through the same kernel; Q8_1 byte-identical to quantize.cu over the fused F32.
+static bool check_prologue(const rht_case & c, const rht_cfg & cfg, const int pro, cudaStream_t st) {
+    rht_shape sh;
+    GGML_ASSERT(rht_make_shape(c.n, cfg, sh));
+    const int64_t rows = c.rows();
+    const size_t  ny   = (size_t) (rows*c.n);
+
+    std::vector<float> x(c.size()), x2(pro == RHT_PRO_NORM ? c.n : c.size());
+    for (auto & v : x) {
+        v = 4.0f*frand();
+    }
+    for (auto & v : x2) {
+        v = pro == RHT_PRO_NORM ? 1.0f + 0.5f*frand() : frand();
+    }
+
+    float * d_x; float * d_x2; float * d_y; float * d_p; char * d_q; char * d_r; float * d_t = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_x, x.size()*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_x2, x2.size()*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_y, ny*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_p, ny*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_q, std::max(q8_1_size(c), ny*sizeof(float))));
+    CUDA_CHECK(cudaMalloc(&d_r, q8_1_size(c)));
+    size_t nt = 0;
+    for (int fmt = GGML_CUDA_SRC1_F32; fmt <= GGML_CUDA_SRC1_Q8_1_MMQ_DS4; ++fmt) {
+        nt = std::max({nt, rht_tmp_floats(sh, rows, cfg, fmt, pro), rht_tmp_floats(sh, rows, cfg, fmt)});
+    }
+    if (nt) {
+        CUDA_CHECK(cudaMalloc(&d_t, nt*sizeof(float)));
+    }
+    CUDA_CHECK(cudaMemcpy(d_x, x.data(), x.size()*sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_x2, x2.data(), x2.size()*sizeof(float), cudaMemcpyHostToDevice));
+
+    bool ok = true;
+
+    launch(sh, cfg, c, d_x, d_y, d_t, st, GGML_CUDA_SRC1_F32, pro, d_x2);
+    std::vector<float> y(ny);
+    CUDA_CHECK(cudaMemcpy(y.data(), d_y, ny*sizeof(float), cudaMemcpyDeviceToHost));
+    double max_diff = 0.0, max_ref = 0.0;
+    std::vector<float> ref(c.n);
+    for (int64_t r = 0; r < rows; ++r) {
+        const float * xr = x.data() + c.off(r);
+        double ss = 0.0;
+        for (int64_t i = 0; i < c.n; ++i) {
+            const float xi = xr[i];
+            const float ui = pro == RHT_PRO_NORM ? x2[i] : x2[c.off(r) + i];
+            ss    += (double) xi*xi;
+            ref[i] = pro == RHT_PRO_NORM ? xi*ui : pro == RHT_PRO_SWIGLU ? xi/(1.0f + expf(-xi))*ui :
+                0.5f*xi*(1.0f + tanhf(0.79788456080286535587989211986876f*xi*(1.0f + 0.044715f*xi*xi)))*ui;
+        }
+        ggml_rht_ref(ref.data(), c.n, SEED);
+        const double scale = pro == RHT_PRO_NORM ? 1.0/sqrt(ss/c.n + EPS) : 1.0;
+        for (int64_t i = 0; i < c.n; ++i) {
+            const double d = fabs((double) y[r*c.n + i] - ref[i]*scale);
+            max_diff = std::isnan(d) ? INFINITY : std::max(max_diff, d);
+            max_ref  = std::max(max_ref, fabs(ref[i]*scale));
+        }
+    }
+    if (!(max_diff <= MAX_ERR*max_ref)) {
+        printf("# FAIL prologue %s n=%ld rows=%ld kernel=%s err=%.3g\n", pro_name(pro), (long) c.n, (long) rows, kernel_name(sh, rows, cfg), max_diff/max_ref);
+        ok = false;
+    }
+
+    if (pro != RHT_PRO_NORM) {
+        produce_launch(c, d_x, d_x2, d_p, pro, st);
+        const rht_case cp = make_case(c.n, rows);
+        launch(sh, cfg, cp, d_p, d_q, d_t, st);
+        std::vector<float> y2(ny);
+        CUDA_CHECK(cudaMemcpy(y2.data(), d_q, ny*sizeof(float), cudaMemcpyDeviceToHost));
+        if (memcmp(y.data(), y2.data(), ny*sizeof(float)) != 0) {
+            printf("# FAIL prologue %s n=%ld rows=%ld kernel=%s: not bitwise equal to the unfused rotation\n", pro_name(pro), (long) c.n,
+                (long) rows, kernel_name(sh, rows, cfg));
+            ok = false;
+        }
+    }
+
+    if (c.n % QK8_1 == 0) {
+        for (ggml_cuda_src1_fmt fmt : {GGML_CUDA_SRC1_Q8_1, GGML_CUDA_SRC1_Q8_1_MMQ_D4, GGML_CUDA_SRC1_Q8_1_MMQ_DS4}) {
+            rht_cfg cfg_f32 = cfg;
+            if (!rht_use_b(sh, rows, cfg, fmt)) {
+                cfg_f32.kernel = 1;
+            }
+            launch(sh, cfg_f32, c, d_x, d_y, d_t, st, GGML_CUDA_SRC1_F32, pro, d_x2);
+            quantize_ref(c, d_y, d_r, fmt, st);
+            CUDA_CHECK(cudaMemset(d_q, 0xAB, q8_1_size(c)));
+            launch(sh, cfg, c, d_x, d_q, d_t, st, fmt, pro, d_x2);
+            std::vector<char> q(q8_1_size(c)), r(q8_1_size(c));
+            CUDA_CHECK(cudaMemcpy(q.data(), d_q, q.size(), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(r.data(), d_r, r.size(), cudaMemcpyDeviceToHost));
+            if (memcmp(q.data(), r.data(), q.size()) != 0) {
+                printf("# FAIL prologue %s q8_1 fmt=%d n=%ld rows=%ld kernel=%s\n", pro_name(pro), (int) fmt, (long) c.n, (long) rows,
+                    kernel_name(sh, rows, cfg, fmt));
+                ok = false;
+            }
+        }
+    }
+
+    CUDA_CHECK(cudaFree(d_x)); CUDA_CHECK(cudaFree(d_x2)); CUDA_CHECK(cudaFree(d_y)); CUDA_CHECK(cudaFree(d_p));
+    CUDA_CHECK(cudaFree(d_q)); CUDA_CHECK(cudaFree(d_r));
+    if (d_t) {
+        CUDA_CHECK(cudaFree(d_t));
+    }
+    return ok;
+}
+
+static void check_prologues_all(cudaStream_t st) {
+    int n_cases = 0;
+    int n_bad   = 0;
+    // one width per class: K = 1 one pass / mixed / strided, unrolled orders (split and not), generic, narrow chunks
+    for (int64_t n : {64ll, 1024ll, 4096ll, 1ll << 16, 3072ll, 5120ll, 6144ll, 17408ll, 11008ll, 9728ll, 36ll*256, 36ll*16, 12ll << 11}) {
+        for (int kernel : {1, 2}) {
+            rht_cfg cfg;
+            cfg.kernel = kernel;
+            for (const rht_case & c : {make_case(n, 1), make_case(n, 7, 5), make_case(n, 9), make_case_4d(n, 5, 3, 2, 1, 5, 7)}) {
+                for (int pro : {RHT_PRO_NORM, RHT_PRO_SWIGLU, RHT_PRO_GEGLU}) {
+                    n_cases++;
+                    n_bad += !check_prologue(c, cfg, pro, st);
+                }
+            }
+        }
+    }
+    n_failed += n_bad;
+    printf("# prologues: %d cases, %d failed\n", n_cases, n_bad);
 }
 
 static bool once = false;
@@ -581,6 +766,55 @@ static void bench_q8_1(int64_t n, const rht_cfg & cfg, int64_t rows, cudaStream_
     fflush(stdout);
 }
 
+// fused prologue vs producer + rotation (F32 out): decode as 64 dependent launches, prompt processing
+// through buffer sets larger than L2
+static void bench_prologue(int64_t n, int64_t rows, const int pro, cudaStream_t st) {
+    const rht_cfg cfg;
+    rht_shape     sh;
+    GGML_ASSERT(rht_make_shape(n, cfg, sh));
+    const rht_case c     = make_case(n, rows);
+    const size_t   bytes = c.size()*sizeof(float);
+    const int      nbuf  = rows >= 64 ? (int) std::max<size_t>(2, (384u << 20)/(3*bytes) + 1) : 2;
+
+    std::vector<float *> x(nbuf), u(nbuf), y(nbuf);
+    for (int i = 0; i < nbuf; ++i) {
+        CUDA_CHECK(cudaMalloc(&x[i], bytes));
+        CUDA_CHECK(cudaMalloc(&u[i], bytes));
+        CUDA_CHECK(cudaMalloc(&y[i], bytes));
+        CUDA_CHECK(cudaMemset(x[i], 0, bytes));
+        CUDA_CHECK(cudaMemset(u[i], 0, bytes));
+    }
+    float * tmp = nullptr;
+    const size_t nt = std::max(rht_tmp_floats(sh, rows, cfg, GGML_CUDA_SRC1_F32, pro), rht_tmp_floats(sh, rows, cfg));
+    if (nt) {
+        CUDA_CHECK(cudaMalloc(&tmp, nt*sizeof(float)));
+    }
+    // decode chains each rotation into the next one's x
+    auto in  = [&](int i) { return rows >= 64 ? x[i % nbuf] : y[(i + 1) % 2]; };
+    auto out = [&](int i) { return y[i % nbuf]; };
+    for (bool fused : {false, true}) {
+        const double us = time_graph_of([&](int i) {
+            if (fused) {
+                launch(sh, cfg, c, in(i), out(i), tmp, st, GGML_CUDA_SRC1_F32, pro, u[i % nbuf]);
+            } else {
+                produce_launch(c, in(i), u[i % nbuf], x[(i + 1) % nbuf], pro, st);
+                launch(sh, cfg, c, x[(i + 1) % nbuf], out(i), tmp, st);
+            }
+        }, rows >= 64 ? nbuf : 64, st);
+        printf("%ld,%d,%ld,%ld,%s,%s%s,,%.2f,,,\n", (long) n, sh.K, (long) sh.P, (long) rows, kernel_name(sh, rows, cfg),
+            fused ? "fused_" : "producer+rht_", pro_name(pro), us);
+    }
+    fflush(stdout);
+    for (int i = 0; i < nbuf; ++i) {
+        CUDA_CHECK(cudaFree(x[i]));
+        CUDA_CHECK(cudaFree(u[i]));
+        CUDA_CHECK(cudaFree(y[i]));
+    }
+    if (tmp) {
+        CUDA_CHECK(cudaFree(tmp));
+    }
+}
+
 int main(int argc, char ** argv) {
     bool    sweep      = false;
     bool    skip_check = false;
@@ -619,6 +853,7 @@ int main(int argc, char ** argv) {
     if (!skip_check && !once) {
         check_all(st);
         check_q8_1_all(st);
+        check_prologues_all(st);
     }
 
     std::vector<int64_t> shapes = { 2560, 4096, 9728, 5120, 6144, 17408, 11008, 3072 };
@@ -641,6 +876,9 @@ int main(int argc, char ** argv) {
                 bench(n, b, rows, st);
             }
             bench_q8_1(n, rht_cfg(), rows, st);
+            for (int pro : {RHT_PRO_NORM, RHT_PRO_SWIGLU}) {
+                bench_prologue(n, rows, pro, st);
+            }
         }
         if (sweep) {
             rht_shape sh;

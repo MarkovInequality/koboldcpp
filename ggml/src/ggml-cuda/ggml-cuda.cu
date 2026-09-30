@@ -1903,37 +1903,64 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 // the RHT nodes writing Q8_1 in the graph being evaluated on this thread
 static thread_local std::unordered_map<const ggml_tensor *, ggml_cuda_src1_fmt> ggml_cuda_src1_fmts;
 
-static std::atomic<int64_t> ggml_cuda_rht_q8_1_count{0};
-
 ggml_cuda_src1_fmt ggml_cuda_get_src1_fmt(const ggml_tensor * t) {
     const auto it = ggml_cuda_src1_fmts.find(t);
     return it == ggml_cuda_src1_fmts.end() ? GGML_CUDA_SRC1_F32 : it->second;
 }
 
-// number of RHT launches that wrote Q8_1, for tests
+// number of RHT launches that wrote Q8_1 / that ran fused with their producer, for tests
 static int64_t ggml_backend_cuda_rht_q8_1_count(void) {
-    return ggml_cuda_rht_q8_1_count.load();
+    return ggml_cuda_rht_q8_1_count();
 }
 
-// the Q8_1 a MUL_MAT would quantize its src1 rht to, and the bytes it reads (tile overrun included); F32 if none
+static int64_t ggml_backend_cuda_rht_fused_count(void) {
+    return ggml_cuda_rht_fused_count();
+}
+
+// the RHT node whose rows t holds unchanged and in order: the RHT itself or a reshape of it that keeps the row
+// width, so either carries the same Q8_1 bytes; nullptr if none
+static const ggml_tensor * ggml_cuda_rht_rows_of(const ggml_tensor * t) {
+    while (t->op == GGML_OP_RESHAPE && t->src[0]->ne[0] == t->ne[0]) {
+        t = t->src[0];
+    }
+    return t->op == GGML_OP_RHT ? t : nullptr;
+}
+
+// the Q8_1 a MUL_MAT or MUL_MAT_ID would quantize its src1 (rht, or a reshape of it) to, and the bytes it reads
+// (tile overrun included); F32 if none. Through a reshape only MMVQ's row-major layout lines up.
 static ggml_cuda_src1_fmt ggml_cuda_rht_consumer_fmt(
         const ggml_tensor * mm, const ggml_tensor * rht, const int cc, const int warp_size, size_t & nbytes) {
-    if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != rht || mm->src[0] == rht || !ggml_is_quantized(mm->src[0]->type) ||
-            ggml_get_op_params_i32(mm, 1) != 0) {
+    if (mm->op != GGML_OP_MUL_MAT && mm->op != GGML_OP_MUL_MAT_ID) {
+        return GGML_CUDA_SRC1_F32;
+    }
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    if (ggml_cuda_rht_rows_of(src1) != rht || ggml_cuda_rht_rows_of(src0) == rht || !ggml_is_quantized(src0->type) ||
+            mm->type != GGML_TYPE_F32) {
         return GGML_CUDA_SRC1_F32;
     }
 
-    const ggml_tensor * src0 = mm->src[0];
-
     const int64_t ne10_padded = GGML_PAD(rht->ne[0], MATRIX_ROW_PADDING);
-    const size_t  nbytes_q8_1 = rht->ne[3]*rht->ne[2]*rht->ne[1]*ne10_padded*sizeof(block_q8_1)/QK8_1;
+    const size_t  nbytes_q8_1 = ggml_nrows(rht)*ne10_padded*sizeof(block_q8_1)/QK8_1;
 
-    switch (ggml_cuda_mul_mat_path(src0, rht, mm, cc, warp_size)) {
+    if (mm->op == GGML_OP_MUL_MAT_ID) {
+        // ggml_cuda_mul_mat_id's MMVQ path (also its fusions), which quantizes src1 as a MUL_MAT's
+        if (mm->ne[2] > MMVQ_MAX_BATCH_SIZE || mm->ne[2] > get_mmvq_mmid_max_batch(src0->type, cc)) {
+            return GGML_CUDA_SRC1_F32;
+        }
+        nbytes = nbytes_q8_1;
+        return GGML_CUDA_SRC1_Q8_1;
+    }
+    if (ggml_get_op_params_i32(mm, 1) != 0) {
+        return GGML_CUDA_SRC1_F32;
+    }
+
+    switch (ggml_cuda_mul_mat_path(src0, src1, mm, cc, warp_size)) {
         case GGML_CUDA_MM_VEC_Q:
             nbytes = nbytes_q8_1;
             return GGML_CUDA_SRC1_Q8_1;
         case GGML_CUDA_MM_Q:
-            if (blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4)) {
+            if (src1 != rht || (blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4))) {
                 return GGML_CUDA_SRC1_F32;
             }
             // ggml_cuda_mmq_get_J_max <= min(ne11, 512): the bound costs nothing, the exact value a search per consumer
@@ -1959,20 +1986,33 @@ static void ggml_cuda_rht_plan_q8_1(const ggml_backend_cuda_context * ctx, const
         return;
     }
 
-    std::unordered_map<const ggml_tensor *, std::vector<const ggml_tensor *>> consumers;
+    // per RHT node: its family (itself, then the reshapes that keep its rows, as node indices) and the nodes that
+    // read it through any of them
+    struct rht_uses {
+        std::vector<int>                 family;
+        std::vector<const ggml_tensor *> consumers;
+    };
+    std::unordered_map<const ggml_tensor *, rht_uses> uses;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
-        if (cgraph->nodes[i]->op == GGML_OP_RHT) {
-            consumers[cgraph->nodes[i]];
+        const ggml_tensor * node = cgraph->nodes[i];
+        const ggml_tensor * rht  = ggml_cuda_rht_rows_of(node);
+        if (rht && (node == rht || uses.count(rht))) {
+            uses[rht].family.push_back(i);
         }
     }
-    if (consumers.empty()) {
+    if (uses.empty()) {
         return;
     }
     for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_RESHAPE && ggml_cuda_rht_rows_of(node)) {
+            continue;
+        }
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
-            const auto it = consumers.find(cgraph->nodes[i]->src[j]);
-            if (it != consumers.end()) {
-                it->second.push_back(cgraph->nodes[i]);
+            const ggml_tensor * rht = node->src[j] ? ggml_cuda_rht_rows_of(node->src[j]) : nullptr;
+            const auto it = rht ? uses.find(rht) : uses.end();
+            if (it != uses.end()) {
+                it->second.consumers.push_back(node);
             }
         }
     }
@@ -1980,21 +2020,23 @@ static void ggml_cuda_rht_plan_q8_1(const ggml_backend_cuda_context * ctx, const
     const int cc        = ggml_cuda_info().devices[ctx->device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx->device].warp_size;
 
-    for (int i = 0; i < cgraph->n_nodes; ++i) {
-        const ggml_tensor * node = cgraph->nodes[i];
-        if (node->op != GGML_OP_RHT || (node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
-            continue;
+    for (auto & [rht, u] : uses) {
+        // every use of the family is a consumer or one of the family's own reshapes
+        int n_uses = 0;
+        bool output = false;
+        for (const int i : u.family) {
+            n_uses += ggml_node_get_use_count(cgraph, i);
+            output  = output || (cgraph->nodes[i]->flags & GGML_TENSOR_FLAG_OUTPUT);
         }
-        const std::vector<const ggml_tensor *> & cons = consumers[node];
-        if (cons.empty() || (int) cons.size() != ggml_node_get_use_count(cgraph, i)) {
+        if (output || u.consumers.empty() || n_uses != (int) (u.consumers.size() + u.family.size() - 1)) {
             continue;
         }
 
         ggml_cuda_src1_fmt fmt    = GGML_CUDA_SRC1_F32;
         size_t             nbytes = 0;
-        for (const ggml_tensor * mm : cons) {
+        for (const ggml_tensor * mm : u.consumers) {
             size_t nbytes_mm = 0;
-            const ggml_cuda_src1_fmt fmt_mm = ggml_cuda_rht_consumer_fmt(mm, node, cc, warp_size, nbytes_mm);
+            const ggml_cuda_src1_fmt fmt_mm = ggml_cuda_rht_consumer_fmt(mm, rht, cc, warp_size, nbytes_mm);
             if (fmt_mm == GGML_CUDA_SRC1_F32 || (fmt != GGML_CUDA_SRC1_F32 && fmt_mm != fmt)) {
                 fmt = GGML_CUDA_SRC1_F32;
                 break;
@@ -2002,8 +2044,10 @@ static void ggml_cuda_rht_plan_q8_1(const ggml_backend_cuda_context * ctx, const
             fmt    = fmt_mm;
             nbytes = std::max(nbytes, nbytes_mm);
         }
-        if (fmt != GGML_CUDA_SRC1_F32 && nbytes <= ggml_nbytes(node) && ggml_cuda_rht_write_q8_1(node, fmt, (int) cons.size())) {
-            ggml_cuda_src1_fmts[node] = fmt;
+        if (fmt != GGML_CUDA_SRC1_F32 && nbytes <= ggml_nbytes(rht) && ggml_cuda_rht_write_q8_1(rht, fmt, (int) u.consumers.size())) {
+            for (const int i : u.family) {
+                ggml_cuda_src1_fmts[cgraph->nodes[i]] = fmt;
+            }
         }
     }
 }
@@ -2546,9 +2590,6 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_lightning_indexer(ctx, dst);
             break;
         case GGML_OP_RHT:
-            if (ggml_cuda_get_src1_fmt(dst) != GGML_CUDA_SRC1_F32) {
-                ggml_cuda_rht_q8_1_count++;
-            }
             ggml_cuda_op_rht(ctx, dst);
             break;
         default:
@@ -3435,6 +3476,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (const int n_fused = ggml_cuda_rht_try_fuse(*cuda_ctx, cgraph, i)) {
+        return n_fused;
+    }
 
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
@@ -5671,6 +5716,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_rht_q8_1_count") == 0) {
         return (void *)ggml_backend_cuda_rht_q8_1_count;
+    }
+    if (strcmp(name, "ggml_backend_cuda_rht_fused_count") == 0) {
+        return (void *)ggml_backend_cuda_rht_fused_count;
+    }
+    if (strcmp(name, "ggml_backend_cuda_rht_fusion_pays") == 0) {
+        return (void *)ggml_cuda_rht_fusion_pays;
     }
     if (strcmp(name, "ggml_backend_cuda_rht_consumer_fmt") == 0) {
         return (void *)ggml_backend_cuda_rht_consumer_fmt;

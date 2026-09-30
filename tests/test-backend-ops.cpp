@@ -8395,6 +8395,7 @@ enum test_rht_q8_1_graph {
     RHT_Q8_1_GLU,       // up and gate (types[0]) into a SWIGLU
     RHT_Q8_1_WITH_ADD,  // one MUL_MAT per type and an ADD on the RHT output
     RHT_Q8_1_OUTPUT,    // one MUL_MAT per type, RHT output flagged as a graph output
+    RHT_Q8_1_MOE,       // a MUL_MAT (shared expert) on the RHT, two MUL_MAT_IDs (experts) on a 3D reshape of it
 };
 
 struct test_rht_q8_1 : public test_case {
@@ -8472,7 +8473,18 @@ struct test_rht_q8_1 : public test_case {
         rht = r;
 
         ggml_tensor * out = nullptr;
-        if (graph == RHT_Q8_1_GLU) {
+        if (graph == RHT_Q8_1_MOE) {
+            const int n_exp  = 4;
+            const int n_used = 2;
+            ggml_tensor * r3  = ggml_reshape_3d(ctx, r, n, 1, rows);
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, rows);
+            ggml_tensor * sh  = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, types[0], n, 256), r);
+            ggml_tensor * e0  = ggml_mul_mat_id(ctx, ggml_new_tensor_3d(ctx, types[0], n, 128, n_exp), r3, ids);
+            ggml_tensor * e1  = ggml_mul_mat_id(ctx, ggml_new_tensor_3d(ctx, types[0], n, 128, n_exp), r3, ids);
+            mms = { sh, e0, e1 };
+            out = ggml_concat(ctx, ggml_concat(ctx, sh, ggml_reshape_2d(ctx, e0, 128*n_used, rows), 0),
+                                   ggml_reshape_2d(ctx, e1, 128*n_used, rows), 0);
+        } else if (graph == RHT_Q8_1_GLU) {
             ggml_tensor * up   = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, types[0], n, 256), r);
             ggml_tensor * gate = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, types[0], n, 256), r);
             mms = { up, gate };
@@ -8497,6 +8509,10 @@ struct test_rht_q8_1 : public test_case {
         return out;
     }
 
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, 4);
+    }
+
     double max_err(ggml_backend_t backend) override {
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
         if (checked < 0) {
@@ -8509,6 +8525,152 @@ struct test_rht_q8_1 : public test_case {
                 const bool   emitted  = q8_1_count() > count0;
                 if (emitted != expect) {
                     printf("[RHT] Q8_1 %s, expected %s ", emitted ? "written" : "not written", expect ? "written" : "F32");
+                    checked = 0;
+                }
+            }
+        }
+        return checked ? max_nmse_err() : -1.0;
+    }
+};
+
+// A producer the CUDA backend fuses into the rotation (RMS_NORM + MUL or a GLU in front of an RHT), run as one
+// graph against the CPU. Where the graph allows it, the backend must fuse exactly when the shape pays
+// (ggml_backend_cuda_rht_fusion_pays); inputs computed in the graph may share memory with the RHT output, so there
+// only the result is checked. Checked through the backend's counter; never with GGML_CUDA_DISABLE_FUSION=1.
+enum test_rht_fused_kind {
+    RHT_FUSED_NORM,           // rms_norm(x)*w
+    RHT_FUSED_SWIGLU_SPLIT,   // swiglu(g, u)
+    RHT_FUSED_GEGLU_SPLIT,
+    RHT_FUSED_SWIGLU,         // swiglu of the two halves of each row
+    RHT_FUSED_GEGLU_SWAPPED,
+    RHT_FUSED_SWIGLU_INPLACE, // swiglu(g, u) written over g, as llama builds it for a rotated gate
+    RHT_FUSED_NORM_TWO_USES,  // the MUL also feeds an ADD: not fusable
+    RHT_FUSED_SWIGLU_OAI,     // not a fused GLU op
+};
+
+struct test_rht_fused : public test_case {
+    const test_rht_fused_kind kind;
+    const std::array<int64_t, 3> ne; // n, rows, channels
+    const bool q8_1;     // two quantized consumers, so the rotation may write Q8_1
+    const bool computed; // the fused inputs are computed in the graph
+
+    int64_t count0  = -1;
+    int     checked = -1;
+    ggml_tensor * rht = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RHT_FUSED";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(kind, ne, q8_1, computed);
+    }
+
+    test_rht_fused(test_rht_fused_kind kind, std::array<int64_t, 3> ne, bool q8_1 = false, bool computed = false)
+        : kind(kind), ne(ne), q8_1(q8_1), computed(computed) {}
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return q8_1 ? 5e-4 : 1e-6;
+    }
+
+    static void * cuda_fn(const char * name) {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+        return reg ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
+    }
+
+    static int64_t fused_count() {
+        auto fn = (int64_t (*)(void)) cuda_fn("ggml_backend_cuda_rht_fused_count");
+        return fn ? fn() : -1;
+    }
+
+    ggml_tensor * input(ggml_context * ctx, int64_t n0, const char * name) {
+        ggml_tensor * t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n0, ne[1], ne[2]);
+        ggml_set_name(t, name);
+        return computed ? ggml_scale(ctx, t, 1.5f) : t;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        count0  = fused_count();
+        checked = -1;
+
+        const int64_t n = ne[0];
+        ggml_tensor * y     = nullptr;
+        ggml_tensor * extra = nullptr;
+        switch (kind) {
+            case RHT_FUSED_NORM:
+            case RHT_FUSED_NORM_TWO_USES: {
+                ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+                ggml_set_name(w, "w");
+                y = ggml_mul(ctx, ggml_rms_norm(ctx, input(ctx, n, "x"), 1e-6f), w);
+                if (kind == RHT_FUSED_NORM_TWO_USES) {
+                    extra = ggml_add(ctx, y, y);
+                }
+            } break;
+            case RHT_FUSED_SWIGLU_SPLIT:
+                y = ggml_swiglu_split(ctx, input(ctx, n, "g"), input(ctx, n, "u"));
+                break;
+            case RHT_FUSED_GEGLU_SPLIT:
+                y = ggml_geglu_split(ctx, input(ctx, n, "g"), input(ctx, n, "u"));
+                break;
+            case RHT_FUSED_SWIGLU:
+                y = ggml_swiglu(ctx, input(ctx, 2*n, "gu"));
+                break;
+            case RHT_FUSED_GEGLU_SWAPPED:
+                y = ggml_geglu_swapped(ctx, input(ctx, 2*n, "gu"));
+                break;
+            case RHT_FUSED_SWIGLU_INPLACE:
+                y = ggml_glu_split_inplace(ctx, input(ctx, n, "g"), input(ctx, n, "u"), GGML_GLU_OP_SWIGLU);
+                break;
+            case RHT_FUSED_SWIGLU_OAI:
+                y = ggml_swiglu_oai(ctx, input(ctx, n, "g"), input(ctx, n, "u"), 1.702f, 7.0f);
+                break;
+        }
+        rht = ggml_rht(ctx, y, 42);
+        ggml_set_name(rht, "rht");
+
+        ggml_tensor * out = rht;
+        if (q8_1) {
+            // the consumers read the RHT node itself (not a view), as the Q8_1 planner requires
+            const ggml_type type = n % ggml_blck_size(GGML_TYPE_Q4_K) == 0 ? GGML_TYPE_Q4_K : GGML_TYPE_Q8_0;
+            out = ggml_concat(ctx, ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, type, n, 256), rht),
+                                   ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, type, n, 128), rht), 0);
+        }
+        if (extra) {
+            out = ggml_concat(ctx, ggml_reshape_2d(ctx, out, ggml_nelements(out)/ne[1]/ne[2], ne[1]*ne[2]),
+                                   ggml_reshape_2d(ctx, extra, n, ne[1]*ne[2]), 0);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            // norm weights around 1, activations in the range where the GLUs are nonlinear
+            if (strcmp(t->name, "w") == 0) {
+                init_tensor_uniform(t, 0.5f, 1.5f);
+            } else {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            }
+        }
+    }
+
+    double max_err(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        if (checked < 0) {
+            checked = 1;
+            if (strcmp(ggml_backend_reg_name(reg), "CUDA") == 0 && count0 >= 0 && !computed) {
+                const char * env      = getenv("GGML_CUDA_DISABLE_FUSION");
+                const bool   disabled = env && atoi(env);
+                auto         pays     = (bool (*)(const ggml_tensor *)) cuda_fn("ggml_backend_cuda_rht_fusion_pays");
+                GGML_ASSERT(pays);
+                const bool fusable = kind != RHT_FUSED_NORM_TWO_USES && kind != RHT_FUSED_SWIGLU_OAI;
+                const bool expect  = fusable && !disabled && pays(rht);
+                const bool fused   = fused_count() > count0;
+                if (fused != expect) {
+                    printf("[RHT] %s, expected %s ", fused ? "fused" : "not fused", expect ? "fused" : "not fused");
                     checked = 0;
                 }
             }
@@ -8596,6 +8758,12 @@ static void make_test_cases_fork(std::vector<std::unique_ptr<test_case>> & test_
         // Q4_K (DS4) next to Q6_K (D4): one layout while both take MMVQ
         test_cases.emplace_back(new test_rht_q8_1({GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q6_K}, 2560, rows, RHT_Q8_1_MATMULS, true));
     }
+    // the experts' MUL_MAT_IDs read a reshape of the RHT the shared expert reads (MMVQ in decode, MMQ beyond)
+    for (int64_t rows : {1, 2, 4, 8, 9, 64}) {
+        for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_rht_q8_1({type}, 2560, rows, RHT_Q8_1_MOE, true));
+        }
+    }
     for (ggml_type type : {GGML_TYPE_IQ4_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S}) {
         for (int64_t rows : {1, 8}) {
             test_cases.emplace_back(new test_rht_q8_1({type, type}, 2560, rows, RHT_Q8_1_MATMULS, true));
@@ -8616,6 +8784,34 @@ static void make_test_cases_fork(std::vector<std::unique_ptr<test_case>> & test_
     // the padded Q8_1 doesn't fit in the F32 output
     for (int64_t rows : {1, 8}) {
         test_cases.emplace_back(new test_rht_q8_1({GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}, 128, rows, RHT_Q8_1_MATMULS, false));
+    }
+
+    // producers fused into the rotation: every kernel path (one-warp rows, the mix, K-split, generic, narrow, strided,
+    // kernel B, the compute-bound order that isn't fused), with and without Q8_1 consumers, 3D rows
+    for (test_rht_fused_kind kind : {RHT_FUSED_NORM, RHT_FUSED_SWIGLU_SPLIT, RHT_FUSED_GEGLU_SPLIT, RHT_FUSED_SWIGLU, RHT_FUSED_GEGLU_SWAPPED,
+                                     RHT_FUSED_SWIGLU_INPLACE}) {
+        for (int64_t n : {1024, 2048, 5120, 17408, 11008, 36*256, 36*16, 1 << 16}) {
+            for (int64_t rows : {1, 8, 9, 512}) {
+                if (n*rows > (1 << 22)) {
+                    continue;
+                }
+                test_cases.emplace_back(new test_rht_fused(kind, {n, rows, 1}));
+                test_cases.emplace_back(new test_rht_fused(kind, {n, rows, 1}, true));
+            }
+        }
+        test_cases.emplace_back(new test_rht_fused(kind, {5120, 3, 4}));
+        test_cases.emplace_back(new test_rht_fused(kind, {5120, 4, 3}, true));
+        // computed inputs, which the graph allocator may place under the RHT output
+        for (int64_t n : {1024, 5120, 17408}) {
+            for (int64_t rows : {1, 9, 128}) {
+                test_cases.emplace_back(new test_rht_fused(kind, {n, rows, 1}, false, true));
+                test_cases.emplace_back(new test_rht_fused(kind, {n, rows, 1}, true, true));
+            }
+        }
+    }
+    for (int64_t rows : {1, 9}) {
+        test_cases.emplace_back(new test_rht_fused(RHT_FUSED_NORM_TWO_USES, {5120, rows, 1}));
+        test_cases.emplace_back(new test_rht_fused(RHT_FUSED_SWIGLU_OAI, {5120, rows, 1}));
     }
 }
 

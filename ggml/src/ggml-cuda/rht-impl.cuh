@@ -6,6 +6,7 @@
 
 #include "common.cuh"
 #include "quantize.cuh"
+#include "unary.cuh"
 #include "ggml-hadamard.h"
 
 #include <type_traits>
@@ -72,9 +73,18 @@ template <int K> struct rht_had;
 RHT_UNROLLED_ORDERS(RHT_HAD_DECL)
 #undef RHT_HAD_DECL
 
+// What the kernels rotate in place of the source rows x: x*w, scaled by 1/rms(x) after the transform (a fused
+// RMS_NORM + MUL), or act(g)*u (a fused GLU, g = x)
+enum rht_prologue {
+    RHT_PRO_NONE,
+    RHT_PRO_NORM,
+    RHT_PRO_SWIGLU,
+    RHT_PRO_GEGLU,
+};
+
 struct rht_args {
     const char * src;
-    float      * tmp;   // rows*n floats for the passes of kernel A
+    float      * tmp;   // rows*n floats for the passes of kernel A, then with RHT_PRO_NORM rows*units sums of squares
     void       * dst;
     int          out;   // ggml_cuda_src1_fmt
     int          K;     // table order, for the generic mix
@@ -89,6 +99,11 @@ struct rht_args {
     uint3        ne1, ne2;
     uint64_t     seed;
     float        scale;
+    int          pro;   // rht_prologue
+    int          units; // units per row (kernel A pass 1)
+    const char * src2;  // RHT_PRO_NORM: w (n floats); GLU: u, rows at nb21, nb22, nb23 like the source's
+    int64_t      nb21, nb22, nb23;
+    float        eps;
 };
 
 static __device__ __forceinline__ const float * rht_src_row(const rht_args & a, const uint32_t row) {
@@ -97,14 +112,38 @@ static __device__ __forceinline__ const float * rht_src_row(const rht_args & a, 
     return (const float *) (a.src + q1.y*a.nb1 + q2.y*a.nb2 + q2.x*a.nb3);
 }
 
+static __device__ __forceinline__ const float * rht_src2_row(const rht_args & a, const uint32_t row) {
+    if (a.pro == RHT_PRO_NORM) {
+        return (const float *) a.src2;
+    }
+    const uint2 q1 = fast_div_modulo(row,  a.ne1);
+    const uint2 q2 = fast_div_modulo(q1.x, a.ne2);
+    return (const float *) (a.src2 + q1.y*a.nb21 + q2.y*a.nb22 + q2.x*a.nb23);
+}
+
+static __device__ __forceinline__ float rht_norm_scale(const rht_args & a, const float sumsq) {
+    return rsqrtf(sumsq/a.n + a.eps);
+}
+
+// the row's sum of squares from kernel A pass 1, added in the same order by every warp
+static __device__ __forceinline__ float rht_row_sumsq(const rht_args & a, const int64_t row, const int lane) {
+    const float * ps = a.tmp + a.n*a.nrows + row*a.units;
+    float sum = 0.0f;
+    for (int u = lane; u < a.units; u += WARP_SIZE) {
+        sum += ps[u];
+    }
+    return warp_reduce_sum(sum);
+}
+
 static __device__ __forceinline__ float rht_flip(const float v, const uint32_t mask, const int bit) {
     return __int_as_float(__float_as_int(v) ^ ((mask << (31 - bit)) & 0x80000000u));
 }
 
-static __device__ __forceinline__ void rht_store_f32(const rht_args & a, const int64_t row, const int64_t e0, const int lane, const float v) {
+static __device__ __forceinline__ void rht_store_f32(
+        const rht_args & a, const float scale, const int64_t row, const int64_t e0, const int lane, const float v) {
     const int64_t i = e0 + lane;
     if (i < a.n) {
-        ((float *) a.dst)[row*a.n + i] = v*a.scale;
+        ((float *) a.dst)[row*a.n + i] = v*scale;
     }
 }
 
@@ -152,13 +191,13 @@ static __device__ __noinline__ void rht_store_q8_1(
 // Every store covers 32 consecutive elements of an output chunk, one block_q8_1, with all lanes of the warp:
 // lane stores element c*Pm + e0 + lane for the chunks c0 ... c0 + count-1 (count <= G). Q8_1 needs n % 32 == 0.
 template <int G>
-static __device__ __forceinline__ void rht_store(
-        const rht_args & a, const int64_t row, const int64_t e0, const int lane, const int c0, const int count, const float (&v)[G]) {
+static __device__ __forceinline__ void rht_store(const rht_args & a, const float scale,
+        const int64_t row, const int64_t e0, const int lane, const int c0, const int count, const float (&v)[G]) {
     if (a.out == GGML_CUDA_SRC1_F32) {
 #pragma unroll
         for (int g = 0; g < G; ++g) {
             if (g < count) {
-                rht_store_f32(a, row, (c0 + g)*a.Pm + e0, lane, v[g]);
+                rht_store_f32(a, scale, row, (c0 + g)*a.Pm + e0, lane, v[g]);
             }
         }
         return;
@@ -167,7 +206,7 @@ static __device__ __forceinline__ void rht_store(
     for (int g = 0; g < G; g += 4) {
         if (g < count) {
             const float4 v4 = make_float4(v[g], g + 1 < G ? v[g + 1] : 0.0f, g + 2 < G ? v[g + 2] : 0.0f, g + 3 < G ? v[g + 3] : 0.0f);
-            rht_store_q8_1(a.dst, a.out, a.ne1, a.npad, a.scale, row, (c0 + g)*a.Pm + e0, a.Pm, min(count - g, 4), lane, v4);
+            rht_store_q8_1(a.dst, a.out, a.ne1, a.npad, scale, row, (c0 + g)*a.Pm + e0, a.Pm, min(count - g, 4), lane, v4);
         }
     }
 }
@@ -190,6 +229,77 @@ static __device__ __noinline__ void rht_store_pad(void * dst, const int out, con
                 b->d4[(i % QK8_1_MMQ)/QK8_1] = 0.0f;
             }
         }
+    }
+}
+
+// One lane quantizes the 32 values x of the block at element i0 alone, in the arithmetic and summation order of
+// the warp-wide quantize kernels, so the bytes are the same.
+static __device__ __noinline__ void rht_quantize_block_lane(
+        void * dst, const int out, const uint3 ne1, const int64_t npad, const int64_t row, const int64_t i0, const float * x) {
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < QK8_1; ++i) {
+        amax = fmaxf(amax, fabsf(x[i]));
+    }
+    if (out == GGML_CUDA_SRC1_Q8_1) {
+        // warp_reduce_sum's xor tree
+        float s[QK8_1];
+#pragma unroll
+        for (int i = 0; i < QK8_1; ++i) {
+            s[i] = x[i];
+        }
+#pragma unroll
+        for (int off = QK8_1/2; off > 0; off >>= 1) {
+#pragma unroll
+            for (int i = 0; i < off; ++i) {
+                s[i] += s[i + off];
+            }
+        }
+        block_q8_1 * y = q8_1_block(dst, row, i0, npad);
+        const float d = amax / 127.0f;
+#pragma unroll
+        for (int i = 0; i < QK8_1; i += 4) {
+            char4 q;
+            q.x = amax == 0.0f ? 0 : roundf(x[i + 0] / d);
+            q.y = amax == 0.0f ? 0 : roundf(x[i + 1] / d);
+            q.z = amax == 0.0f ? 0 : roundf(x[i + 2] / d);
+            q.w = amax == 0.0f ? 0 : roundf(x[i + 3] / d);
+            *(char4 *) (y->qs + i) = q;
+        }
+        y->ds = make_half2(d, s[0]);
+        return;
+    }
+    const uint2 ci = fast_div_modulo((uint32_t) row, ne1);
+    block_q8_1_mmq * y = q8_1_mmq_block(dst, ci.x, ci.y, i0, ne1.z, npad);
+    const int iqs = (int) (i0 % QK8_1_MMQ);
+    const float d_inv = 127.0f / amax;
+#pragma unroll
+    for (int i = 0; i < QK8_1; i += 4) {
+        char4 q;
+        q.x = roundf(x[i + 0]*d_inv);
+        q.y = roundf(x[i + 1]*d_inv);
+        q.z = roundf(x[i + 2]*d_inv);
+        q.w = roundf(x[i + 3]*d_inv);
+        ((char4 *) y->qs)[(iqs + i)/4] = q;
+    }
+    const float d = 1.0f / d_inv;
+    if (out == GGML_CUDA_SRC1_Q8_1_MMQ_DS4) {
+        // q8_1_mmq_quantize4: sums of 4 per thread, then an xor tree over the 8 threads of the block
+        float s[QK8_1/4];
+#pragma unroll
+        for (int j = 0; j < QK8_1/4; ++j) {
+            s[j] = x[4*j] + x[4*j + 1] + x[4*j + 2] + x[4*j + 3];
+        }
+#pragma unroll
+        for (int off = QK8_1/8; off > 0; off >>= 1) {
+#pragma unroll
+            for (int j = 0; j < off; ++j) {
+                s[j] += s[j + off];
+            }
+        }
+        y->ds4[iqs/QK8_1] = make_half2(d, s[0]);
+    } else {
+        y->d4[iqs/QK8_1] = d;
     }
 }
 
@@ -223,6 +333,36 @@ static __device__ __forceinline__ void rht_load(float * v, const float * x, cons
     for (int e = 0; e < E; ++e) {
         const int64_t i = base + e*WARP_SIZE + lane;
         v[e] = E > 1 || i < n ? x[i] : 0.0f;
+    }
+}
+
+// rht_load through the prologue; ss collects x^2 for RHT_PRO_NORM. Same arithmetic as the GLU kernels.
+template <int E>
+static __device__ __forceinline__ void rht_load_pro(
+        float * v, const rht_args & a, const float * x, const float * x2, const int64_t base, const int lane, float & ss) {
+    float u[E];
+    rht_load<E>(v, x, base, lane, a.n);
+    rht_load<E>(u, x2, base, lane, a.n);
+    switch (a.pro) {
+        case RHT_PRO_NORM:
+#pragma unroll
+            for (int e = 0; e < E; ++e) {
+                ss  += v[e]*v[e];
+                v[e] *= u[e];
+            }
+            break;
+        case RHT_PRO_SWIGLU:
+#pragma unroll
+            for (int e = 0; e < E; ++e) {
+                v[e] = ggml_cuda_op_silu_single(v[e])*u[e];
+            }
+            break;
+        default:
+#pragma unroll
+            for (int e = 0; e < E; ++e) {
+                v[e] = ggml_cuda_op_gelu_single(v[e])*u[e];
+            }
+            break;
     }
 }
 
@@ -434,7 +574,12 @@ static __global__ void rht_chunks(const rht_args a) {
     ggml_cuda_pdl_sync();
 
     float v[E];
-    rht_load<E>(v, rht_src_row(a, row), base, lane, a.n);
+    float ss = 0.0f;
+    if (a.pro == RHT_PRO_NONE) {
+        rht_load<E>(v, rht_src_row(a, row), base, lane, a.n);
+    } else {
+        rht_load_pro<E>(v, a, rht_src_row(a, row), rht_src2_row(a, row), base, lane, ss);
+    }
 #pragma unroll
     for (int e = 0; e < E; ++e) {
         v[e] = rht_flip(v[e], sg, e);
@@ -442,21 +587,27 @@ static __global__ void rht_chunks(const rht_args a) {
     rht_fwht<E>(v, lane, a.Pc);
 
     if (a.M == 1) {
+        // the whole row is this warp's unit
+        const float scale = a.pro == RHT_PRO_NORM ? a.scale*rht_norm_scale(a, warp_reduce_sum(ss)) : a.scale;
         if (a.out == GGML_CUDA_SRC1_F32) {
 #pragma unroll
             for (int e = 0; e < E; ++e) {
-                rht_store_f32(a, row, base + e*WARP_SIZE, lane, v[e]);
+                rht_store_f32(a, scale, row, base + e*WARP_SIZE, lane, v[e]);
             }
             return;
         }
+        // block e is v[e] across the lanes: transposed, lane e quantizes it alone instead of E warp reductions in turn
+        extern __shared__ float rht_tr[];
+        float * t = rht_tr + threadIdx.y*WARP_SIZE*(WARP_SIZE + 1);
 #pragma unroll
-        for (int e = 0; e < E; e += 4) {
-            const float4 v4 = make_float4(v[e], e + 1 < E ? v[e + 1] : 0.0f, e + 2 < E ? v[e + 2] : 0.0f, e + 3 < E ? v[e + 3] : 0.0f);
-            rht_store_q8_1(a.dst, a.out, a.ne1, a.npad, a.scale, row, base + e*WARP_SIZE, WARP_SIZE, min(E - e, 4), lane, v4);
+        for (int e = 0; e < E; ++e) {
+            t[e*(WARP_SIZE + 1) + lane] = v[e]*scale;
         }
-        if (base == 0) {
-            rht_store_pad(a.dst, a.out, a.ne1, a.n, a.npad, row, lane);
+        __syncwarp();
+        if (lane < E) {
+            rht_quantize_block_lane(a.dst, a.out, a.ne1, a.npad, row, (int64_t) lane*WARP_SIZE, t + lane*(WARP_SIZE + 1));
         }
+        rht_store_pad(a.dst, a.out, a.ne1, a.n, a.npad, row, lane);
         return;
     }
 
@@ -466,6 +617,12 @@ static __global__ void rht_chunks(const rht_args a) {
         const int64_t i = base + e*WARP_SIZE + lane;
         if (E > 1 || i < a.n) {
             y[i] = v[e];
+        }
+    }
+    if (a.pro == RHT_PRO_NORM) {
+        ss = warp_reduce_sum(ss);
+        if (lane == 0) {
+            a.tmp[a.n*a.nrows + row*a.units + w % units] = ss;
         }
     }
 }
@@ -501,6 +658,7 @@ static __global__ void rht_strided(const rht_args a, const int64_t s) {
 template <int MIX, int G, int KS>
 __launch_bounds__(RHT_A_WARPS_MAX*WARP_SIZE)
 static __global__ void rht_mix_split(const rht_args a) {
+    static_assert(KS == 1 || KS == rht_tile_rows(MIX, G), "each warp of a split job finishes one output chunk");
     const int     lane   = threadIdx.x;
     const int64_t w      = ((int64_t) blockIdx.x*blockDim.y + threadIdx.y)/KS;
     const bool    narrow = MIX == 0 && a.Pm < WARP_SIZE;
@@ -525,6 +683,7 @@ static __global__ void rht_mix_split(const rht_args a) {
         if (active && p == 0 && t == 0 && s == 0 && a.out != GGML_CUDA_SRC1_F32) {
             rht_store_pad(a.dst, a.out, a.ne1, a.n, a.npad, row, lane);
         }
+        const float scale = a.pro == RHT_PRO_NORM ? a.scale*rht_norm_scale(a, rht_row_sumsq(a, row, lane)) : a.scale;
 
         float acc[GT];
         if (active) {
@@ -536,15 +695,15 @@ static __global__ void rht_mix_split(const rht_args a) {
             part_acc[threadIdx.y][g][lane] = acc[g];
         }
         __syncthreads();
-        if (active && p == 0) {
+        // warp p of the job finishes output chunk p of the tile, adding the parts in order
+        if (active && t*GT + p < a.M) {
+            const int w0 = threadIdx.y - p;
+            float v[1] = { part_acc[w0][p][lane] };
 #pragma unroll
-            for (int g = 0; g < GT; ++g) {
-#pragma unroll
-                for (int q = 1; q < KS; ++q) {
-                    acc[g] += part_acc[threadIdx.y + q][g][lane];
-                }
+            for (int q = 1; q < KS; ++q) {
+                v[0] += part_acc[w0 + q][p][lane];
             }
-            rht_store(a, row, s*WARP_SIZE, lane, t*GT, min(a.M - t*GT, GT), acc);
+            rht_store(a, scale, row, s*WARP_SIZE, lane, t*GT + p, 1, v);
         }
     } else {
         if (w >= jobs*a.nrows) {
@@ -563,18 +722,19 @@ static __global__ void rht_mix_split(const rht_args a) {
         if (a.out != GGML_CUDA_SRC1_F32 && t == 0 && s == 0) {
             rht_store_pad(a.dst, a.out, a.ne1, a.n, a.npad, row, lane);
         }
+        const float scale = a.pro == RHT_PRO_NORM ? a.scale*rht_norm_scale(a, rht_row_sumsq(a, row, lane)) : a.scale;
 
         if constexpr (MIX == 0) {
             if (narrow) {
                 const float v[1] = { rht_mix_narrow(a, s, lane, bits, [&](const int64_t i) { return x[i]; }) };
-                rht_store(a, row, s*WARP_SIZE, lane, 0, 1, v);
+                rht_store(a, scale, row, s*WARP_SIZE, lane, 0, 1, v);
                 return;
             }
         }
 
         const float * xs = x + s*WARP_SIZE + lane;
         rht_mix_out<MIX, GT>(a, t, bits, [&](const int c) { return xs[c*a.Pm]; },
-            [&](const int c0, const int count, const auto & v) { rht_store(a, row, s*WARP_SIZE, lane, c0, count, v); });
+            [&](const int c0, const int count, const auto & v) { rht_store(a, scale, row, s*WARP_SIZE, lane, c0, count, v); });
     }
 }
 
@@ -618,14 +778,20 @@ static __global__ void rht_rows(const rht_args a) {
 
     const int row = blockIdx.x;
 
-    const float * x = rht_src_row(a, row);
+    const float * x  = rht_src_row(a, row);
+    const float * x2 = a.pro == RHT_PRO_NONE ? nullptr : rht_src2_row(a, row);
+    float ss = 0.0f;
     rht_switch_e<EMAX>(E, [&](auto ec) {
         constexpr int E_ = decltype(ec)::value;
 #pragma unroll
         for (int q = 0; q < RHT_B_REGS/E_; ++q) {
             const int u = w + q*W;
             if (q < Q && u < U) {
-                rht_load<E_>(v + q*E_, x, (int64_t) u*E_*WARP_SIZE, lane, a.n);
+                if (a.pro == RHT_PRO_NONE) {
+                    rht_load<E_>(v + q*E_, x, (int64_t) u*E_*WARP_SIZE, lane, a.n);
+                } else {
+                    rht_load_pro<E_>(v + q*E_, a, x, x2, (int64_t) u*E_*WARP_SIZE, lane, ss);
+                }
             }
         }
 #pragma unroll
@@ -641,6 +807,22 @@ static __global__ void rht_rows(const rht_args a) {
         }
     });
 
+    // the sums of squares pass through the start of the shared memory, before any stage uses it
+    float scale = a.scale;
+    if (a.pro == RHT_PRO_NORM) {
+        ss = warp_reduce_sum(ss);
+        if (lane == 0) {
+            rht_smem[w] = ss;
+        }
+        __syncthreads();
+        float sumsq = 0.0f;
+        for (int i = 0; i < W; ++i) {
+            sumsq += rht_smem[i];
+        }
+        scale *= rht_norm_scale(a, sumsq);
+        __syncthreads();
+    }
+
     if constexpr (MIX == 0) {
         if (a.Pm < WARP_SIZE) {
 #pragma unroll
@@ -652,7 +834,7 @@ static __global__ void rht_rows(const rht_args a) {
             }
             __syncthreads();
             for (int b = w; b < U; b += W) {
-                rht_store_f32(a, row, (int64_t) b*WARP_SIZE, lane, rht_mix_narrow(a, b, lane, bits, [&](const int64_t i) { return rht_smem[i]; }));
+                rht_store_f32(a, scale, row, (int64_t) b*WARP_SIZE, lane, rht_mix_narrow(a, b, lane, bits, [&](const int64_t i) { return rht_smem[i]; }));
             }
             return;
         }
@@ -690,7 +872,7 @@ static __global__ void rht_rows(const rht_args a) {
 #pragma unroll
                     for (int g = 0; g < (int) (sizeof(v)/sizeof(v[0])); ++g) {
                         if (g < count) {
-                            rht_store_f32(a, row, (c0 + g)*a.Pm + e0, lane, v[g]);
+                            rht_store_f32(a, scale, row, (c0 + g)*a.Pm + e0, lane, v[g]);
                         }
                     }
                 });
@@ -771,11 +953,17 @@ static bool rht_use_b(const rht_shape & sh, const int64_t nrows, const rht_cfg &
     }
 }
 
-static size_t rht_tmp_floats(const rht_shape & sh, const int64_t nrows, const rht_cfg & cfg, const int out = GGML_CUDA_SRC1_F32) {
+static int64_t rht_units(const rht_shape & sh) {
+    const int64_t E = std::max<int64_t>(sh.Pc/WARP_SIZE, 1);
+    return (sh.n + E*WARP_SIZE - 1)/(E*WARP_SIZE);
+}
+
+static size_t rht_tmp_floats(const rht_shape & sh, const int64_t nrows, const rht_cfg & cfg, const int out = GGML_CUDA_SRC1_F32,
+        const int pro = RHT_PRO_NONE) {
     if (rht_use_b(sh, nrows, cfg, out) || (sh.M == 1 && !sh.multipass)) {
         return 0;
     }
-    return (size_t) (sh.n*nrows);
+    return (size_t) ((sh.n + (pro == RHT_PRO_NORM ? rht_units(sh) : 0))*nrows);
 }
 
 static rht_args rht_make_args(const rht_shape & sh, const void * src, const int64_t * ne, const size_t * nb,
@@ -800,6 +988,13 @@ static rht_args rht_make_args(const rht_shape & sh, const void * src, const int6
     a.ne2   = init_fastdiv_values(ne[2]);
     a.seed  = seed;
     a.scale = (float) (1.0 / sqrt((double) sh.n));
+    a.pro   = RHT_PRO_NONE;
+    a.units = (int) rht_units(sh);
+    a.src2  = nullptr;
+    a.nb21  = 0;
+    a.nb22  = 0;
+    a.nb23  = 0;
+    a.eps   = 0.0f;
     return a;
 }
 
@@ -897,7 +1092,9 @@ static void rht_launch(rht_args a, const rht_shape & sh, const rht_cfg & cfg, cu
         return dim3((unsigned) ((warps + cfg.a_warps - 1)/cfg.a_warps));
     };
 
-    ggml_cuda_kernel_launch(rht_chunks_kernel(E), ggml_cuda_kernel_launch_params(grid(units*a.nrows), block, 0, stream), a);
+    const size_t smem1 = sh.M == 1 && !sh.multipass && a.out != GGML_CUDA_SRC1_F32 ?
+        (size_t) cfg.a_warps*WARP_SIZE*(WARP_SIZE + 1)*sizeof(float) : 0;
+    ggml_cuda_kernel_launch(rht_chunks_kernel(E), ggml_cuda_kernel_launch_params(grid(units*a.nrows), block, smem1, stream), a);
     if (sh.M == 1 && !sh.multipass) {
         return;
     }

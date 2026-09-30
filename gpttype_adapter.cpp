@@ -7473,6 +7473,24 @@ size_t gpttype_calc_new_state_tokencount()
 {
     return current_context_tokens.size();
 }
+// Sizes buf to n bytes without zero-filling them. A buffer that is too small is freed before the new one is
+// allocated, with headroom, so a slot re-saved after its state grew reuses its pages. Pages not written yet are
+// touched here: faulting them in during the device-to-host copy costs about twice as much.
+static void kcpp_state_buffer_fit(kcpp_state_buffer & buf, size_t n)
+{
+    size_t touched = buf.size();
+    if (buf.capacity() < n) {
+        buf.clear();
+        buf.shrink_to_fit();
+        const size_t step = (size_t) 16 << 20;
+        buf.reserve((n + n/4 + step - 1)/step*step);
+        touched = 0;
+    }
+    buf.resize(n);
+    for (size_t i = touched; i < n; i += 4096) {
+        buf[i] = 0;
+    }
+}
 size_t gpttype_save_state_kv(int slot)
 {
     if(kcpp_data==nullptr)
@@ -7482,9 +7500,7 @@ size_t gpttype_save_state_kv(int slot)
     if(file_format == FileFormat::GGUF_GENERIC)
     {
         size_t totalbytes = 0;
-        if (!savestates[slot].current_savestate_buffer.empty()) {  //JIT free
-            savestates[slot].current_savestate_buffer.clear();
-            savestates[slot].current_draft_savestate_buffer.clear();
+        if (!savestates[slot].current_savestate_buffer.empty()) {  //JIT free; the buffers are kept for reuse, the sizes mark them invalid
             savestates[slot].savestate_context_tokens.clear();
             savestates[slot].latest_logits.clear();
             savestates[slot].current_savestate_size = 0;
@@ -7493,11 +7509,7 @@ size_t gpttype_save_state_kv(int slot)
         }
         size_t newsize = llama_state_get_size(llama_ctx_v4);
         try {
-            if (savestates[slot].current_savestate_buffer.capacity() < newsize + 512) {
-                savestates[slot].current_savestate_buffer = std::vector<uint8_t>(newsize + 512); // add some padding. May throw std::bad_alloc
-            } else {
-                savestates[slot].current_savestate_buffer.resize(newsize + 512);
-            }
+            kcpp_state_buffer_fit(savestates[slot].current_savestate_buffer, newsize + 512); // add some padding. May throw std::bad_alloc
         } catch (const std::bad_alloc&) {
             fprintf(stderr, "KV Save State: Failed to allocate %zu bytes.\n", newsize + 512);
             return 0;
@@ -7532,11 +7544,7 @@ size_t gpttype_save_state_kv(int slot)
         {
             size_t newsize2 = llama_state_get_size(draft_ctx);
             try {
-                if (savestates[slot].current_draft_savestate_buffer.capacity() < newsize2 + 512) {
-                    savestates[slot].current_draft_savestate_buffer = std::vector<uint8_t>(newsize2 + 512);
-                } else {
-                    savestates[slot].current_draft_savestate_buffer.resize(newsize2 + 512);
-                }
+                kcpp_state_buffer_fit(savestates[slot].current_draft_savestate_buffer, newsize2 + 512);
             } catch (const std::bad_alloc&) {
                 fprintf(stderr, "KV Save State: Failed to allocate %zu bytes.\n", newsize2 + 512);
                 return 0;
@@ -7560,7 +7568,7 @@ bool gpttype_load_state_kv(int slot)
     }
     if(file_format == FileFormat::GGUF_GENERIC)
     {
-        if (savestates[slot].current_savestate_buffer.empty()) {
+        if (savestates[slot].current_savestate_size == 0) { //never saved, or the save failed
             return false;
         }
         if(draft_ctx && savestates[slot].current_draft_savestate_size>0)

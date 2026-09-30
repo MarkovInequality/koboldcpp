@@ -536,12 +536,24 @@ struct speculative_draft_result
     int verify_n_past = 0;
 };
 
+// resize() leaves the new bytes uninitialized: zero-filling a ~400 MB state buffer costs far more than the copy into it
+template <typename T>
+struct kcpp_noinit_allocator : std::allocator<T>
+{
+    template <typename U> struct rebind { using other = kcpp_noinit_allocator<U>; };
+    kcpp_noinit_allocator() = default;
+    template <typename U> kcpp_noinit_allocator(const kcpp_noinit_allocator<U> &) {}
+    template <typename U> void construct(U * p) { ::new (static_cast<void *>(p)) U; }
+    template <typename U, typename... Args> void construct(U * p, Args &&... args) { ::new (static_cast<void *>(p)) U(std::forward<Args>(args)...); }
+};
+using kcpp_state_buffer = std::vector<uint8_t, kcpp_noinit_allocator<uint8_t>>;
+
 struct savestate_data
 {
     size_t current_savestate_size = 0;
-    std::vector<uint8_t> current_savestate_buffer;
+    kcpp_state_buffer current_savestate_buffer;
     size_t current_draft_savestate_size = 0;
-    std::vector<uint8_t> current_draft_savestate_buffer;
+    kcpp_state_buffer current_draft_savestate_buffer;
     std::vector<gpt_vocab::id> savestate_context_tokens; //for context clones
     std::vector<float> latest_logits;
     int64_t last_used = 0; //unix timestamp, updated on save or load

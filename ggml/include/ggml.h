@@ -1380,6 +1380,13 @@ extern "C" {
              struct ggml_tensor * b,
              enum ggml_glu_op     op);
 
+    // result written over a (contiguous); b as ggml_glu_split
+    GGML_API struct ggml_tensor * ggml_glu_split_inplace(
+            struct ggml_context * ctx,
+             struct ggml_tensor * a,
+             struct ggml_tensor * b,
+             enum ggml_glu_op     op);
+
     GGML_API struct ggml_tensor * ggml_reglu_split(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
