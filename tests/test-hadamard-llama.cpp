@@ -3,7 +3,9 @@
 // usage: test-hadamard-llama <workdir> <model.gguf>...
 //
 // Each model is a small non-HQ quantization. The test relabels its eligible tensors to their HQ
-// types and adds hadamard.seed; the data isn't really rotated, which doesn't matter here.
+// types and adds hadamard.seed; the data isn't really rotated, which doesn't matter for the structural
+// checks. The numeric comparisons use a real --hadamard requantization. Files written to <workdir> are
+// removed at the end.
 
 #include "llama.h"
 #include "llama-graph.h"
@@ -47,6 +49,14 @@ static void log_cb(ggml_log_level level, const char * text, void * ud) {
 }
 
 static const uint64_t SEED = 0x1234abcdull;
+
+static std::set<std::string> g_temp_files;
+
+static std::string temp_path(const std::string & dir, const char * name) {
+    const std::string path = dir + "/" + name;
+    g_temp_files.insert(path);
+    return path;
+}
 
 static bool g_rotate_embd = false;
 
@@ -309,10 +319,21 @@ static void test_guard(const llama_model * m) {
           "refuses ADD on a view of a rotated weight");
 }
 
+// the relabelled files aren't really rotated, which makes their logits chaotic, so the numeric comparisons
+// use the base model requantized with --hadamard
+static bool requantize_hq(const std::string & base_path, const std::string & hq_path) {
+    llama_model_quantize_params qp = llama_model_quantize_default_params();
+    qp.ftype            = LLAMA_FTYPE_MOSTLY_Q4_K_M;
+    qp.allow_requantize = true;
+    qp.hadamard         = true;
+    qp.pure             = true;
+    return llama_model_quantize(base_path.c_str(), hq_path.c_str(), &qp) == 0;
+}
+
 static void test_model(const std::string & dir, const std::string & base_path) {
     printf("\n%s:\n", base_path.c_str());
 
-    const std::string hq_path = dir + "/test-hq.gguf";
+    const std::string hq_path = temp_path(dir, "test-hq.gguf");
     std::map<std::string, ggml_type> hq_types;
     const std::set<std::string> relabelled = make_hq_file(base_path, hq_path, true, &hq_types);
     check(!relabelled.empty(), "relabelled " + std::to_string(relabelled.size()) + " tensors to HQ types");
@@ -366,16 +387,29 @@ static void test_model(const std::string & dir, const std::string & base_path) {
     }
 
     // the repacked kernels differ numerically from the plain ones, so the bound comes from the base model
-    const std::vector<float> logits      = run_logits(hq);
+    {
+        const std::string real_path = temp_path(dir, "test-hq-real.gguf");
+        check(requantize_hq(base_path, real_path), "requantize the base model with --hadamard");
+        llama_model * real      = load(real_path, true);
+        llama_model * real_flat = load(real_path, false);
+        if (real && real_flat) {
+            const std::vector<float> logits = run_logits(real);
+            const double err_hq   = nmse(logits, run_logits(real_flat));
+            const double err_base = nmse(run_logits(base), run_logits(base_flat));
+            printf("  (nmse repack vs plain: HQ %.3g, base %.3g)\n", err_hq, err_base);
+            check(!logits.empty() && err_hq < std::max(1e-5, 10*err_base), "logits with and without the CPU repack match as closely as the base model's");
+        } else {
+            check(false, "load the requantized HQ model");
+        }
+        for (llama_model * x : { real, real_flat }) {
+            if (x) llama_model_free(x);
+        }
+    }
     const std::vector<float> logits_flat = run_logits(hq_flat);
-    const double err_hq   = nmse(logits, logits_flat);
-    const double err_base = nmse(run_logits(base), run_logits(base_flat));
-    printf("  (nmse repack vs plain: HQ %.3g, base %.3g)\n", err_hq, err_base);
-    check(!logits.empty() && err_hq < std::max(1e-5, 10*err_base), "logits with and without the CPU repack match as closely as the base model's");
 
     printf("save round trip:\n");
     {
-        const std::string saved = dir + "/test-hq-saved.gguf";
+        const std::string saved = temp_path(dir, "test-hq-saved.gguf");
         llama_model_save_to_file(hq_flat, saved.c_str());
 
         gguf_context * a = gguf_init_from_file(hq_path.c_str(), { true, nullptr });
@@ -407,7 +441,7 @@ static void test_model(const std::string & dir, const std::string & base_path) {
             check(false, "reload the saved model");
         }
 
-        const std::string saved_base = dir + "/test-base-saved.gguf";
+        const std::string saved_base = temp_path(dir, "test-base-saved.gguf");
         llama_model_save_to_file(base_flat, saved_base.c_str());
         gguf_context * sb = gguf_init_from_file(saved_base.c_str(), { true, nullptr });
         check(sb && gguf_find_key(sb, "hadamard.seed") < 0, "a non-HQ model saves without hadamard.seed");
@@ -422,7 +456,7 @@ static void test_model(const std::string & dir, const std::string & base_path) {
         check(rec.n_rht == want, "one RHT per distinct rotated activation (" + std::to_string(rec.n_rht) + " == " + std::to_string(want) + ")");
         check(rec.n_hadamard_inputs == 0, "no Hadamard matrix graph inputs");
 
-        const std::string lora_path = dir + "/test-lora.gguf";
+        const std::string lora_path = temp_path(dir, "test-lora.gguf");
         make_lora(hq, lora_path);
         llama_adapter_lora * lora = llama_adapter_lora_init(hq, lora_path.c_str());
         eval_record rec_lora;
@@ -435,14 +469,14 @@ static void test_model(const std::string & dir, const std::string & base_path) {
 
     printf("refusals:\n");
     {
-        const std::string noseed = dir + "/test-hq-noseed.gguf";
+        const std::string noseed = temp_path(dir, "test-hq-noseed.gguf");
         make_hq_file(base_path, noseed, false);
         g_log.clear();
         llama_model * m = load(noseed);
         check(m == nullptr && g_log.find("ConvRot") != std::string::npos, "a file with HQ types and no hadamard.seed is refused, with the ConvRot hint");
         if (m) llama_model_free(m);
 
-        const std::string embd = dir + "/test-hq-embd.gguf";
+        const std::string embd = temp_path(dir, "test-hq-embd.gguf");
         g_rotate_embd = true;
         make_hq_file(base_path, embd, true);
         g_rotate_embd = false;
@@ -490,8 +524,6 @@ static void test_rpc(const std::string & base_path, const std::string & hq_path)
     if (m) llama_model_free(m);
 }
 
-// the relabelled files aren't really rotated, which makes their logits chaotic, so the CUDA
-// comparison uses a real HQ model requantized from the base file
 static void test_cuda(const std::string & dir, const std::string & base_path) {
     ggml_backend_dev_t gpu = nullptr;
     for (size_t i = 0; i < ggml_backend_dev_count() && !gpu; ++i) {
@@ -507,13 +539,8 @@ static void test_cuda(const std::string & dir, const std::string & base_path) {
     }
 
     printf("\ndevice policy (CUDA):\n");
-    const std::string hq_path = dir + "/test-hq-real.gguf";
-    llama_model_quantize_params qp = llama_model_quantize_default_params();
-    qp.ftype            = LLAMA_FTYPE_MOSTLY_Q4_K_M;
-    qp.allow_requantize = true;
-    qp.hadamard         = true;
-    qp.pure             = true;
-    check(llama_model_quantize(base_path.c_str(), hq_path.c_str(), &qp) == 0, "requantize the base model with --hadamard");
+    const std::string hq_path = temp_path(dir, "test-hq-real.gguf");
+    check(requantize_hq(base_path, hq_path), "requantize the base model with --hadamard");
 
     llama_model * m  = load(hq_path, true, gpu);
     llama_model * mc = load(hq_path, true);
@@ -545,12 +572,16 @@ int main(int argc, char ** argv) {
         test_model(dir, argv[i]);
     }
 
-    const std::string hq_path = dir + "/test-hq.gguf";
+    const std::string hq_path = temp_path(dir, "test-hq.gguf");
     make_hq_file(argv[2], hq_path, true);
     test_rpc(argv[2], hq_path);
     test_cuda(dir, argv[2]);
 
     llama_backend_free();
+
+    for (const std::string & path : g_temp_files) {
+        std::remove(path.c_str());
+    }
 
     printf("\n%s: %d failure(s)\n", g_failed ? "FAIL" : "PASS", g_failed);
     return g_failed ? 1 : 0;

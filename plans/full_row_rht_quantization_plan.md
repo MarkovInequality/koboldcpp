@@ -1005,6 +1005,11 @@ It applies when the rotated set is non-empty.
   - The loader's meta tensors (what `llama-quant` reads) keep their HQ types.
 - **Buffer selection:** on the CPU, HQ4_K / HQ5_K / HQ4_NL weights get the repack buffer type,
   like Q4_K / Q5_K / IQ4_NL. The logits match a load with the repack disabled.
+  - *Since 2026-10-04,* this comparison uses the base model requantized with `--hadamard`, as the CUDA
+    comparison already did. The relabelled file computes unrotated weights against rotated inputs, so its
+    logits are chaotic: on a Qwen3-0.6B Q4_K_M its repack difference was 0.12 against the base's 0.00647,
+    which fails the 10× bound. A real HQ quant gives 0.000884.
+  - The test also deletes the files it writes to its workdir.
 - **Save round trip:** save a loaded HQ model with `llama_model_save_to_file` and load the saved
   file. It must have:
   - the source's HQ types in the file (the loader's meta tensors)
