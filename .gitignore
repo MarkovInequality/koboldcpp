@@ -71,6 +71,7 @@ models-mnt
 /tools/hessian/eval/texts/
 /gguf-split
 /test-backend-ops
+/test-save-load-state*
 /bench-rht
 /ggml/src/ggml-cuda/**/*.d
 /ggml/src/ggml-cuda/.flags
