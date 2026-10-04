@@ -35,6 +35,11 @@ extern "C"
         draftmodel_filename = inputs.draftmodel_filename;
 
         file_format = check_file_format(model.c_str(),&file_format_meta);
+        if (file_format == FileFormat::BADFORMAT)
+        {
+            fprintf(stderr, "%s: error: invalid or unsupported model file '%s'\n", __func__, model.c_str());
+            return false;
+        }
 
         executable_path = inputs.executable_path;
 
@@ -263,17 +268,15 @@ extern "C"
     }
 
     const char * new_token(int idx) {
-        if (generated_tokens.size() <= idx || idx < 0) return nullptr;
-
-        return generated_tokens[idx].c_str();
+        return gpttype_new_token(idx);
     }
 
     int get_stream_count() {
-        return generated_tokens.size();
+        return gpttype_get_stream_count();
     }
 
     bool has_finished() {
-        return generation_finished;
+        return generation_finished.load();
     }
     bool batch_generate_enabled() {
         return gpttype_batch_generate_enabled();
@@ -409,8 +412,9 @@ extern "C"
         return detokenized_str.c_str();
     }
 
-    static std::vector<TopPicksData> last_logprob_toppicks;
-    static std::vector<logprob_item> last_logprob_items;
+    // Returned pointers remain valid until the next call on the same thread.
+    static thread_local std::vector<TopPicksData> last_logprob_toppicks;
+    static thread_local std::vector<logprob_item> last_logprob_items;
     last_logprobs_outputs last_logprobs()
     {
         last_logprobs_outputs output;

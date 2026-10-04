@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <cstdint>
 
 const int tensor_split_max = 16;
@@ -59,6 +60,7 @@ struct load_model_inputs
     const bool use_fastforward = false;
     const int kcpp_main_gpu = -1;
     const int batchsize = 512;
+    const int ubatchsize = -1;
     const bool autofit = false;
     const int autofit_tax_mb = 0;
     const int gpulayers = 0;
@@ -67,6 +69,7 @@ struct load_model_inputs
     const int overridenativecontext = 0;
     const int moe_experts = -1;
     const int moecpu = 0;
+    const int ffncpu = 0;
     const bool no_bos_token = false;
     const bool load_guidance = false;
     const char * override_kv[overridekv_max] = {};
@@ -82,7 +85,6 @@ struct load_model_inputs
     const int swa_padding = 0;
     const bool smartcache = false;
     const int smartcacheslots = 0;
-    const bool pipelineparallel = false;
     const float lora_multiplier = 1.0f;
     const char * devices_override = nullptr;
     const bool quiet = false;
@@ -225,10 +227,12 @@ struct sd_generation_inputs
     const char * negative_prompt = nullptr;
     const char * init_images = "";
     const char * mask = "";
-    const char * audio_data = "";
+    const char * video_start_frame = "";
+    const char * video_end_frame = "";
     const int extra_images_len = 0;
     const char ** extra_images = nullptr;
-    const bool reverse_refimg = false;
+    const int ref_audios_len = 0;
+    const char ** ref_audios = nullptr;
     const bool flip_mask = false;
     const float denoising_strength = 0.0f;
     const float cfg_scale = 0.0f;
@@ -395,7 +399,7 @@ extern std::string lora_filename;
 extern std::string mmproj_filename;
 extern std::string draftmodel_filename;
 extern std::vector<std::string> generated_tokens;
-extern bool generation_finished;
+extern std::atomic<bool> generation_finished;
 extern bool audio_multimodal_supported;
 extern bool vision_multimodal_supported;
 extern float last_eval_time;

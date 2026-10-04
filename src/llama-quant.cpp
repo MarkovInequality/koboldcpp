@@ -765,12 +765,28 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
 // quantization implementation
 //
 
-static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * f32_data, void * new_data, const int64_t chunk_size, int64_t nrows, int64_t n_per_row, const float * imatrix, std::vector<std::thread> & workers, const int nthread) {
+// quantize rows [first_row, first_row + nrows), indexed globally across all expert matrices
+// note: chunks never cross an expert boundary since each expert has its own imatrix slice
+static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * f32_data, void * new_data, const int64_t chunk_size, int64_t first_row, int64_t nrows, int64_t nrows_per_expert, int64_t n_per_row, const float * imatrix, std::vector<std::thread> & workers, const int nthread) {
+    const size_t row_size = ggml_row_size(new_type, n_per_row);
+
+    auto imatrix_for_row = [=](int64_t row_global) {
+        return imatrix ? imatrix + (row_global / nrows_per_expert) * n_per_row : nullptr;
+    };
+
     if (nthread < 2) {
         // single-thread
-        size_t new_size = ggml_quantize_chunk(new_type, f32_data, new_data, 0, nrows, n_per_row, imatrix);
-        if (!ggml_validate_row_data(new_type, new_data, new_size)) {
-            throw std::runtime_error("quantized data validation failed");
+        size_t new_size = 0;
+        for (int64_t row = 0; row < nrows;) {
+            const int64_t row_global = first_row + row;
+            const int64_t this_nrow  = std::min(nrows - row, nrows_per_expert - row_global % nrows_per_expert);
+            void * this_data = (char *) new_data + row * row_size;
+            size_t this_size = ggml_quantize_chunk(new_type, f32_data + row * n_per_row, this_data, 0, this_nrow, n_per_row, imatrix_for_row(row_global));
+            if (!ggml_validate_row_data(new_type, this_data, this_size)) {
+                throw std::runtime_error("quantized data validation failed");
+            }
+            new_size += this_size;
+            row += this_nrow;
         }
         return new_size;
     }
@@ -780,26 +796,29 @@ static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * 
     size_t new_size = 0;
     bool valid = true;
     auto compute = [&mutex, &counter, &new_size, &valid, new_type, f32_data, new_data, chunk_size,
-            nrows, n_per_row, imatrix]() {
+            first_row, nrows, nrows_per_expert, n_per_row, row_size, imatrix_for_row]() {
         const int64_t nrows_per_chunk = chunk_size / n_per_row;
         size_t local_size = 0;
         while (true) {
             std::unique_lock<std::mutex> lock(mutex);
-            int64_t first_row = counter; counter += nrows_per_chunk;
-            if (first_row >= nrows) {
+            if (counter >= nrows) {
                 if (local_size > 0) {
                     new_size += local_size;
                 }
                 break;
             }
+            const int64_t row        = counter;
+            const int64_t row_global = first_row + row;
+            // stop at the expert boundary
+            const int64_t this_nrow  = std::min(std::min(nrows - row, nrows_per_chunk), nrows_per_expert - row_global % nrows_per_expert);
+            counter += this_nrow;
             lock.unlock();
-            const int64_t this_nrow = std::min(nrows - first_row, nrows_per_chunk);
-            size_t this_size = ggml_quantize_chunk(new_type, f32_data, new_data, first_row * n_per_row, this_nrow, n_per_row, imatrix);
+
+            void * this_data = (char *) new_data + row * row_size;
+            size_t this_size = ggml_quantize_chunk(new_type, f32_data + row * n_per_row, this_data, 0, this_nrow, n_per_row, imatrix_for_row(row_global));
             local_size += this_size;
 
             // validate the quantized data
-            const size_t row_size  = ggml_row_size(new_type, n_per_row);
-            void * this_data = (char *) new_data + first_row * row_size;
             if (!ggml_validate_row_data(new_type, this_data, this_size)) {
                 std::unique_lock<std::mutex> lock(mutex);
                 valid = false;
@@ -1686,7 +1705,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 double t_factor = 0, t_encode = 0;
 
                 const int64_t n_per_row = tensor->ne[0];
-                const int64_t nrows = tensor->ne[1];
+                const int64_t nrows_per_expert = tensor->ne[1];
+                const int64_t nrows_total = tensor->ne[1] * tensor->ne[2];
 
                 const size_t row_size_src = ggml_row_size(tensor->type, n_per_row);
                 const size_t row_size_dst = ggml_row_size(new_type,     n_per_row);
@@ -1695,76 +1715,96 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 // (rotating or merging an F32 tensor needs the f32 buffer too: the source may be a read-only mmap)
                 const bool f32_copy = tensor->type != GGML_TYPE_F32 || rotate || lora;
                 const size_t bytes_per_row = row_size_src + row_size_dst + (f32_copy ? n_per_row*sizeof(float) : 0);
-                const int64_t nrows_slab = std::max<int64_t>(1, std::min<int64_t>(nrows, max_buf_size/bytes_per_row));
+                const int64_t nrows_slab = std::max<int64_t>(1, std::min<int64_t>(nrows_total, max_buf_size/bytes_per_row));
 
                 static const int64_t min_chunk_size = 32 * 512;
                 const int64_t chunk_size = (n_per_row >= min_chunk_size ? n_per_row : n_per_row * ((min_chunk_size + n_per_row - 1)/n_per_row));
 
-                // quantize each expert separately since they have different importance matrices
-                new_size = 0;
-                for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
-                    const float * imatrix_03 = imatrix ? imatrix + i03 * n_per_row : nullptr;
+                // GPTQ factor of expert gptq_e; experts come in order, so each is factored once
+                int64_t       gptq_e = -1;
+                const float * gptq_U = nullptr;
 
-                    const float * gptq_U = nullptr;
+                // process rows across all experts in one pass to keep all threads busy
+                new_size = 0;
+                for (int64_t ir = 0; ir < nrows_total; ir += nrows_slab) {
+                    const int64_t nrows_cur = std::min(nrows_slab, nrows_total - ir);
+                    const int64_t nelements_cur = nrows_cur * n_per_row;
+
+                    // fn(expert, first row in the slab, rows) for the slab's part of each expert
+                    auto for_each_expert = [&](auto && fn) {
+                        for (int64_t r = 0; r < nrows_cur; ) {
+                            const int64_t e = (ir + r) / nrows_per_expert;
+                            const int64_t n = std::min(nrows_cur - r, (e + 1)*nrows_per_expert - (ir + r));
+                            fn(e, r, n);
+                            r += n;
+                        }
+                    };
+
+                    const void * src = load_range(ir*row_size_src, nrows_cur*row_size_src);
+
+                    const float * f32_data;
+                    if (!f32_copy) {
+                        f32_data = (const float *) src;
+                    } else {
+                        if (f32_conv_buf.size() < (size_t) nelements_cur) {
+                            f32_conv_buf.resize(nelements_cur);
+                        }
+                        float * f32 = (float *) f32_conv_buf.data();
+                        if (tensor->type == GGML_TYPE_F32) {
+                            std::memcpy(f32, src, nelements_cur * sizeof(float));
+                        } else {
+                            llama_tensor_dequantize_impl(tensor->type, src, f32, workers, nelements_cur, nthread);
+                        }
+                        if (lora) {
+                            for_each_expert([&](int64_t e, int64_t r, int64_t n) {
+                                llama_quant_apply_lora(f32 + r*n_per_row, *lora, e, ir + r - e*nrows_per_expert, n, n_per_row,
+                                                       nrows_per_expert, src_rot, hadamard_seed, workers, nthread);
+                            });
+                        }
+                        if (rotate) {
+                            llama_parallel_rows(nrows_cur, workers, nthread, [&](int64_t r) {
+                                ggml_rht_ref(f32 + r*n_per_row, n_per_row, hadamard_seed);
+                            });
+                        }
+                        f32_data = f32;
+                    }
+
+                    if (work.size() < nrows_cur*row_size_dst) {
+                        work.resize(nrows_cur*row_size_dst);
+                    }
+
+                    const int64_t nchunk = (nelements_cur + chunk_size - 1)/chunk_size;
+                    const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
+
+                    size_t size_cur = 0;
                     if (tm.use_gptq) {
                         GGML_ASSERT(f32_copy);
-                        const auto t0 = std::chrono::steady_clock::now();
-                        gptq_U = hq.factor(tm, tensor, imatrix_03, gptq_cache, nthread);
-                        t_factor += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-                    }
-
-                    for (int64_t ir = 0; ir < nrows; ir += nrows_slab) {
-                        const int64_t nrows_cur = std::min(nrows_slab, nrows - ir);
-                        const int64_t nelements_cur = nrows_cur * n_per_row;
-
-                        const void * src = load_range((i03*nrows + ir)*row_size_src, nrows_cur*row_size_src);
-
-                        const float * f32_data;
-                        if (!f32_copy) {
-                            f32_data = (const float *) src;
-                        } else {
-                            if (f32_conv_buf.size() < (size_t) nelements_cur) {
-                                f32_conv_buf.resize(nelements_cur);
+                        for_each_expert([&](int64_t e, int64_t r, int64_t n) {
+                            if (e != gptq_e) {
+                                const auto t0 = std::chrono::steady_clock::now();
+                                gptq_U = hq.factor(tm, tensor, imatrix ? imatrix + e*n_per_row : nullptr, gptq_cache, nthread);
+                                gptq_e = e;
+                                t_factor += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                             }
-                            float * f32 = (float *) f32_conv_buf.data();
-                            if (tensor->type == GGML_TYPE_F32) {
-                                std::memcpy(f32, src, nelements_cur * sizeof(float));
+                            char * dst = (char *) work.data() + r*row_size_dst;
+                            if (gptq_U) {
+                                const auto t0 = std::chrono::steady_clock::now();
+                                if (!llama_tensor_quantize_gptq(new_type, (float *) f32_data + r*n_per_row, dst, n, n_per_row, gptq_U, workers, nthread)) {
+                                    throw std::runtime_error("quantized data validation failed");
+                                }
+                                size_cur += n*row_size_dst;
+                                t_encode += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                             } else {
-                                llama_tensor_dequantize_impl(tensor->type, src, f32, workers, nelements_cur, nthread);
+                                size_cur += llama_tensor_quantize_impl(new_type, f32_data + r*n_per_row, dst, chunk_size, ir + r, n,
+                                                                       nrows_per_expert, n_per_row, imatrix, workers, nthread_use);
                             }
-                            if (lora) {
-                                llama_quant_apply_lora(f32, *lora, i03, ir, nrows_cur, n_per_row, nrows, src_rot, hadamard_seed, workers, nthread);
-                            }
-                            if (rotate) {
-                                llama_parallel_rows(nrows_cur, workers, nthread, [&](int64_t r) {
-                                    ggml_rht_ref(f32 + r*n_per_row, n_per_row, hadamard_seed);
-                                });
-                            }
-                            f32_data = f32;
-                        }
-
-                        if (work.size() < nrows_cur*row_size_dst) {
-                            work.resize(nrows_cur*row_size_dst);
-                        }
-
-                        const int64_t nchunk = (nelements_cur + chunk_size - 1)/chunk_size;
-                        const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
-
-                        size_t size_cur;
-                        if (gptq_U) {
-                            const auto t0 = std::chrono::steady_clock::now();
-                            if (!llama_tensor_quantize_gptq(new_type, (float *) f32_data, work.data(), nrows_cur, n_per_row, gptq_U, workers, nthread)) {
-                                throw std::runtime_error("quantized data validation failed");
-                            }
-                            size_cur = nrows_cur*row_size_dst;
-                            t_encode += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-                        } else {
-                            size_cur = llama_tensor_quantize_impl(new_type, f32_data, work.data(), chunk_size, nrows_cur, n_per_row, imatrix_03, workers, nthread_use);
-                        }
-
-                        fout.write((const char *) work.data(), size_cur);
-                        new_size += size_cur;
+                        });
+                    } else {
+                        size_cur = llama_tensor_quantize_impl(new_type, f32_data, work.data(), chunk_size, ir, nrows_cur, nrows_per_expert, n_per_row, imatrix, workers, nthread_use);
                     }
+
+                    fout.write((const char *) work.data(), size_cur);
+                    new_size += size_cur;
                 }
                 if (tm.use_gptq) {
                     LLAMA_LOG_INFO("factor %.1f s, encode %.1f s, ", t_factor, t_encode);
