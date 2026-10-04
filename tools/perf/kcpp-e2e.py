@@ -7,16 +7,28 @@
 #
 # --build DIR    tree with koboldcpp.py and koboldcpp_cublas.so (default: this repo)
 # --lib FILE     A/B a scratch library: runs a symlinked copy of --build with FILE as koboldcpp_cublas.so
-# --configs      comma list of mtp, nomtp, guidance, grammar (default: all)
+# --configs      comma list of mtp, nomtp, guidance, grammar, media (default: all but media)
+#
+# media: a server with MTP, the vision projector, whisper and TTS on the GPU; an image description, a TTS clip, a
+# transcription, and a TTS clip made while an MTP generation runs (both must equal their solo results)
 #
 # A config's texts may differ from another config's (MTP verifies batches through other kernels); the cross-config
 # checks (guidance and grammar give the same text with and without MTP) accept a divergence only at a near-tie,
 # probed with top-2 logprobs at the first differing token.
 
-import argparse, hashlib, json, os, shutil, signal, subprocess, sys, tempfile, time, urllib.request
+import argparse, base64, hashlib, json, os, shutil, signal, subprocess, sys, tempfile, threading, time, urllib.request
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 DEFAULT_MODEL = os.path.expanduser("~/AI/qwen3/Qwen3.8-27B-HQ4_K_M.gguf")
+MEDIA = {
+    "mmproj":       os.path.expanduser("~/AI/qwen3/mmproj-F16.gguf"),
+    "whisper":      os.path.expanduser("~/AI/whisper-base.en-q5_1.bin"),
+    "tts":          os.path.expanduser("~/AI/qwen3/qwen3-tts-0.6b-q8_0.gguf"),
+    "wavtokenizer": os.path.expanduser("~/AI/qwen3/qwen3-tts-tokenizer-q8_0.gguf"),
+    "speech":       os.path.expanduser("~/AI/qwen3/Voices/Vivian.wav"),
+    "image":        os.path.join(REPO, "media", "preview.png"),
+}
+TTS_TEXT = "The quick brown fox jumps over the lazy dog, then naps in the warm afternoon sun."
 LONG_SRC = ("53ed051ce", "src/llama-graph.cpp", 30000)  # pinned, so edits to the tree don't change the prompt
 NEAR_TIE = 1e-3
 
@@ -41,6 +53,8 @@ SERVERS = {
     "nomtp":          [],
     "guidance-mtp":   ["--usemtp", "--draftamount", "4", "--enableguidance"],
     "guidance-nomtp": ["--enableguidance"],
+    "media":          ["--usemtp", "--draftamount", "4", "--mmproj", MEDIA["mmproj"], "--whispermodel", MEDIA["whisper"],
+                       "--ttsmodel", MEDIA["tts"], "--ttswavtokenizer", MEDIA["wavtokenizer"], "--ttsgpu"],
 }
 
 def h(s):
@@ -62,11 +76,12 @@ class Server:
                 return
         raise RuntimeError(f"koboldcpp did not come up, see {log}")
 
-    def post(self, path, body=None):
+    def post(self, path, body=None, raw=False):
         req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}",
                                      data=json.dumps(body).encode() if body is not None else None,
                                      headers={"Content-Type": "application/json"})
-        return json.loads(urllib.request.urlopen(req, timeout=1800).read())
+        data = urllib.request.urlopen(req, timeout=1800).read()
+        return data if raw else json.loads(data)
 
     def gen(self, prompt, max_length, params, **extra):
         body = dict(params, prompt=prompt, max_length=max_length, logprobs=True, **extra)
@@ -117,7 +132,33 @@ def run_server(name, args, tree, workdir, res):
     s = Server(tree, args.model, SERVERS[name], args.port, log)
     try:
         out = res.setdefault(name, {})
-        if name in ("mtp", "nomtp"):
+        if name == "media":
+            img = base64.b64encode(open(MEDIA["image"], "rb").read()).decode()
+            r = s.gen(chat("Describe this image in two sentences."), 80, GREEDY, images=[img])
+            out["vision"] = r
+            print(f"  vision: [{r['hash']}] {r['text'][:70]!r}", flush=True)
+            tts = lambda: s.post("/api/extra/tts", {"input": TTS_TEXT, "voice": "vivian", "seed": 42}, raw=True)
+            wav = tts()
+            out["tts"] = {"hash": hashlib.md5(wav).hexdigest()[:12], "bytes": len(wav)}
+            print(f"  tts: [{out['tts']['hash']}] {len(wav)} bytes", flush=True)
+            speech = base64.b64encode(open(MEDIA["speech"], "rb").read()).decode()
+            t = s.post("/api/extra/transcribe", {"audio_data": speech})
+            out["transcribe"] = {"hash": h(t.get("text", "")), "text": t.get("text", "")}
+            print(f"  transcribe: [{out['transcribe']['hash']}] {t.get('text', '')[:70]!r}", flush=True)
+            solo = s.gen(chat(SHORT[1]), 200, GREEDY)
+            both = {}
+            th = threading.Thread(target=lambda: both.update(gen=s.gen(chat(SHORT[1]), 200, GREEDY)))
+            th.start()
+            time.sleep(1.0)
+            wav2 = tts()
+            th.join()
+            same = both["gen"]["hash"] == solo["hash"] and hashlib.md5(wav2).hexdigest()[:12] == out["tts"]["hash"]
+            out["tts+gen"] = {"hash": h(both["gen"]["hash"] + hashlib.md5(wav2).hexdigest()[:12]), "same_as_solo": same}
+            print(f"  tts during MTP generation: {'same as solo' if same else 'DIFFERS from solo'} "
+                  f"(gen [{both['gen']['hash']}] vs [{solo['hash']}])", flush=True)
+            if not same:
+                res.setdefault("_cross", {})["tts+gen"] = False
+        elif name in ("mtp", "nomtp"):
             for run in range(2):
                 r = s.gen(long_prompt(run), 64, GREEDY)
                 out[f"long{run}"] = r
@@ -175,6 +216,8 @@ def main():
     names = [n for n in ("mtp", "nomtp") if n in args.configs]
     if "guidance" in args.configs:
         names += ["guidance-mtp", "guidance-nomtp"]
+    if "media" in args.configs:
+        names += ["media"]
 
     res, ok = {}, True
     for name in names:
@@ -192,6 +235,7 @@ def main():
                 ok &= good
         finally:
             s.stop()
+    ok &= all(res.get("_cross", {}).values())
     print(f"logs in {workdir}")
 
     def strip(r):
@@ -214,6 +258,10 @@ def main():
                     continue
                 same = g["hash"] == r["hash"]
                 drafts = (g.get("draft_ok"), g.get("draft_fail")) == (r.get("draft_ok"), r.get("draft_fail"))
+                if "n_out" not in r:
+                    ok &= same
+                    print(f"  {c:15s} {k:10s} {'same' if same else 'DIFF'} hash{'' if same else '  FAIL'}")
+                    continue
                 if k.startswith("long"):
                     speed, gs = r["n_in"]/r["pp_s"], g["n_in"]/g["pp_s"]
                     what = "prompt t/s"

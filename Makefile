@@ -1073,6 +1073,13 @@ maincuda: tools/completion/main.cpp tools/completion/completion.cpp common/arg.c
 test-hadamard-archs-cuda: tests/test-hadamard-archs.cpp $(LLAMA_TOOL_OBJS_CUDA)
 	$(CXX) $(CXXFLAGS) $(CUBLAS_FLAGS) $(filter-out %.h,$^) -o $@ $(CUBLASLD_FLAGS) $(LDFLAGS)
 
+# graphs must stay off on the legacy (non-VMM) pool: the -g mode asserts zero captures in this build
+ggml-cuda-novmm.o: ggml/src/ggml-cuda/ggml-cuda.cu ggml/include/ggml-cuda.h ggml/include/ggml.h ggml/include/ggml-backend.h ggml/src/ggml-backend-impl.h ggml/src/ggml-common.h $(wildcard ggml/src/ggml-cuda/*.cuh)
+	$(NVCC) $(NVCCFLAGS) $(subst -Ofast,-O3,$(CXXFLAGS)) $(CUBLAS_FLAGS) -DGGML_CUDA_NO_VMM $(CUBLAS_CXXFLAGS) -Wno-pedantic -c $< -o $@
+
+test-hadamard-archs-cuda-novmm: tests/test-hadamard-archs.cpp ggml-cuda-novmm.o $(filter-out ggml-cuda.o,$(LLAMA_TOOL_OBJS_CUDA))
+	$(CXX) $(CXXFLAGS) $(CUBLAS_FLAGS) $(filter-out %.h,$^) -o $@ $(CUBLASLD_FLAGS) $(LDFLAGS)
+
 test-hadamard-llama-cuda: tests/test-hadamard-llama.cpp $(LLAMA_TOOL_OBJS_CUDA)
 	$(CXX) $(CXXFLAGS) $(CUBLAS_FLAGS) $(filter-out %.h,$^) -o $@ $(CUBLASLD_FLAGS) $(LDFLAGS)
 

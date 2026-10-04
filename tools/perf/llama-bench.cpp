@@ -1307,6 +1307,10 @@ struct cmd_params_instance {
         llama_context_params cparams = llama_context_default_params();
 
         cparams.n_ctx           = n_prompt + n_gen + n_depth;
+        if (n_rs_seq > 0) {
+            // the ubatch must hold a sequence's last n_rs_seq + 1 tokens, and n_ubatch is capped by n_ctx
+            cparams.n_ctx = std::max<uint32_t>(cparams.n_ctx, 256);
+        }
         cparams.n_batch         = n_batch;
         cparams.n_ubatch        = n_ubatch;
         cparams.type_k          = type_k;

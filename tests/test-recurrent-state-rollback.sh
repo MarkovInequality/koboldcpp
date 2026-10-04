@@ -13,6 +13,6 @@ run() {
 }
 run "CUDA"            ./test-recurrent-state-rollback-cuda -ngl 99 "${args[@]}"
 run "CUDA, no fusion" env GGML_CUDA_DISABLE_FUSION=1 ./test-recurrent-state-rollback-cuda -ngl 99 "${args[@]}"
-run "CPU"             ./test-recurrent-state-rollback -ngl 0 "${args[@]}"
+run "CPU"             ./test-recurrent-state-rollback -ngl 0 -ub 16 "${args[@]}"
 rm -f /tmp/rollback-$$.log
 exit $fail
