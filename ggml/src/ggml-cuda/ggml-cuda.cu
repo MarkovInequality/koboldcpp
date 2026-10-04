@@ -6086,6 +6086,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_rht_fused_count") == 0) {
         return (void *)ggml_backend_cuda_rht_fused_count;
     }
+    if (strcmp(name, "ggml_backend_cuda_fattn_mma_q_count") == 0) {
+        return (void *)ggml_cuda_fattn_mma_q_count;
+    }
     if (strcmp(name, "ggml_backend_cuda_graph_launch_count") == 0) {
         return (void *)ggml_backend_cuda_graph_launch_count;
     }

@@ -1105,6 +1105,9 @@ test-kcpp-sampler: tests/test-kcpp-sampler.cpp otherarch/kcpp_sampler_util.h
 test-mtp-draft-vocab-cuda: tests/test-mtp-draft-vocab.cpp $(LLAMA_TOOL_OBJS_CUDA)
 	$(CXX) $(CXXFLAGS) $(CUBLAS_FLAGS) $(filter-out %.h,$^) -o $@ $(CUBLASLD_FLAGS) $(LDFLAGS)
 
+test-fattn-mma-q: tests/test-fattn-mma-q.cpp $(filter-out ggml.o ggml-backend-reg_default.o,$(HADAMARD_TEST_OBJS)) ggml_v4_cublas.o ggml-backend-reg_cublas.o $(CUBLAS_OBJS_V4)
+	$(CXX) $(CXXFLAGS) $(CUBLAS_FLAGS) $(filter-out %.h,$^) -o $@ $(CUBLASLD_FLAGS) $(LDFLAGS)
+
 test-backend-ops: tests/test-backend-ops.cpp $(filter-out ggml.o ggml-backend-reg_default.o,$(HADAMARD_TEST_OBJS)) ggml_v4_cublas.o ggml-backend-reg_cublas.o $(CUBLAS_OBJS_V4)
 	$(CXX) $(CXXFLAGS) $(CUBLAS_FLAGS) $(filter-out %.h,$^) -o $@ $(CUBLASLD_FLAGS) $(LDFLAGS)
 

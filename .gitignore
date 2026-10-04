@@ -78,6 +78,7 @@ models-mnt
 /test-recurrent-state-rollback*
 /test-kcpp-sampler
 /test-mtp-draft-vocab*
+/test-fattn-mma-q
 /bench-rht
 /ggml/src/ggml-cuda/**/*.d
 /ggml/src/ggml-cuda/.flags

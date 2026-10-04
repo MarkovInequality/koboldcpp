@@ -11280,6 +11280,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // small batches with quantized K/V at head sizes 128/256, where the MMA kernel reads the quantized tiles;
+    // kv 1025 (unpadded) and GQA 2 keep the F16 copy
+    for (ggml_type type_KV : { GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        for (int hs : { 128, 256 }) {
+            for (int gqa : { 2, 4, 6, 8 }) {
+                for (int nb : { 1, 2, 3, 5, 8, 16 }) {
+                    for (int kv : { 512, 8192 }) {
+                        for (std::array<int32_t, 4> perm : { std::array<int32_t, 4>{0, 1, 2, 3}, std::array<int32_t, 4>{0, 2, 1, 3} }) {
+                            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {gqa, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, perm));
+                        }
+                    }
+                }
+            }
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {6, 1}, 1025, 5, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {6, 1}, 512, 5, true, true, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {6, 2}, 512, 5, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {8, 1}, 512, 1, true, false, 0, 10.0f, GGML_PREC_F32, type_KV, type_KV));
+        }
+    }
+
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
             if (hsk != 96 && hsk != 192 && hsk != 320 && hsk != 576 && hsk != hsv) continue;
