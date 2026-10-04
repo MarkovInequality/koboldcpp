@@ -29,7 +29,8 @@ step() {
 }
 
 make LLAMA_CUBLAS=1 -j8 test-backend-ops test-hadamard-archs-cuda test-hadamard-archs-cuda-novmm \
-    test-save-load-state-cuda test-recurrent-state-rollback-cuda test-recurrent-state-rollback test-kcpp-sampler koboldcpp_cublas \
+    test-save-load-state-cuda test-recurrent-state-rollback-cuda test-recurrent-state-rollback test-kcpp-sampler \
+    test-fattn-mma-q test-mtp-draft-vocab-cuda koboldcpp_cublas \
     > "$log/build.log" 2>&1 || { echo "build failed, see $log/build.log"; exit 1; }
 
 # cases that assert the global fusion/RHT counters run on one thread
@@ -38,6 +39,8 @@ counted="RHT,RHT_FUSED,ADD_ADD,ADD_RMS_NORM,GATED_DELTA_NET_CACHE_FUSION,MUL_MAT
 step "test-backend-ops ops"       ./test-backend-ops -b CUDA0 -j 4 -o "$ops"
 step "test-backend-ops RHT and fusion cases" ./test-backend-ops -b CUDA0 -o "$counted"
 step "test-kcpp-sampler"          ./test-kcpp-sampler
+step "test-fattn-mma-q"           ./test-fattn-mma-q
+step "test-mtp-draft-vocab-cuda"  ./test-mtp-draft-vocab-cuda "$model"
 step "test-hadamard-archs-cuda"   ./test-hadamard-archs-cuda -d CUDA0
 step "test-hadamard-archs-cuda -g" ./test-hadamard-archs-cuda -g
 step "-g, sync uploads"           env GGML_SCHED_SYNC_UPLOADS=1 ./test-hadamard-archs-cuda -g
@@ -50,7 +53,7 @@ if [ $quick = 1 ]; then
     step "rollback suite (CUDA)"  ./test-recurrent-state-rollback-cuda -m "$model" -ngl 99 -c 4096 -p "The quick brown fox jumps over the lazy dog. Once upon a time in a land far away there lived"
 else
     step "rollback suite (CUDA, no fusion, CPU)" tests/test-recurrent-state-rollback.sh "$model"
-    step "kcpp-e2e check"         venv/bin/python tools/perf/kcpp-e2e.py check "$golden" --configs mtp,nomtp,guidance,grammar,media
+    step "kcpp-e2e check"         venv/bin/python tools/perf/kcpp-e2e.py check "$golden" --configs mtp,nomtp,guidance,grammar,media,deep
 fi
 
 echo
