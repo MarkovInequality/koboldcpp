@@ -9118,7 +9118,8 @@ struct test_rht_q8_1 : public test_case {
     std::vector<ggml_tensor *> fusion_test_nodes() override { return check_nodes; }
 
     double max_nmse_err() override {
-        return 5e-4;
+        // the GLU multiplies two matmuls' quantization errors
+        return graph == RHT_Q8_1_GLU ? 1e-3 : 5e-4;
     }
 
     static void * cuda_fn(const char * name) {
