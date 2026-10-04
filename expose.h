@@ -56,6 +56,7 @@ struct load_model_inputs
     const bool no_host = false;
     const bool use_mtp = false;
     const int mtp_vocab = 0;
+    const float draft_p_min = 0.0f;
     const bool use_smartcontext = false;
     const bool use_contextshift = false;
     const bool use_fastforward = false;

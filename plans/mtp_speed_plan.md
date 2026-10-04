@@ -759,3 +759,47 @@ All A/Bs interleaved, 3 rounds, 27B HQ4_K_M, q5_1 K/V, FA, contention 13–16 %.
 - Standing suite at Phase 1 end: every step passes. The first run failed only the RHT counter assertions because
   `test-backend-ops -j 4` ran other cases on parallel threads against the global counters; the suite now runs the
   counter-asserting cases on one thread.
+
+### Phase 2: item 5 (17c6aa479)
+
+- **Change as planned**, with two refinements found by profiling the new selection on recorded rows (copy 26, bucket
+  index 61, histogram 41, scatter 82, sort 75 µs per row):
+  - the bucket indices are computed with SSE2 (`cvttps2dq` returns INT_MIN for NaN and out-of-range values exactly like
+    the scalar `int()`, and mul then add rounds the same; a scalar loop elsewhere);
+  - the scatter skips 16-entry chunks without a candidate (~1 % of the vocabulary reaches the kept buckets).
+  - The sorts are unchanged, so the selection is bitwise the old one; it lives in `otherarch/kcpp_sampler_util.h`,
+    shared with the test, together with the stop-sequence tail scanner.
+- **Regression:** `test-kcpp-sampler` on 974 rows recorded from kcpp-e2e (KCPP_SAMPLER_RECORD) plus edge rows (ties,
+  everything in the top bucket, a tied boundary group, ±inf, NaN, 3e38, vocabularies of 100 and 2000, everything
+  below the lowest bucket) × biases/bans/DRY penalties × k ∈ {3000, 40, 1}: 29460 cases bitwise; stop scan equal to a
+  full find on 2000 random append sequences (pieces spanning appends, overlaps, multi-byte). kcpp-e2e: every text
+  and draft count unchanged across greedy, DRY/bias, mirostat, xtc, dynatemp+nsigma, adaptive-p, bans, grammar and
+  guidance.
+- **Performance:** selection 404 → 286 µs/row (`test-kcpp-sampler --bench`); the boundary bucket held > 6000 entries
+  in 0 of 974 real rows. Scratch timer around the sampling loop of an MTP cycle: 1.99–2.15 → 1.16–1.29 ms
+  (550–578 → 320–356 µs/row), the plan's target. kcpp-e2e MTP generation +2–6 % (median of 3 interleaved rounds;
+  within the run-to-run spread for some prompts, which the cycle timer resolves).
+- koboldcpp sometimes reports a bogus eval time for a request that is not the first (e.g. 400 tokens "at 264 t/s"):
+  `e2esum` medians over 3 rounds absorb single glitches.
+
+### Phase 3: items 4b (50cccab69) and 4d
+
+- **4b as planned.** T for Qwen3.8 is 248044 (the first control/EOG id at or after N), so N = 65536 keeps rows
+  [0, 65536) ∪ [248044, 248320). `is_rotated` follows `view_src`, so the HQ-rotated head works through the views,
+  and both views share one RHT through the rotation cache.
+  - Regression: `test-mtp-draft-vocab` (27B HQ4_K_M, HQ-rotated output.weight): kept rows bitwise equal to the full
+    head's, the rest -inf, for a 5-row batch and three single-token steps.
+  - Not run: qwen35moe/step35 smoke tests (no such models here).
+  - Performance (interleaved, 3 rounds): MTP generation off/48k/64k short0 145.7/162.0/154.0, short2
+    141.8/151.2/152.3, sampled 124.6/140.9/135.4 t/s; accepted/rejected drafts at 64k 275/40 vs 276/39 (48k 272/44).
+    The option stays off by default; 65536 keeps acceptance closer to the full head at the same speed.
+- **4d.** `--draftpmin` makes `p_min` an option (default 0).
+  - Bug found: with `p_min > 0` a draft can stop before its first token, and koboldcpp aborted the generation ("Draft
+    model produced no draft tokens", empty text). It now verifies the single token. With `--draftpmin 0.3` 9 of 11
+    kcpp-e2e texts equal the golden; short1 diverges at token 370 of 400 and the temperature-0.7 run diverges (the
+    verify batch shapes now vary between 1 and 5 tokens).
+  - Draft length at p_min 0 (mtpvocab 64k, contention 0.3 %, geomean over 9 prompts): 4 → 155.9, 5 → 155.2,
+    6 → 149.3, 7 → 150.1 t/s. The default stays 4.
+  - p_min (with the fix, mtpvocab 64k, geomean): d4 165.4; d4/0.3 139.1 (−16 %), d5/0.3 136.9, d6/0.3 131.1,
+    d6/0.5 113.1, d7/0.5 111.2 (−33 %). Shorter, varying verify batches lose both accepted tokens per cycle and
+    CUDA graph reuse. The default stays 0.

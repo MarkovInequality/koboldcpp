@@ -329,6 +329,7 @@ class load_model_inputs(ctypes.Structure):
                 ("no_host", ctypes.c_bool),
                 ("use_mtp", ctypes.c_bool),
                 ("mtp_vocab", ctypes.c_int),
+                ("draft_p_min", ctypes.c_float),
                 ("use_smartcontext", ctypes.c_bool),
                 ("use_contextshift", ctypes.c_bool),
                 ("use_fastforward", ctypes.c_bool),
@@ -2091,6 +2092,7 @@ def load_model(model_filename):
     inputs.no_host = False
     inputs.use_mtp = args.usemtp
     inputs.mtp_vocab = getattr(args, "mtpvocab", 0)
+    inputs.draft_p_min = getattr(args, "draftpmin", 0.0)
     inputs.lora_filename = "".encode("UTF-8")
     inputs.lora_multiplier = args.loramult
     if args.lora:
@@ -13611,6 +13613,7 @@ if __name__ == '__main__':
     advparser.add_argument("--swapadding", help="How much extra to pad the SWA KV cache, this affects the rewind limit before reprocessing is forced.", type=int, default=swa_padding_default)
     advparser.add_argument("--unpack", help="Extracts the file contents of the KoboldCpp binary into a target directory.", metavar=('destination'), type=str, default="")
     advparser.add_argument("--usemtp", help="Enables MTP layers to be used for drafting (speculative decoding) if present", action='store_true')
+    advparser.add_argument("--draftpmin", metavar=('[probability]'), help="Stop a draft at the first token the draft model gives less than this probability. 0 = always draft the full amount.", type=float, default=0.0)
     advparser.add_argument("--mtpvocab", metavar=('[tokens]'), help="MTP drafts only from the first N vocabulary tokens (plus the special tokens after them), which makes each draft step cheaper. 0 = the full vocabulary.", type=int, default=0)
     advparser.add_argument("--usemlock","--mlock", help="Enables mlock, preventing the RAM used to load the model from being paged out. Not usually recommended.", action='store_true')
     compatgroup3 = advparser.add_mutually_exclusive_group()

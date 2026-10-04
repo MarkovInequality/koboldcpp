@@ -892,6 +892,8 @@ const char * kcpp_print_system_info(void) {
     return s.c_str();
 }
 
+static float speculative_p_min = 0.0f;
+
 static bool speculative_state_setup(llama_context * main_ctx, const llama_context_params & draft_ctx_params, int draft_gpulayers, common_speculative_type type)
 {
     common_params_speculative spec_params;
@@ -900,7 +902,7 @@ static bool speculative_state_setup(llama_context * main_ctx, const llama_contex
     spec_params.draft.ctx_dft = draft_ctx;
     spec_params.draft.n_max = speculative_chunk_amt;
     spec_params.draft.n_min = 0;
-    spec_params.draft.p_min = 0.0f;
+    spec_params.draft.p_min = speculative_p_min;
     spec_params.draft.backend_sampling = true;
     spec_params.draft.n_gpu_layers = draft_gpulayers;
     spec_params.draft.cache_type_k = draft_ctx_params.type_k;
@@ -1125,14 +1127,8 @@ static speculative_draft_result speculative_decoding_eval_chunk(llama_context * 
     dp.prompt = &prompt_tokens;
     dp.result = &drafted_ids;
 
+    // with draft p_min > 0 a draft can stop before its first token: the batch is then just embd[0]
     common_speculative_draft(draft_spec);
-    if(drafted_ids.empty())
-    {
-        kcpp_flush_log_output();
-        printf("\nERROR: Draft model produced no draft tokens!\n");
-        fflush(stdout);
-        return results;
-    }
 
     std::vector<llama_token> real_embd;
     real_embd.reserve(drafted_ids.size() + 1);
@@ -3788,6 +3784,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
             }
 
             speculative_chunk_amt = inputs.draft_amount;
+            speculative_p_min = inputs.draft_p_min;
             if(draftmodel_filename != "")
             {
                 if(inputs.use_mtp)
