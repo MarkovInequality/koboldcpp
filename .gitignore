@@ -76,6 +76,7 @@ models-mnt
 /test-backend-ops
 /test-save-load-state*
 /test-recurrent-state-rollback*
+/test-kcpp-sampler
 /bench-rht
 /ggml/src/ggml-cuda/**/*.d
 /ggml/src/ggml-cuda/.flags

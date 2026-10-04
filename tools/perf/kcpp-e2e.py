@@ -47,6 +47,15 @@ def chat(p):
 GREEDY = {"temperature": 0, "top_k": 1, "top_p": 1.0, "rep_pen": 1.0, "sampler_seed": 42}
 SAMPLED = {"temperature": 0.7, "top_k": 20, "top_p": 0.95, "rep_pen": 1.0, "sampler_seed": 42,
            "dry_multiplier": 0.8, "dry_base": 1.75, "dry_allowed_length": 2, "logit_bias": {"13": -2.0, "271": 1.5}}
+# the other sampler paths, 120 tokens each
+SAMPLERS = {
+    "mirostat": {"temperature": 0.8, "mirostat": 2, "mirostat_tau": 5.0, "mirostat_eta": 0.1, "sampler_seed": 42},
+    "xtc":      {"temperature": 1.0, "top_k": 40, "top_p": 1.0, "xtc_threshold": 0.1, "xtc_probability": 0.5, "sampler_seed": 42},
+    "dynatemp": {"temperature": 0.9, "top_k": 40, "dynatemp_range": 0.4, "dynatemp_exponent": 1.0, "nsigma": 1.5, "sampler_seed": 42},
+    "adaptive": {"temperature": 0.8, "top_k": 40, "adaptive_target": 0.4, "adaptive_decay": 0.9, "sampler_seed": 42},
+    "bans":     {"temperature": 0.7, "top_k": 40, "rep_pen": 1.1, "rep_pen_range": 256, "ban_eos_token": True,
+                 "custom_token_bans": "13,271", "sampler_seed": 42},
+}
 
 SERVERS = {
     "mtp":            ["--usemtp", "--draftamount", "4"],
@@ -170,6 +179,10 @@ def run_server(name, args, tree, workdir, res):
             r = s.gen(chat(SHORT[0]), 200, SAMPLED)
             out["sampled"] = r
             print(f"  sampled: [{r['hash']}] {r['n_out']} tok -> {r['n_out']/r['eval_s']:.1f} t/s, drafts {r['draft_ok']}/{r['draft_fail']}", flush=True)
+            for sname, sp in SAMPLERS.items():
+                r = s.gen(chat(SHORT[2]), 120, sp)
+                out[sname] = r
+                print(f"  {sname}: [{r['hash']}] {r['n_out']} tok, drafts {r['draft_ok']}/{r['draft_fail']}", flush=True)
             if "grammar" in args.configs:
                 r = s.gen(chat(GRAMMAR[0]), 64, GREEDY, grammar=GRAMMAR[1])
                 out["grammar"] = r

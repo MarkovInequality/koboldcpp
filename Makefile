@@ -1098,6 +1098,10 @@ test-recurrent-state-rollback: tests/test-recurrent-state-rollback.cpp common/ar
 test-recurrent-state-rollback-cuda: tests/test-recurrent-state-rollback.cpp common/arg.cpp common/preset.cpp $(COMMON_DOWNLOAD_SRCS) build-info.h $(LLAMA_TOOL_OBJS_CUDA)
 	$(CXX) $(CXXFLAGS) $(CUBLAS_FLAGS) $(filter-out %.h,$^) -o $@ $(CUBLASLD_FLAGS) $(LDFLAGS)
 
+# built with the adapter's flags, so --bench times what SampleLogits runs
+test-kcpp-sampler: tests/test-kcpp-sampler.cpp otherarch/kcpp_sampler_util.h
+	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
+
 test-backend-ops: tests/test-backend-ops.cpp $(filter-out ggml.o ggml-backend-reg_default.o,$(HADAMARD_TEST_OBJS)) ggml_v4_cublas.o ggml-backend-reg_cublas.o $(CUBLAS_OBJS_V4)
 	$(CXX) $(CXXFLAGS) $(CUBLAS_FLAGS) $(filter-out %.h,$^) -o $@ $(CUBLASLD_FLAGS) $(LDFLAGS)
 
@@ -1106,6 +1110,9 @@ bench-rht: tests/bench-rht.cu ggml/src/ggml-cuda/quantize.cu ggml-hadamard.o ggm
 
 tools/perf/stall: tools/perf/stall.cu
 	nvcc -O3 -std=c++17 -arch=native $< -o $@
+
+tools/perf/bench-mmvq: tools/perf/bench-mmvq.cu $(filter-out ggml.o ggml-backend-reg_default.o,$(HADAMARD_TEST_OBJS)) ggml_v4_cublas.o ggml-backend-reg_cublas.o $(CUBLAS_OBJS_V4)
+	$(NVCC) $(NVCCFLAGS) -O3 -std=c++17 -Iggml/include -Iggml/src $(filter %.cu %.o,$^) -o $@ $(CUBLASLD_FLAGS) $(LDFLAGS)
 
 #window simple clinfo
 simplecpuinfo: simplecpuinfo.cpp

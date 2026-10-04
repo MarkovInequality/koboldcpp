@@ -2332,6 +2332,26 @@ static int apply_reasoning_budget(int id, const std::vector<int> & start_think, 
     return id;
 }
 
+// KCPP_SAMPLER_RECORD=FILE appends every KCPP_SAMPLER_RECORD_EVERY-th (default 5) sampled row, up to
+// KCPP_SAMPLER_RECORD_N (default 300), for tests/test-kcpp-sampler.cpp: int32 n_vocab, then the logits
+static void kcpp_sampler_record(const float * logits, int n_vocab)
+{
+    static FILE * f = nullptr;
+    static int every = 0, left = -1, seen = 0;
+    if (left < 0) {
+        const char * path = getenv("KCPP_SAMPLER_RECORD");
+        f = path ? fopen(path, "ab") : nullptr;
+        left = f ? (getenv("KCPP_SAMPLER_RECORD_N") ? atoi(getenv("KCPP_SAMPLER_RECORD_N")) : 300) : 0;
+        every = std::max(1, getenv("KCPP_SAMPLER_RECORD_EVERY") ? atoi(getenv("KCPP_SAMPLER_RECORD_EVERY")) : 5);
+    }
+    if (left > 0 && seen++ % every == 0) {
+        fwrite(&n_vocab, sizeof(n_vocab), 1, f);
+        fwrite(logits, sizeof(float), n_vocab, f);
+        fflush(f);
+        --left;
+    }
+}
+
 int SampleLogits(const float * logits, int n_ctx, int n_vocab, int rep_pen_range, float rep_pen, float rep_pen_slope, float presence_penalty, float top_k, float top_a, float top_p, float min_p, float typical_p, float tfs, float nsigma, float temp, std::mt19937 & rng,
 int mirostat, float mirostat_tau, float mirostat_eta, float dry_multiplier, float dry_base, int dry_allowed_length, int dry_penalty_last_n, float xtc_threshold, float xtc_probability,
 const std::vector<samplers> & sampler_order, llama_grammar * grammar, float dynatemp_range, float dynatemp_exponent, float smoothing_factor, float smoothing_curve, float adaptive_target, float adaptive_decay,
@@ -2339,6 +2359,8 @@ const std::vector<int> & think_start_seq, const std::vector<int> & think_end_seq
 {
     // printf("SampleLogits called with: n_ctx=%d, n_vocab=%d, rep_pen_range=%d, rep_pen=%f, rep_pen_slope=%f, presence_penalty=%f, top_k=%f, top_a=%f, top_p=%f, min_p=%f, typical_p=%f, tfs=%f, nsigma=%f, temp=%f, mirostat=%d, mirostat_tau=%f, mirostat_eta=%f, dry_multiplier=%f, dry_base=%f, dry_allowed_length=%d, dry_penalty_last_n=%d, xtc_threshold=%f, xtc_probability=%f, sampler_order_size=%zu, dynatemp_range=%f, dynatemp_exponent=%f, smoothing_factor=%f\n",
     // n_ctx, n_vocab, rep_pen_range, rep_pen, rep_pen_slope, presence_penalty, top_k, top_a, top_p, min_p, typical_p, tfs, nsigma, temp, mirostat, mirostat_tau, mirostat_eta, dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n, xtc_threshold, xtc_probability, sampler_order.size(), dynatemp_range, dynatemp_exponent, smoothing_factor);
+
+    kcpp_sampler_record(logits, n_vocab);
 
     static thread_local std::vector<llama_token_data> candidates;
     candidates.resize(n_vocab);

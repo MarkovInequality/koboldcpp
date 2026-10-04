@@ -700,3 +700,62 @@ Each phase ends with the full standing suite and an A/B of the phase against the
   - pp5 with graphs still off: 33.7 → 30.9 ms (noisy);
   - one bogus llama-bench row (tg128 405 ms) was discarded.
 - **sm_70 table:** no effect on sm_120; covered by the build and the cases above.
+
+### Phase 0: infrastructure (d48556e4b, 2f5e7d6ea; branch `mtp-speed-impl`)
+
+- **In the repo:**
+  - `tools/perf/llama-bench.cpp` + `make llama-bench-cuda`, with `-nrs`. With `-nrs > 0` the context is at least 256
+    tokens, since n_ubatch (capped by n_ctx) must exceed n_rs_seq.
+  - `tools/perf/kcpp-e2e.py`: configs mtp, nomtp, guidance (MTP vs no MTP must match), grammar (same), media (vision,
+    TTS, whisper, TTS during MTP generation), and the sampler paths (sampled with DRY/bias, mirostat, xtc,
+    dynatemp+nsigma, adaptive-p, bans). The long prompt is pinned to `53ed051ce:src/llama-graph.cpp`. A cross-config
+    difference is accepted only at a top-2 logprob gap below 1e-3, probed at the first differing token. Golden:
+    `tools/perf/golden/kcpp-e2e-27b.json`.
+  - `tools/perf/stall.cu` (`make tools/perf/stall`), `tools/perf/standing-suite.sh` (the correctness half of the
+    standing suite).
+  - `test-hadamard-archs -g`, with `ggml_backend_cuda_graph_launch_count`/`_capture_count`, and
+    `test-hadamard-archs-cuda-novmm` (ggml-cuda.cu with `GGML_CUDA_NO_VMM`).
+  - `tests/test-recurrent-state-rollback.cpp` (upstream's at 53ed051ce plus the fork's cases) and
+    `tests/test-recurrent-state-rollback.sh` (CUDA, CUDA without fusion, CPU with `-ub 16`).
+  - FLASH_ATTN_EXT perf cases at the 27B's shapes (hs 256, 4 KV heads, GQA 6, kv 8k/32k/96k, nb 1/2/5/8/1024).
+- **Deviations from the plan:**
+  - `-g` keeps the fixture's 2 layers: `full_attention_interval` is 2 there, so qwen35 already has an attention layer.
+    It runs each batch size on a fresh 16-token prefill with `n_ctx` 256, which caps n_kv at 256 (4 batches, 3 for
+    T = 64).
+  - F16-expert MoE models launch graphs too (MMF needs no sync), so `-g` asserts graph launches only for dense
+    models, plus no re-capture churn for all.
+  - The HQ4_K_M fixture is skipped where the model saver lacks the arch (gemma3n, bitnet, apertus, step35) and for
+    qwen4exp, whose Q4_K_M quantizes a tensor its graph adds (the CPU add aborts) — a quantizer bug, not pursued.
+  - No SD model on this box, so no SD smoke test; no DFlash/DSpark or second MTP architecture either.
+  - bench-mmvq and the sampler-row recorder are built with the items that need them (6b, 5).
+- **Bug found and fixed (6712d8ab0):** a recurrent rollback deeper than the last ubatch's snapshots was accepted and
+  restored a stale gated-delta-net state. A ubatch of T tokens writes snapshots for its last min(T, n_rs_seq + 1)
+  states, so rolling back T tokens (the state before the ubatch) read a plane from an older ubatch. Upstream's own
+  multi-seq split replay does exactly that (a 3-token tail rolled back 3), and failed here at nmse 1.9e-3 on both 27B
+  quants. koboldcpp could hit it when a reused prompt trims a context whose last ubatch was short (single-token
+  decodes with MTP loaded). The memory now tracks per cell how many snapshots the last ubatch wrote and refuses a
+  deeper rollback; the fork's guard case fails without the fix (nmse 3.3e-3) and passes with it. Upstream's
+  multi-seq case now rolls back 3 of a 4-token tail (nmse 4.4e-5 against a reference that took a 1-token step).
+- **Rollback suite:** CUDA, CUDA without fusion and the CPU pass every case. The CPU leg runs with `-ub 16`: at the
+  default ubatch each context's buffer-discovery decode of 512 tokens made a 27B HQ run take over 30 minutes.
+- **Environment during Phase 1:** `stall` lost 13–16 % of wall time to preemptions in every session (a slower mode
+  than the plan's measurements: MTP generation was 88–92 t/s at baseline).
+
+### Phase 1 (303f03c52, 0af97dedc, 6942c1bd2, 8ff930639)
+
+All A/Bs interleaved, 3 rounds, 27B HQ4_K_M, q5_1 K/V, FA, contention 13–16 %.
+
+| item | regression test | result |
+|---|---|---|
+| 1 graphs | `-g`: 249 configs bitwise graphs on vs off, every T in 2..64 launched as a graph (before: "no graph at T=2"); NO_VMM: 0 launches; `-ngl 1`, 2 virtual devices, pipeline parallel pass; kcpp-e2e and media hashes equal | pp2/pp5/pp8 29.7/32.3/37.7 → 21.7/22.0/25.0 ms; pp5 at nrs 4 33.1 → 24.0 ms; tg32 unchanged; MTP generation 88.8/80.6/92.0 → 120.6/106.8/124.5 t/s (+33–36 %) |
+| 2 prompt logits | kcpp-e2e: long-prompt texts equal, draft counts equal | 9.6k prompt cold 1725 → 2402 t/s (wall 6.60 → 5.10 s), warm 2456 → 2614 t/s |
+| 7 guidance | kcpp-e2e guidance: MTP and no-MTP texts differed at token 15 (top-2 gap 1.05) with item 2 alone; identical after | drafting off under guidance |
+| 4a uploads | `-g` with the reference child on sync uploads, in both parent upload modes, `-ngl 1`, 2 devices, pp | draft-step uploads 0.53–0.64 → 0.13–0.18 ms; MTP generation 122.1/109.4/124.3 → 129.8/118.0/134.3 t/s (+6–8 %); tg32 588 → 572–581 ms |
+
+- Item 1 keeps the legacy-pool gate inside ggml-cuda.cu (`ggml_cuda_graph_set_enabled` returns false without the
+  VMM pool) rather than a field in common.cuh, which would rebuild every CUDA object.
+- Item 2: the 1 GB host output buffer grows lazily, so its size isn't in the startup log; not re-measured.
+- Phase 1 end: MTP generation 88.8/80.6/92.0 → 129.8/118.0/134.3 t/s (+42–46 %), cold long prompt 1725 → ~2500 t/s.
+- Standing suite at Phase 1 end: every step passes. The first run failed only the RHT counter assertions because
+  `test-backend-ops -j 4` ran other cases on parallel threads against the global counters; the suite now runs the
+  counter-asserting cases on one thread.
