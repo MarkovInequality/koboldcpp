@@ -803,3 +803,40 @@ All A/Bs interleaved, 3 rounds, 27B HQ4_K_M, q5_1 K/V, FA, contention 13–16 %.
   - p_min (with the fix, mtpvocab 64k, geomean): d4 165.4; d4/0.3 139.1 (−16 %), d5/0.3 136.9, d6/0.3 131.1,
     d6/0.5 113.1, d7/0.5 111.2 (−33 %). Shorter, varying verify batches lose both accepted tokens per cycle and
     CUDA graph reuse. The default stays 0.
+
+### Phase 4: items 3a (348af46d5) and 3b (54d3ce936)
+
+- **3a, simpler than planned.** The quantized loader dequantizes each 8-value piece of a K/V row with the conversion
+  path's functions (`dequantize_q5_1` etc., then `__float2half`) and writes it straight into the swizzled F16 tile,
+  synchronously: no raw `cp.async` staging, the kernel runs with `nstages = 0`. The shared memory is the 1-stage F16
+  budget (about 33 KB at (1,8), D 256), so 2 blocks per SM without separate config entries. Instances: q4_0, q5_1,
+  q8_0 × D {128, 256} × (1,8), (2,8), (4,8), (8,8), (2,4), (4,4), (8,4) (21 files); GQA 2 keeps the old path.
+  - `GGML_CUDA_FA_Q_CONVERT=1` selects the same MMA kernel on the F16 copy (not VEC), so the test compares exactly
+    the dequantization step. The plan's `get_alloc_size` sharing: `BEST_FATTN_KERNEL_MMA_Q` needs no F16 scratch.
+  - Decode (1–2 tokens) leaves VEC everywhere the predicate holds: at every measured depth the new kernel is faster
+    (8k: 42.5 → 31.2 µs/layer; llama-bench decode at depth 0: 22.79 → 22.05 ms, 4k 25.67 → 23.98 ms).
+  - Regression: `test-fattn-mma-q`, 180 cases (3 types × hs × GQA 4/6/8 × kv 512/8192 × 1–8 tokens): bitwise at
+    kv 512; at kv 8192, 1–2 tokens differ by ≤ 1e-7 nmse, because the quantized kernel's smaller shared memory fits
+    more blocks and stream-k splits the KV range elsewhere. test-backend-ops: the plan's new cases plus every other
+    FLASH_ATTN_EXT case pass.
+  - Spills (ptxas): q5_1 (1,8) D 256 197 registers, none (F16: 254, none); (8,8) D 256 80 B (F16: 330 B);
+    (8,8) D 128 32 B (F16: none) is the only new spill.
+  - Not run: compute-sanitizer racecheck, which cannot attach under WSL2 ("Failed to initialize WDDM debugger
+    interface", needs EnableDebuggerInterface.bat as administrator).
+  - Performance, per layer at the 27B's shapes (q5_1): 8k decode/verify(5) 42.5/74.9 → 31.2/46.1 µs; 32k
+    147.5/313.7 → 88.2/121.9 µs; 96k 570/951 → 348/449 µs. llama-bench pp5 at nrs 4: 32k 37.2 → 29.4 ms, 96k
+    41.2 → 35.6 ms; decode at 32k 22.95 → 21.79 ms (VEC → MMA-Q; the MMA kernel on the F16 copy: 24.13 ms).
+    kcpp-e2e (3 interleaved rounds): MTP generation after a 27.5k-token prompt 59.9 → 62.8 t/s, after 88.6k
+    34.3 → 41.0 t/s (+20 %); short prompts +1–6 %.
+- **3b, generalized:** for 32+ tokens the tile's head count is the largest power of two dividing the GQA ratio
+  (GQA 3/5/7 → 1, 6 → 2, 12 → 4), not just 6 → 2.
+  - Per layer at the 27B's shapes: 1024-token prefill at 32k 7.0 → 5.3 ms (q5_1 and f16), 96k 27.0 → 20.8 ms;
+    f16 nb 512 at 4k/16k/128k −26/−26/−19 %. llama-bench pp1024 at depth 0/4k/8k unchanged (341.7/344.7/358.9 →
+    336.1/344.5/357.0 ms); kcpp-e2e prompt rates at 9.6k tokens are within the run spread, 88.6k +5 %.
+  - KL: the deltas are smaller than the metric's own movement under equivalent rounding changes (q5_1 opencode
+    0.00610 → 0.00702 at --parallel 1 but 0.00704 → 0.00614 at --parallel 2; wiki/heldout ±1 %; q8_0 opencode +1.4 %
+    with top-1 up).
+- The kcpp-e2e golden was re-recorded after 3a: decode with MTP off now runs the MMA kernel, so those greedy texts
+  moved; the guidance/grammar cross-checks, media and deep configs pass. `deep` is a new e2e config (32k and 96k
+  prompts at a 131072 context).
+- Standing suite at Phase 4 end: PASS (all steps, including the CPU rollback leg and the e2e check with deep).
