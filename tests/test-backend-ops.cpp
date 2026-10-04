@@ -9220,15 +9220,13 @@ struct test_rht_q8_1 : public test_case {
 
 // A producer the CUDA backend fuses into the rotation (RMS_NORM + MUL or a GLU in front of an RHT), run as one
 // graph against the CPU. Where the graph allows it, the backend must fuse exactly when the shape pays
-// (ggml_backend_cuda_rht_fusion_pays); inputs computed in the graph may share memory with the RHT output, so there
-// only the result is checked. Checked through the backend's counter; never with GGML_CUDA_DISABLE_FUSION=1.
+// (ggml_backend_cuda_rht_fusion_pays). Checked through the backend's counter; never with GGML_CUDA_DISABLE_FUSION=1.
 enum test_rht_fused_kind {
     RHT_FUSED_NORM,           // rms_norm(x)*w
     RHT_FUSED_SWIGLU_SPLIT,   // swiglu(g, u)
     RHT_FUSED_GEGLU_SPLIT,
     RHT_FUSED_SWIGLU,         // swiglu of the two halves of each row
     RHT_FUSED_GEGLU_SWAPPED,
-    RHT_FUSED_SWIGLU_INPLACE, // swiglu(g, u) written over g, as llama builds it for a rotated gate
     RHT_FUSED_NORM_TWO_USES,  // the MUL also feeds an ADD: not fusable
     RHT_FUSED_SWIGLU_OAI,     // not a fused GLU op
 };
@@ -9306,9 +9304,6 @@ struct test_rht_fused : public test_case {
             case RHT_FUSED_GEGLU_SWAPPED:
                 y = ggml_geglu_swapped(ctx, input(ctx, 2*n, "gu"));
                 break;
-            case RHT_FUSED_SWIGLU_INPLACE:
-                y = ggml_glu_split_inplace(ctx, input(ctx, n, "g"), input(ctx, n, "u"), GGML_GLU_OP_SWIGLU);
-                break;
             case RHT_FUSED_SWIGLU_OAI:
                 y = ggml_swiglu_oai(ctx, input(ctx, n, "g"), input(ctx, n, "u"), 1.702f, 7.0f);
                 break;
@@ -9346,7 +9341,7 @@ struct test_rht_fused : public test_case {
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
         if (checked < 0) {
             checked = 1;
-            if (strcmp(ggml_backend_reg_name(reg), "CUDA") == 0 && count0 >= 0 && !computed) {
+            if (strcmp(ggml_backend_reg_name(reg), "CUDA") == 0 && count0 >= 0) {
                 const char * env      = getenv("GGML_CUDA_DISABLE_FUSION");
                 const bool   disabled = env && atoi(env);
                 auto         pays     = (bool (*)(const ggml_tensor *)) cuda_fn("ggml_backend_cuda_rht_fusion_pays");
@@ -9473,8 +9468,7 @@ static void make_test_cases_fork(std::vector<std::unique_ptr<test_case>> & test_
 
     // producers fused into the rotation: every kernel path (one-warp rows, the mix, K-split, generic, narrow, strided,
     // kernel B, the compute-bound order that isn't fused), with and without Q8_1 consumers, 3D rows
-    for (test_rht_fused_kind kind : {RHT_FUSED_NORM, RHT_FUSED_SWIGLU_SPLIT, RHT_FUSED_GEGLU_SPLIT, RHT_FUSED_SWIGLU, RHT_FUSED_GEGLU_SWAPPED,
-                                     RHT_FUSED_SWIGLU_INPLACE}) {
+    for (test_rht_fused_kind kind : {RHT_FUSED_NORM, RHT_FUSED_SWIGLU_SPLIT, RHT_FUSED_GEGLU_SPLIT, RHT_FUSED_SWIGLU, RHT_FUSED_GEGLU_SWAPPED}) {
         for (int64_t n : {1024, 2048, 5120, 17408, 11008, 36*256, 36*16, 1 << 16}) {
             for (int64_t rows : {1, 8, 9, 512}) {
                 if (n*rows > (1 << 22)) {

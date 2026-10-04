@@ -26,6 +26,11 @@ Two follow-ups came from questions after the implementation:
 - **M1:** each activation is rotated once. MoE models with a shared expert rotated the same input twice per layer,
   and the experts' GEMMs now read the rotation's Q8_1.
 
+A third came with the 2026-10-04 upstream merge:
+- **G2:** upstream's allocation dependencies (`add_alloc_dep` in `graph_optimize`) keep each fusion's inputs
+  allocated. This replaces G1's in-place GLU and the F1/F2 aliasing rule, and also covers MoE experts and every
+  fusable GLU op.
+
 "Future work" has what's left, starting with rotated MoE routers, so the FFN norm can fuse in MoE layers too.
 
 ## Measurements (initial pass)
@@ -152,8 +157,9 @@ Not taken from the audit:
 | D2 | K-split epilogue spread over the split's warps; re-measure the one-consumer emission limits | `rht-impl.cuh`, `rht.cu` | ~1 µs per 17408 decode rotation |
 | F0 | Expand each RHT into the graph where it is created | `src/llama-graph.cpp` | lets F1 fire at all 128 norms |
 | F1 | RMS_NORM → MUL → RHT: the norm moves into the RHT kernels | `rht-impl.cuh`, `rht.cu`, `ggml-cuda.cu` (hook) | pp ~1.8 ms per ubatch; decode ~0.15 ms/token |
-| F2 | GLU (SWIGLU, GEGLU) → RHT | same | pp ~2 ms per ubatch where the aliasing check passes |
-| G1 | Follow-up: GLU of a rotated gate built in place over the gate's output, so upstream's gate/up/GLU MMVQ fusion isn't refused | `ggml.h`, `ggml.c`, `src/llama-graph.{h,cpp}`, `rht.cu` | measured: decode fusion 40 → 64/64 layers, +0.3 % decode |
+| F2 | GLU (SWIGLU, GEGLU) → RHT | same | pp ~2 ms per ubatch where the aliasing check passes (always since G2) |
+| G1 | Follow-up: GLU of a rotated gate built in place over the gate's output, so upstream's gate/up/GLU MMVQ fusion isn't refused. Superseded by G2 | `ggml.h`, `ggml.c`, `src/llama-graph.{h,cpp}`, `rht.cu` | measured: decode fusion 40 → 64/64 layers, +0.3 % decode |
+| G2 | Follow-up (2026-10-04): the fusions' inputs stay allocated through upstream's `graph_optimize` allocation dependencies; G1 and the F1/F2 aliasing rule removed | `ggml-cuda.cu`, `rht.{cu,cuh}`; reverts `ggml.{h,c}`, `src/llama-graph.{h,cpp}` | measured: G1's fusion counts, decode unchanged |
 | M1 | Follow-up: one RHT per activation. The rotation cache looks through row-keeping reshapes; the Q8_1 planner and MMVQ let expert `MUL_MAT_ID`s read the RHT's Q8_1 | `src/llama-graph.cpp`, `ggml-cuda.cu`, `mmvq.cu` | measured on Qwen1.5-MoE: decode 943 → 847 kernels, ~+1.7 % decode and prompt |
 
 Why these gains aren't simply additive:
@@ -264,10 +270,14 @@ Not pursued, and why:
 
   Q8_1 written by kernel A directly has a different layout, so it needs no overlap. `via_f32` never writes the
   output while reading inputs. The check is made in `rht.cu`, which knows how the launch will write.
+
+  *Superseded by G2:* the inputs are kept allocated until the RHT node, so the output never overlaps them.
 - **Counters.** A fused-launch counter and the Q8_1 counter live in the op, both exported through
   `get_proc_address` like `ggml_backend_cuda_rht_q8_1_count`. `GGML_CUDA_DISABLE_FUSION=1` disables the fusions.
 
 ### G1. In-place GLU for rotated gates (follow-up)
+
+*Superseded by G2 (2026-10-04); kept as the record of the problem.*
 
 - **Problem.** The gate and up GEMMs read an RHT that the graph allocator frees once both are allocated, and the
   GLU output can land on it (24 of the 27B's 64 layers). Upstream's fused gate/up/GLU kernel reads that RHT's Q8_1
@@ -308,6 +318,42 @@ Not pursued, and why:
   wrote its rows in src1's (i11, i12, i13) order. It used to assert `!ids`.
 - **Test.** test-hadamard-archs asserts that no two RHT nodes read the same rows. It checks through `cb_eval`
   queries, which leave the graph unsplit.
+
+### G2. Allocation dependencies for the fusions (follow-up after the 2026-10-04 merge)
+
+- **Upstream mechanism** (#27301, in since the merge of llama.cpp `53ed051ce`):
+  - A backend's `graph_optimize` gets `ggml_backend_graph_optimize_params`. Its `add_alloc_dep(tensor, until)`
+    keeps `tensor` allocated until node `until` has been computed.
+  - The scheduler adds a `GGML_OP_NONE` node after `until`, with the kept tensors as sources. That node goes only
+    into the copy of the graph that is allocated, never into the graph the backend computes, so the Q8_1 planner
+    doesn't see it as a consumer.
+  - Upstream uses this for its MoE weighted-reduction and top-k MoE fusions. It is the general form of what G1
+    did from the graph side.
+- **gate/up/GLU** (`ggml_cuda_glu_add_alloc_deps`, `ggml-cuda.cu`):
+  - For every split GLU, both inputs are traced back through the scale MUL and bias ADD/ADD_ID that the fusions
+    accept, to two `MUL_MAT(_ID)`s.
+  - If those share src1 and the vector fusion can apply (`ggml_cuda_should_fuse_mul_mat_vec_q/f`), src1 stays
+    allocated until the GLU, and so do the `ids` of `MUL_MAT_ID`.
+  - It isn't limited to rotated models. It covers routed experts and all four fusable GLU ops (G1 had only
+    SWIGLU/GEGLU in `build_ffn`). Upstream's `ggml_cuda_check_fusion_memory_ranges` stays as the guard.
+- **Prologues** (`ggml_cuda_rht_add_alloc_deps`, `rht.cu`):
+  - The RMS norm's input, and the GLU's `g`/`u`, stay allocated until the RHT node.
+  - The matcher is shared with `ggml_cuda_rht_try_fuse` (`rht_norm_fusable`, `rht_glu_fusable`), so dependencies
+    and fusions can't disagree.
+  - `rht_fusion_safe`, with its per-kernel exceptions, is gone. `ggml_cuda_rht_try_fuse` asserts that the output
+    doesn't overlap the inputs, so a missing dependency fails loudly instead of racing.
+- **Order:**
+  - The dependencies are added before upstream's optional stream reordering (`GGML_CUDA_GRAPH_OPT=1`), on the node
+    order the fusions match.
+  - Within concurrent regions, upstream restores that order for fusion.
+- **Removed:**
+  - `ggml_glu_split_inplace`: the GLU constructor is back to upstream's.
+  - `build_glu_split`: `build_ffn` calls `ggml_swiglu_split`/`ggml_geglu_split` again.
+  - The in-place view case of `rht_glu_can_fuse`, and the `RHT_FUSED` in-place test cases.
+- **Kept:** kernel B still writes Q8_1 for a single consumer. That is the same work as the consumer's own
+  quantize; the aliasing argument for it no longer applies.
+- **Cost:** the kept tensors live a few nodes longer. In decode that is a small src1. In prompt processing it is
+  the norm input (the residual, which stays alive anyway) and the GLU inputs up to the next node.
 
 ## Implementation conventions
 
@@ -371,7 +417,7 @@ Session scratch, not in the repo:
 All phases implemented 2026-09-29, follow-ups G1 and M1 on 2026-09-29/30. Uncommitted. Files:
 - `gpttype_adapter.cpp`, `otherarch/otherarch.h` (K1)
 - `src/llama-graph.{h,cpp}` (F0, G1, M1)
-- `ggml/include/ggml.h`, `ggml/src/ggml.c` (G1: `ggml_glu_split_inplace`)
+- `ggml/include/ggml.h`, `ggml/src/ggml.c` (G1: `ggml_glu_split_inplace`, removed again by G2)
 - `ggml/src/ggml-cuda/{rht-impl.cuh, rht.cu, rht.cuh}` (D1, D2, F1, F2, G1)
 - `ggml/src/ggml-cuda/ggml-cuda.cu`: the fusion hook, the counters, and the Q8_1 planner changes (M1)
 - `ggml/src/ggml-cuda/mmvq.cu` (M1)
@@ -605,6 +651,45 @@ MoE HQ is further behind plain than the dense models are. Its layers are small, 
 more, and the norm→RHT fusion can't fire: the router, which isn't rotated, also reads the norm output (see
 "Future work").
 
+### Follow-up G2: allocation dependencies (2026-10-04)
+
+Done right after the merge of upstream `concedo` (llama.cpp `53ed051ce`), on branch `merge-concedo`. The design is
+under G2.
+
+**Fusion counts**: a temporary `FUSELOG` counter in the CUDA evaluate loop, removed afterwards, recorded during
+koboldcpp `--benchmark` runs.
+
+| model | graph | gate/up/GLU (MMVQ) | {RMS_NORM, MUL, RHT} | {GLU, RHT} |
+|---|---|---|---|---|
+| 27B HQ4_K_M | decode | 64/64 | 128/128 | — (the GLU is in the MMVQ fusion) |
+| 27B HQ4_K_M | prompt (512) | — | 128/128 | 64/64 |
+| 0.6B HQ4_K_M | decode | 28/28 | 56/56 | — |
+| 0.6B HQ4_K_M | prompt (512) | 1 (the last layer, which runs on the output row only) | 56/56 | 27/28 |
+| 27B UD-Q4_K_M (plain) | decode | 36/64 | — | — |
+
+- The 27B HQ counts are G1's.
+- On the plain UD-Q4_K_M, exactly the 36 layers whose `ffn_gate` and `ffn_up` have the same type fuse. Unsloth's
+  mix uses different types in the other 28 layers, and upstream's fusion needs equal types.
+
+**Tests:**
+- `RHT_FUSED`: 384/384, both with fusion enabled and with `GGML_CUDA_DISABLE_FUSION=1`.
+  - The 76 in-place cases are gone.
+  - The computed-input cases must now fuse too. test-backend-ops allocates every tensor separately and never calls
+    `graph_optimize`, so its inputs never alias.
+- `RHT` 438/438, `MUL_MAT_VEC_FUSION` 1265/1265, `MUL_MAT_ID_FUSION` 13/13, `SWIGLU` 24/24.
+- `test-hadamard-archs`: 264/264 on CPU and on CUDA. The CUDA sweep runs through the scheduler, so a missing
+  dependency would have hit the new assert.
+- `golden.sh check` against master: byte-identical.
+
+**Speed and memory** (27B HQ4_K_M, koboldcpp `--benchmark`, ctx 4096, 4 interleaved rounds):
+- Decode is unchanged: G1 gave 65.92–66.80 t/s, G2 66.05–67.02 t/s.
+- One G2 round read 151 t/s. koboldcpp times generation with `std::chrono::high_resolution_clock`, which is the
+  system clock on libstdc++, and WSL clock corrections make single readings invalid (an earlier run read a
+  negative time).
+- Prompt speed couldn't be compared: `--benchmark` swung between 2.0 and 4.5k t/s across rounds on this box. The
+  prompt fusion counts are the same.
+- The compute buffers are identical: 519.27 MiB CUDA0, 24.27 MiB host.
+
 ### Open: HQ prompt processing has a temporal slow mode
 
 - **What:** on this box, 27B HQ pp512 sometimes runs at ~2300–2600 t/s instead of ~3500.
@@ -675,8 +760,7 @@ more, and the norm→RHT fusion can't fire: the router, which isn't rotated, als
 ### Other next steps
 
 - **The HQ prompt slow mode:** see "Open"; next is ncu on a slow and a fast process.
-- **In-place GLU for routed experts** (`build_moe_ffn`, the separate gate/up layout), if a model shows expert-path
-  collisions. None were seen, and there an overlap wouldn't even be a race.
+- ~~In-place GLU for routed experts~~: G2's allocation dependencies cover the expert path.
 - **Kernel B's Q8_1 epilogue** through a reduce-scatter over the tile's blocks. The draft's P1 was rejected because
   its per-block shuffle epilogue was too slow. This would be worth ~1.5 % of prompt time on the 27B.
 - **Kernel A's two launches per decode rotation.** That is the largest remaining decode cost of dense HQ (−2.3 %

@@ -656,6 +656,16 @@ them with the §3.1 step. Changes to the driver:
 - Cost is a roughly fixed 3–7 s per 0.6B run, up to 5× the fastest uniform quantizers (HQ3_K
   1.5 → 8.3 s).
 
+### After the upstream merge (2026-10-04)
+
+- Upstream's quantizer now streams row slabs across all experts of a 3D tensor in one pass, to keep the threads
+  busy (#27830). It used to loop over experts, then over slabs.
+- The merge keeps that structure. Inside a slab, LoRA merging and GPTQ run per expert segment, and each expert is
+  still factored once with its own imatrix slice.
+- GPTQ's output doesn't depend on how rows are grouped into calls, so the files are unchanged:
+  - `golden.sh check` is byte-identical against the pre-merge build;
+  - `test-hadamard-quantize`'s 3D-expert checks pass ("each expert equals its slice quantized alone").
+
 ## Future work
 
 ### Low-rank Hessian from the top-k eigenpairs

@@ -1630,17 +1630,6 @@ void llm_graph_check_hadamard_rotation(ggml_cgraph * gf, const llama_model & mod
     }
 }
 
-// With a rotated gate, the gate and up GEMMs read an RHT that the graph allocator frees once both are allocated,
-// so the GLU output can land on it; the CUDA backend then refuses to fuse gate/up/GLU into one kernel, which reads
-// that RHT while writing the GLU. Written over the gate's output (its only consumer is the GLU), it never overlaps
-// the RHT. Rotated models run only on the CPU and CUDA backends, whose GLU kernels work in place.
-ggml_tensor * llm_graph_context::build_glu_split(ggml_tensor * g, ggml_tensor * u, const ggml_tensor * w_gate, ggml_glu_op op) const {
-    if (rotation_owner(w_gate) && ggml_is_contiguous(g)) {
-        return ggml_glu_split_inplace(ctx0, g, u, op);
-    }
-    return ggml_glu_split(ctx0, g, u, op);
-}
-
 ggml_tensor * llm_graph_context::build_mm(ggml_tensor * w, ggml_tensor * cur) const {
     return ggml_mul_mat(ctx0, w, rotate_input_if_rotated(w, cur));
 }
@@ -1991,7 +1980,7 @@ ggml_tensor * llm_graph_context::build_ffn(
                     }
                 }
 
-                cur = build_glu_split(cur, tmp, gate, GGML_GLU_OP_SWIGLU);
+                cur = ggml_swiglu_split(ctx0, cur, tmp);
                 cb(cur, "ffn_swiglu", il);
                 type_gate = LLM_FFN_SEQ;
             } else {
@@ -2000,7 +1989,7 @@ ggml_tensor * llm_graph_context::build_ffn(
             } break;
         case LLM_FFN_GELU:
             if (gate && type_gate == LLM_FFN_PAR) {
-                cur = build_glu_split(cur, tmp, gate, GGML_GLU_OP_GEGLU);
+                cur = ggml_geglu_split(ctx0, cur, tmp);
                 cb(cur, "ffn_geglu", il);
                 type_gate = LLM_FFN_SEQ;
             } else {

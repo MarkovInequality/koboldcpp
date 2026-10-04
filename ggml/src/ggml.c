@@ -2994,13 +2994,12 @@ struct ggml_tensor * ggml_exp_inplace(
 
 // ggml_glu
 
-static struct ggml_tensor * ggml_glu_impl_ext(
+static struct ggml_tensor * ggml_glu_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
         struct ggml_tensor  * b,
         enum ggml_glu_op      op,
-        bool                  swapped,
-        bool                  inplace) {
+        bool                  swapped) {
     GGML_ASSERT(ggml_is_contiguous_1(a));
 
     if (b) {
@@ -3010,7 +3009,7 @@ static struct ggml_tensor * ggml_glu_impl_ext(
     }
 
     int64_t ne[GGML_MAX_DIMS] = { a->ne[0] / 2 }; for (int i = 1; i < GGML_MAX_DIMS; i++) ne[i] = a->ne[i];
-    struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_new_tensor_impl(ctx, a->type, GGML_MAX_DIMS, b ? a->ne : ne, NULL, 0);
+    struct ggml_tensor * result = ggml_new_tensor_impl(ctx, a->type, GGML_MAX_DIMS, b ? a->ne : ne, NULL, 0);
 
     ggml_set_op_params_i32(result, 0, (int32_t) op);
     ggml_set_op_params_i32(result, 1, (int32_t) swapped);
@@ -3020,15 +3019,6 @@ static struct ggml_tensor * ggml_glu_impl_ext(
     result->src[1] = b;
 
     return result;
-}
-
-static struct ggml_tensor * ggml_glu_impl(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * a,
-        struct ggml_tensor  * b,
-        enum ggml_glu_op      op,
-        bool                  swapped) {
-    return ggml_glu_impl_ext(ctx, a, b, op, swapped, false);
 }
 
 // ggml_floor
@@ -3122,15 +3112,6 @@ struct ggml_tensor * ggml_reglu_split(
         struct ggml_tensor  * a,
         struct ggml_tensor  * b) {
     return ggml_glu_impl(ctx, a, b, GGML_GLU_OP_REGLU, false);
-}
-
-struct ggml_tensor * ggml_glu_split_inplace(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * a,
-        struct ggml_tensor  * b,
-        enum ggml_glu_op      op) {
-    GGML_ASSERT(b && ggml_is_contiguous(a));
-    return ggml_glu_impl_ext(ctx, a, b, op, false, true);
 }
 
 // ggml_geglu

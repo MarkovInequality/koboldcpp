@@ -4714,6 +4714,51 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
     }
 }
 
+// the MUL_MAT(_ID) behind a GLU input, through the scale MUL and bias ADD(_ID) the gate/up/GLU fusions accept
+static const ggml_tensor * ggml_cuda_glu_input_mm(const ggml_tensor * t) {
+    auto is_mm = [](const ggml_tensor * x) {
+        return x && (x->op == GGML_OP_MUL_MAT || x->op == GGML_OP_MUL_MAT_ID);
+    };
+    auto is_chain = [&](const ggml_tensor * x) {
+        return is_mm(x) || (x && (x->op == GGML_OP_MUL || x->op == GGML_OP_ADD || x->op == GGML_OP_ADD_ID));
+    };
+    for (int depth = 0; depth < 3 && t && !is_mm(t); ++depth) {
+        if (!is_chain(t)) {
+            return nullptr;
+        }
+        const ggml_tensor * a = t->src[0];
+        const ggml_tensor * b = t->src[1];
+        t = is_mm(a) ? a : is_mm(b) ? b : is_chain(a) != is_chain(b) ? (is_chain(a) ? a : b) : nullptr;
+    }
+    return is_mm(t) ? t : nullptr;
+}
+
+// The fused gate/up/GLU kernels read the GEMMs' shared input while they write the GLU, so the input stays allocated
+// until the GLU. Otherwise the GLU output can land on it (with Hadamard-rotated weights, on the freed RHT) and
+// ggml_cuda_check_fusion_memory_ranges refuses the fusion.
+static void ggml_cuda_glu_add_alloc_deps(ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        ggml_tensor * glu = cgraph->nodes[i];
+        if (glu->op != GGML_OP_GLU || !glu->src[1]) {
+            continue;
+        }
+        const ggml_tensor * gate = ggml_cuda_glu_input_mm(glu->src[0]);
+        const ggml_tensor * up   = ggml_cuda_glu_input_mm(glu->src[1]);
+        if (!gate || !up || gate == up || gate->op != up->op || gate->src[1] != up->src[1] || !up->src[0]->buffer) {
+            continue;
+        }
+        if (!ggml_cuda_should_fuse_mul_mat_vec_q(up) && !ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
+            continue;
+        }
+        // src1, and the ids of MUL_MAT_ID
+        for (int j = 1; j < 3; ++j) {
+            if (up->src[j]) {
+                params->add_alloc_dep(params->user_data, up->src[j], glu);
+            }
+        }
+    }
+}
+
 static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
@@ -4733,6 +4778,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     };
 
     if (!disable_fusion) {
+        ggml_cuda_set_device(cuda_ctx->device);
+        ggml_cuda_glu_add_alloc_deps(cgraph, params);
+        ggml_cuda_rht_add_alloc_deps(cgraph, params);
+
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         for (int i = 0; i < cgraph->n_nodes; ++i) {

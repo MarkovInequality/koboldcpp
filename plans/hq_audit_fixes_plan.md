@@ -224,6 +224,15 @@ Implemented 2026-09-29; uncommitted. All measurements on this box (8 cores, RTX 
 - **Baselines** (KL to BF16, 40 × 512 of `wiki.test.raw`): `--hadamard --hessian Q4_K_M` 0.027308; `--hadamard
   IQ4_XS` 0.145369, with the imatrix 0.058425; `--hadamard IQ4_NL` 0.137891, with the imatrix 0.054590.
 
+**After the upstream merge (2026-10-04):**
+- The fixture is now upstream's `tests/test-llama-archs.cpp` at `53ed051ce`, which covers the new maple, hy_v4,
+  hrm_text and spark2_5 architectures, and fixes bailingmoe3's rope sections.
+- Upstream's fixture now defaults to a weight stdev of 0.1. This test keeps 0.01, because its 1e-6 NMSE threshold
+  assumes that scale: at 0.1, CUDA reaches ~1.5e-6 in a few architectures.
+- Result: 264/264 on CPU and CUDA.
+- The weight GEMMs of hy-v4, the nemotron-h-moe latent projections and the deepseek4 MTP head went through
+  `build_mm` as part of the merge.
+
 ### Phase 2
 
 - **C1:** `llama_hessian` reads through `llama_file`. Its buffered reads return short past the end instead of failing,
