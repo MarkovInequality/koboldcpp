@@ -2787,10 +2787,6 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             }
         }
 
-        if (node->op == GGML_OP_ADD && node->src[1] && node->src[1]->ne[1] > 1) {
-            use_cuda_graph = false;
-        }
-
         if (!use_cuda_graph) {
             break;
         }
@@ -4658,7 +4654,14 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
         }
     }
 
-    return graph->is_enabled();
+    // a captured graph keeps its pool addresses, which only the VMM pool never frees or moves
+#if defined(GGML_USE_VMM)
+    const bool vmm_pool = ggml_cuda_info().devices[cuda_ctx->device].vmm;
+#else
+    const bool vmm_pool = false;
+#endif
+
+    return graph->is_enabled() && vmm_pool;
 }
 #endif // USE_CUDA_GRAPH
 
@@ -4674,10 +4677,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 #ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
-    ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+    const bool graph_enabled = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled()) {
+    if (graph_enabled) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
