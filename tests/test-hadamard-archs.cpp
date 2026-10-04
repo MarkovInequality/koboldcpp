@@ -5,8 +5,9 @@
 // usage: test-hadamard-archs [-a REGEX] [-d DEVICE] [-s SEED] [-v]
 //        test-hadamard-archs -g [-a REGEX] [-d DEVICE] [-s SEED] [-ngl N] [-pp] [-v]
 //
-// -g: the batch shapes of MTP verify and small prompts give bitwise the same logits with CUDA graphs as without them
-// (a child process reruns everything with GGML_CUDA_DISABLE_GRAPHS=1), and multi-token batches do run as graphs:
+// -g: the batch shapes of MTP verify and small prompts give bitwise the same logits with CUDA graphs and batched
+// input uploads as without them (a child process reruns everything with GGML_CUDA_DISABLE_GRAPHS=1 and
+// GGML_SCHED_SYNC_UPLOADS=1), and multi-token batches do run as graphs:
 // per model, a 16-token prefill, then up to 4 batches of each size in G_TS, the CUDA graph launch and capture counters
 // checked per size. Each model also runs quantized to HQ4_K_M (MMVQ/MMQ, RHT, quantized experts). -ngl offloads only
 // N layers (a CPU split feeds the GPU), -pp turns on pipeline parallelism (needs two devices, e.g. GGML_CUDA_DEVICES=2).
@@ -965,6 +966,7 @@ static int g_main(const g_options & o, char ** argv) {
     const pid_t pid = fork();
     if (pid == 0) {
         setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 1);
+        setenv("GGML_SCHED_SYNC_UPLOADS", "1", 1);
         if (FILE * f = fopen(child_log.c_str(), "w")) {
             dup2(fileno(f), STDOUT_FILENO);
             dup2(fileno(f), STDERR_FILENO);

@@ -839,6 +839,9 @@ struct ggml_backend_sched {
     int debug_realloc;
     int debug_graph_size;
     int debug_prev_graph_size;
+
+    // GGML_SCHED_SYNC_UPLOADS=1: upload host inputs one blocking copy at a time (the reference for tests)
+    bool sync_uploads;
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1676,10 +1679,27 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         // copy the input tensors to the split backend
+        // without events, host-resident inputs go up asynchronously on the split backend's stream, which orders them
+        // after the work that last read their copies; one synchronize after the loop then lets the caller (or a
+        // later CPU split) reuse the host data
+        bool async_uploads = false;
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+
+            if (!sched->sync_uploads && sched->events[split_backend_id][sched->cur_copy] == NULL &&
+                    split_backend->iface.set_tensor_async != NULL &&
+                    input->buffer && ggml_backend_buffer_is_host(input->buffer) &&
+                    ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                    input_cpy->buffer && ggml_backend_buffer_get_type(input_cpy->buffer) == ggml_backend_get_default_buffer_type(split_backend)) {
+                if (!(input->flags & GGML_TENSOR_FLAG_INPUT)) {
+                    ggml_backend_synchronize(input_backend);
+                }
+                ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                async_uploads = true;
+                continue;
+            }
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -1801,6 +1821,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
             }
         }
+        if (async_uploads) {
+            ggml_backend_synchronize(split_backend);
+        }
 
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
@@ -1877,6 +1900,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
 #endif
     const char * GGML_SCHED_DEBUG_REALLOC = getenv("GGML_SCHED_DEBUG_REALLOC");
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
+
+    const char * GGML_SCHED_SYNC_UPLOADS = getenv("GGML_SCHED_SYNC_UPLOADS");
+    sched->sync_uploads = GGML_SCHED_SYNC_UPLOADS && atoi(GGML_SCHED_SYNC_UPLOADS) != 0;
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;

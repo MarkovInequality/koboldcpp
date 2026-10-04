@@ -1445,6 +1445,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         n_reused++;
     } else {
         gf_res_prev_active = nullptr;
+        graph_host_light   = -1;
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -2635,7 +2636,10 @@ ggml_status llama_context::graph_compute(
 
     // kicking a polling threadpool for trivial host work leaves its workers spinning between graphs,
     // starving anything else on the CPU (e.g. CPU TTS running alongside GPU generation)
-    if (n_threads > 1 && graph_host_work_is_light(sched.get(), gf)) {
+    if (graph_host_light < 0) {
+        graph_host_light = graph_host_work_is_light(sched.get(), gf);
+    }
+    if (n_threads > 1 && graph_host_light) {
         n_threads = 1;
         tp        = nullptr;
     }

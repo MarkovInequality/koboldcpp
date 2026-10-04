@@ -387,6 +387,9 @@ private:
 
     llm_graph_result * gf_res_prev_active = nullptr;
 
+    // graph_host_work_is_light() of gf_res_prev_active's graph, -1 until computed
+    int graph_host_light = -1;
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 
