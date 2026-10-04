@@ -10,6 +10,8 @@
 # --configs      comma list of mtp, nomtp, guidance, grammar, media (default: all but media)
 # --server-args  extra koboldcpp arguments for every server, e.g. "--mtpvocab 65536"
 #
+# deep: MTP generation after ~32k- and ~96k-token prompts (pinned sources), at a 131072-token context
+#
 # media: a server with MTP, the vision projector, whisper and TTS on the GPU; an image description, a TTS clip, a
 # transcription, and a TTS clip made while an MTP generation runs (both must equal their solo results)
 #
@@ -31,6 +33,8 @@ MEDIA = {
 }
 TTS_TEXT = "The quick brown fox jumps over the lazy dog, then naps in the warm afternoon sun."
 LONG_SRC = ("53ed051ce", "src/llama-graph.cpp", 30000)  # pinned, so edits to the tree don't change the prompt
+DEEP_SRC = ("53ed051ce", ["src/llama-context.cpp", "src/llama-graph.cpp", "ggml/src/ggml.c", "src/llama-vocab.cpp"])
+DEEP_CHARS = {"deep32k": 100000, "deep96k": 300000}
 NEAR_TIE = 1e-3
 
 SHORT = [
@@ -63,6 +67,7 @@ SERVERS = {
     "nomtp":          [],
     "guidance-mtp":   ["--usemtp", "--draftamount", "4", "--enableguidance"],
     "guidance-nomtp": ["--enableguidance"],
+    "deep":           ["--usemtp", "--draftamount", "4", "--contextsize", "131072"],
     "media":          ["--usemtp", "--draftamount", "4", "--mmproj", MEDIA["mmproj"], "--whispermodel", MEDIA["whisper"],
                        "--ttsmodel", MEDIA["tts"], "--ttswavtokenizer", MEDIA["wavtokenizer"], "--ttsgpu"],
 }
@@ -136,13 +141,25 @@ def long_prompt(run):
     code = subprocess.run(["git", "-C", REPO, "show", f"{sha}:{path}"], capture_output=True, text=True, check=True).stdout[:n]
     return chat(f"Run {run}. Summarize this code in three sentences:\n{code}")
 
+def deep_prompt(n_chars):
+    sha, paths = DEEP_SRC
+    text = "".join(subprocess.run(["git", "-C", REPO, "show", f"{sha}:{p}"], capture_output=True, text=True, check=True).stdout
+                   for p in paths)[:n_chars]
+    return chat(f"Summarize what this code does in three sentences:\n{text}")
+
 def run_server(name, args, tree, workdir, res):
     log = os.path.join(workdir, f"{name}.log")
     print(f"== {name}: loading", flush=True)
     s = Server(tree, args.model, SERVERS[name] + args.server_args.split(), args.port, log)
     try:
         out = res.setdefault(name, {})
-        if name == "media":
+        if name == "deep":
+            for k, n in DEEP_CHARS.items():
+                r = s.gen(deep_prompt(n), 200, GREEDY)
+                out[k] = r
+                print(f"  {k}: [{r['hash']}] {r['n_in']} tok, process {r['pp_s']:.1f}s -> {r['n_in']/r['pp_s']:.0f} t/s; "
+                      f"{r['n_out']} tok -> {r['n_out']/r['eval_s']:.1f} t/s, drafts {r['draft_ok']}/{r['draft_fail']}", flush=True)
+        elif name == "media":
             img = base64.b64encode(open(MEDIA["image"], "rb").read()).decode()
             r = s.gen(chat("Describe this image in two sentences."), 80, GREEDY, images=[img])
             out["vision"] = r
@@ -233,6 +250,8 @@ def main():
         names += ["guidance-mtp", "guidance-nomtp"]
     if "media" in args.configs:
         names += ["media"]
+    if "deep" in args.configs:
+        names += ["deep"]
 
     res, ok = {}, True
     for name in names:
