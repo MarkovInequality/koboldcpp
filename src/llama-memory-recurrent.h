@@ -91,6 +91,9 @@ public:
         int32_t   src0 = -1; // like src, but only used when setting the inputs (allowing to copy once)
         int32_t   tail = -1;
 
+        // rollback snapshots the cell's last ubatch wrote: the states before its last n_snap - 1 tokens
+        uint32_t  n_snap = 0;
+
         std::set<llama_seq_id> seq_id;
 
         bool has_seq_id(const llama_seq_id & id) const {

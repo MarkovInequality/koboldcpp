@@ -144,6 +144,7 @@ void llama_memory_recurrent::clear(bool data) {
         cells[i].seq_id.clear();
         cells[i].src = -1;
         cells[i].tail = -1;
+        cells[i].n_snap = 0;
     }
 
     head = 0;
@@ -195,7 +196,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
-                if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+                if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq && rollback < (llama_pos) cell.n_snap) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     cell.pos = p0 - 1;
                     return true;
@@ -636,6 +637,8 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             std::swap(dst_cell.pos, src_cell.pos);
             std::swap(dst_cell.src, src_cell.src);
             std::swap(dst_cell.seq_id, src_cell.seq_id);
+            // only the current state follows a cell that moves, its snapshots stay behind
+            src_cell.n_snap = 0;
 
             // swap tails
             for (uint32_t j = 0; j < size; ++j) {
@@ -663,6 +666,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 __func__, last_pos, cell.pos, ubatch.seq_id[i][0], n_seq_tokens);
         }
         cell.pos = last_pos;
+        cell.n_snap = std::min(n_seq_tokens, n_rs_seq + 1);
         cell.seq_id.clear();
         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
             const llama_seq_id seq_id = ubatch.seq_id[i][j];
@@ -1036,6 +1040,10 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
         GGML_ASSERT(cells[head + cell_count - 1].pos == ubatch.pos[cell_count - 1]);
         GGML_ASSERT(cells[head].has_seq_id(dest_seq_id));
         GGML_ASSERT(cells[head + cell_count - 1].has_seq_id(dest_seq_id));
+
+        for (uint32_t i = 0; i < cell_count; ++i) {
+            cells[head + i].n_snap = 0;
+        }
     } else {
         // whole KV cache restore
 
