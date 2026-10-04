@@ -3649,6 +3649,20 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// concat(conv state, x^T) -> copies of its conv windows (rollback snapshots) -> ssm_conv -> [bias add] -> silu,
+// the conv state update of the gated-delta-net models (views between the nodes are skipped)
+struct ggml_cuda_ssm_conv_update_match {
+    ggml_tensor * concat   = nullptr;
+    ggml_tensor * ssm_conv = nullptr;
+    ggml_tensor * bias_add = nullptr;
+    ggml_tensor * silu     = nullptr;
+    ggml_tensor * snap[GGML_CUDA_SSM_CONV_UPDATE_MAX_SNAP];
+    int           n_snap   = 0;
+    int           last     = 0; // index of the silu
+};
+
+static bool ggml_cuda_match_ssm_conv_update(const ggml_cgraph * cgraph, int i, ggml_cuda_ssm_conv_update_match & m);
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -3671,6 +3685,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
                 return match.node_count - 1;
             }
+        }
+    }
+
+    if (node->op == GGML_OP_CONCAT) {
+        ggml_cuda_ssm_conv_update_match m;
+        if (ggml_cuda_match_ssm_conv_update(cgraph, i, m)) {
+            ggml_cuda_op_ssm_conv_update(*cuda_ctx, m.concat, m.snap, m.n_snap, m.ssm_conv, m.bias_add, m.silu);
+            return m.last - i;
         }
     }
 
@@ -4771,6 +4793,76 @@ static const ggml_tensor * ggml_cuda_glu_input_mm(const ggml_tensor * t) {
 // The fused gate/up/GLU kernels read the GEMMs' shared input while they write the GLU, so the input stays allocated
 // until the GLU. Otherwise the GLU output can land on it (with Hadamard-rotated weights, on the freed RHT) and
 // ggml_cuda_check_fusion_memory_ranges refuses the fusion.
+static bool ggml_cuda_match_ssm_conv_update(const ggml_cgraph * cgraph, int i, ggml_cuda_ssm_conv_update_match & m) {
+    ggml_tensor * concat = cgraph->nodes[i];
+    if (concat->op != GGML_OP_CONCAT || ggml_get_op_params_i32(concat, 0) != 0 || concat->type != GGML_TYPE_F32 ||
+            (concat->flags & GGML_TENSOR_FLAG_OUTPUT) || !ggml_is_contiguous(concat) || concat->ne[3] != 1) {
+        return false;
+    }
+    const ggml_tensor * state = concat->src[0];
+    const ggml_tensor * x     = concat->src[1];
+    if (state->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(state) ||
+            x->ne[0] > GGML_CUDA_SSM_CONV_UPDATE_MAX_T || x->nb[0] % sizeof(float) != 0 || x->nb[1] % sizeof(float) != 0) {
+        return false;
+    }
+    const int64_t n_w = state->ne[0]; // d_conv - 1
+
+    int n_views = 0;
+    int j = i + 1;
+    for (; j < cgraph->n_nodes; ++j) {
+        ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_VIEW && n->view_src == concat) {
+            if (ggml_node_get_use_count(cgraph, j) != 1) {
+                return false;
+            }
+            n_views++;
+            continue;
+        }
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        if (n->op != GGML_OP_CPY) {
+            break;
+        }
+        const ggml_tensor * src = n->src[0];
+        const ggml_tensor * dst = n->src[1];
+        if (src->op != GGML_OP_VIEW || src->view_src != concat || m.n_snap == GGML_CUDA_SSM_CONV_UPDATE_MAX_SNAP ||
+                (n->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                src->ne[0] != n_w || src->ne[1] != concat->ne[1] || src->ne[2] != concat->ne[2] ||
+                src->nb[1] != concat->nb[1] || src->nb[2] != concat->nb[2] || src->view_offs % sizeof(float) != 0 ||
+                (int64_t) (src->view_offs / sizeof(float)) + n_w > concat->ne[0] ||
+                dst->type != GGML_TYPE_F32 || dst->nb[0] != sizeof(float) || dst->ne[0] != n_w*concat->ne[1] ||
+                dst->ne[1] != concat->ne[2] || dst->ne[2] != 1 || dst->ne[3] != 1) {
+            return false;
+        }
+        m.snap[m.n_snap++] = n;
+    }
+    if (j >= cgraph->n_nodes || n_views != m.n_snap) {
+        return false;
+    }
+    ggml_tensor * conv = cgraph->nodes[j];
+    if (conv->op != GGML_OP_SSM_CONV || conv->src[0] != concat || conv->src[1]->ne[0] != n_w + 1 ||
+            conv->src[1]->type != GGML_TYPE_F32 || conv->src[1]->nb[0] != sizeof(float) ||
+            ggml_node_get_use_count(cgraph, i) != n_views + 1) {
+        return false;
+    }
+    if (ggml_cuda_can_fuse(cgraph, j, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
+        m.bias_add = cgraph->nodes[j + 1];
+        m.silu     = cgraph->nodes[j + 2];
+    } else if (ggml_cuda_can_fuse(cgraph, j, { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
+        m.silu = cgraph->nodes[j + 1];
+    } else {
+        return false;
+    }
+    if (m.silu->ne[1] != x->ne[0] || m.silu->nb[0] != sizeof(float)) {
+        return false;
+    }
+    m.concat   = concat;
+    m.ssm_conv = conv;
+    m.last     = m.bias_add ? j + 2 : j + 1;
+    return true;
+}
+
 static void ggml_cuda_glu_add_alloc_deps(ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * glu = cgraph->nodes[i];
@@ -4816,6 +4908,16 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         ggml_cuda_set_device(cuda_ctx->device);
         ggml_cuda_glu_add_alloc_deps(cgraph, params);
         ggml_cuda_rht_add_alloc_deps(cgraph, params);
+
+        // the fused conv update reads the concat's inputs while it writes the silu output
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_cuda_ssm_conv_update_match m;
+            if (ggml_cuda_match_ssm_conv_update(cgraph, i, m)) {
+                for (ggml_tensor * t : { m.concat->src[0], m.concat->src[1] }) {
+                    params->add_alloc_dep(params->user_data, t->view_src ? t->view_src : t, m.silu);
+                }
+            }
+        }
 
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
@@ -6085,6 +6187,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_rht_fused_count") == 0) {
         return (void *)ggml_backend_cuda_rht_fused_count;
+    }
+    if (strcmp(name, "ggml_backend_cuda_ssm_conv_update_count") == 0) {
+        return (void *)ggml_cuda_ssm_conv_update_count;
     }
     if (strcmp(name, "ggml_backend_cuda_fattn_mma_q_count") == 0) {
         return (void *)ggml_cuda_fattn_mma_q_count;

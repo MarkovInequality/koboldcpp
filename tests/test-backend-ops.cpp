@@ -9360,7 +9360,113 @@ struct test_rht_fused : public test_case {
     }
 };
 
+// The conv state update of the gated-delta-net models: concat(state, x^T), K copies of its conv windows into the
+// cache (the rollback snapshots), ssm_conv, an optional bias add and silu, in the order the models build them. The
+// CUDA backend runs it as one kernel up to 32 tokens, which its counter must show, and never when the concat is a
+// graph output. The copies are chained through views and the conv weight is a view of the last one, so the graph
+// keeps that order with one output.
+struct test_ssm_conv_update : public test_case {
+    const int64_t n_t, n_c, n_s, n_snap, d_conv;
+    const bool bias;
+    const bool concat_output;
+
+    int64_t count0  = -1;
+    int     checked = -1;
+    std::vector<ggml_tensor *> cpys;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_UPDATE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR7(n_t, n_c, n_s, n_snap, d_conv, bias, concat_output);
+    }
+
+    test_ssm_conv_update(int64_t n_t, int64_t n_c, int64_t n_s, int64_t n_snap, int64_t d_conv = 4, bool bias = false,
+                         bool concat_output = false)
+        : n_t(n_t), n_c(n_c), n_s(n_s), n_snap(n_snap), d_conv(d_conv), bias(bias), concat_output(concat_output) {}
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return cpys; }
+
+    static int64_t fused_count() {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+        auto fn = reg ? (int64_t (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_ssm_conv_update_count") : nullptr;
+        return fn ? fn() : -1;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        count0  = fused_count();
+        checked = -1;
+        cpys.clear();
+
+        const int64_t n_w      = d_conv - 1;
+        const int64_t snap_len = n_w*n_c*n_s;
+        ggml_tensor * state = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_w, n_c, n_s);
+        ggml_tensor * x     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_c, n_t, n_s);
+        ggml_tensor * cache = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_snap*snap_len + d_conv*n_c);
+        ggml_set_name(state, "state");
+        ggml_set_name(x, "x");
+        ggml_set_name(cache, "cache");
+
+        ggml_tensor * concat = ggml_concat(ctx, state, ggml_transpose(ctx, x), 0);
+        ggml_set_name(concat, "conv_input");
+        if (concat_output) {
+            ggml_set_output(concat);
+        }
+
+        ggml_tensor * prev = cache;
+        for (int64_t k = 0; k < n_snap; ++k) {
+            const int64_t idx = std::max<int64_t>(0, n_t - k);
+            ggml_tensor * src = ggml_view_3d(ctx, concat, n_w, n_c, n_s, concat->nb[1], concat->nb[2], idx*sizeof(float));
+            ggml_tensor * dst = ggml_view_2d(ctx, prev, n_w*n_c, n_s, n_w*n_c*sizeof(float), k*snap_len*sizeof(float) - prev->view_offs);
+            prev = ggml_cpy(ctx, src, dst);
+            cpys.push_back(prev);
+        }
+        ggml_tensor * w = ggml_view_2d(ctx, prev, d_conv, n_c, d_conv*sizeof(float), n_snap*snap_len*sizeof(float) - prev->view_offs);
+        ggml_tensor * out = ggml_ssm_conv(ctx, concat, w);
+        if (bias) {
+            ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_c);
+            ggml_set_name(b, "bias");
+            out = ggml_add(ctx, out, b);
+        }
+        out = ggml_silu(ctx, out);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    double max_err(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        if (checked < 0) {
+            checked = 1;
+            if (strcmp(ggml_backend_reg_name(reg), "CUDA") == 0 && count0 >= 0) {
+                const char * env    = getenv("GGML_CUDA_DISABLE_FUSION");
+                const bool   expect = !(env && atoi(env)) && !concat_output && n_t <= 32;
+                const bool   fused  = fused_count() > count0;
+                if (fused != expect) {
+                    printf("[SSM_CONV_UPDATE] %s, expected %s ", fused ? "fused" : "not fused", expect ? "fused" : "not fused");
+                    checked = 0;
+                }
+            }
+        }
+        return checked ? max_nmse_err() : -1.0;
+    }
+};
+
 static void make_test_cases_fork(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    for (int64_t n_t : { 1, 2, 5, 9, 32, 33 }) {
+        for (int64_t n_snap : { 0, 1, 5 }) {
+            test_cases.emplace_back(new test_ssm_conv_update(n_t, 384, 1, n_snap));
+        }
+    }
+    test_cases.emplace_back(new test_ssm_conv_update(5, 10240, 1, 5));
+    test_cases.emplace_back(new test_ssm_conv_update(5, 384, 2, 5));
+    test_cases.emplace_back(new test_ssm_conv_update(3, 256, 1, 3, 3));
+    test_cases.emplace_back(new test_ssm_conv_update(5, 384, 1, 5, 5));
+    test_cases.emplace_back(new test_ssm_conv_update(5, 384, 1, 1, 4, true));
+    test_cases.emplace_back(new test_ssm_conv_update(5, 384, 1, 5, 4, false, true));
+
     const uint64_t seed_big = 0xFEDCBA9876543210ull;
 
     // (K, P) of the reference models, each at 3 rows (kernel A) and 9 rows (kernel B)

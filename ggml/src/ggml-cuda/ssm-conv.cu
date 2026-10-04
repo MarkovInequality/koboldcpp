@@ -2,6 +2,8 @@
 #include "ssm-conv.cuh"
 #include "unary.cuh"
 
+#include <atomic>
+
 template <bool apply_silu, size_t split_d_inner, size_t d_conv>
 static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_ptr,
                                     const float * bias_ptr,
@@ -203,4 +205,110 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
         ssm_conv_f32_cuda<false>(src0_d, src1_d, bias_d, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
                           out->nb[2], nc, nr, n_t, n_s, stream);
     }
+}
+
+struct ggml_cuda_ssm_conv_snaps {
+    int     n;
+    int     idx[GGML_CUDA_SSM_CONV_UPDATE_MAX_SNAP]; // first window value in the concat row
+    float * ptr[GGML_CUDA_SSM_CONV_UPDATE_MAX_SNAP];
+    int64_t nb1[GGML_CUDA_SSM_CONV_UPDATE_MAX_SNAP]; // floats between sequences
+};
+
+// one thread per channel and sequence; the sums are ssm_conv_f32's, term by term, so the outputs are bitwise its
+template <int d_conv>
+static __global__ void ssm_conv_update_f32(
+        const float * __restrict__ state, const int64_t state_nb1, const int64_t state_nb2,
+        const char  * __restrict__ x, const int64_t x_nb0, const int64_t x_nb1, const int64_t x_nb2,
+        const float * __restrict__ w, const int64_t w_nb1, const float * __restrict__ bias,
+        float * __restrict__ dst, const int64_t dst_nb1, const int64_t dst_nb2,
+        const ggml_cuda_ssm_conv_snaps snaps, const int n_t, const int n_c) {
+    const int s = blockIdx.x;
+    const int c = blockIdx.y*blockDim.x + threadIdx.x;
+    if (c >= n_c) {
+        return;
+    }
+
+    float xin[d_conv - 1 + GGML_CUDA_SSM_CONV_UPDATE_MAX_T];
+#pragma unroll
+    for (int j = 0; j < d_conv - 1; ++j) {
+        xin[j] = state[j + c*state_nb1 + s*state_nb2];
+    }
+    for (int t = 0; t < n_t; ++t) {
+        xin[d_conv - 1 + t] = *(const float *) (x + t*x_nb0 + c*x_nb1 + s*x_nb2);
+    }
+    float wv[d_conv];
+#pragma unroll
+    for (int j = 0; j < d_conv; ++j) {
+        wv[j] = w[j + c*w_nb1];
+    }
+    const float b = bias != nullptr ? bias[c] : 0.0f;
+
+    for (int t = 0; t < n_t; ++t) {
+        float sumf = 0.0f;
+#pragma unroll
+        for (int j = 0; j < d_conv; ++j) {
+            sumf += xin[t + j] * wv[j];
+        }
+        sumf += b;
+        dst[c + t*dst_nb1 + s*dst_nb2] = ggml_cuda_op_silu_single(sumf);
+    }
+
+    for (int k = 0; k < snaps.n; ++k) {
+        float * o = snaps.ptr[k] + s*snaps.nb1[k] + c*(d_conv - 1);
+#pragma unroll
+        for (int j = 0; j < d_conv - 1; ++j) {
+            o[j] = xin[snaps.idx[k] + j];
+        }
+    }
+}
+
+static std::atomic<int64_t> ssm_conv_update_count{0};
+
+int64_t ggml_cuda_ssm_conv_update_count() {
+    return ssm_conv_update_count.load();
+}
+
+void ggml_cuda_op_ssm_conv_update(ggml_backend_cuda_context & ctx, const ggml_tensor * concat, ggml_tensor * const * snaps,
+                                  int n_snap, const ggml_tensor * ssm_conv, const ggml_tensor * bias_add, ggml_tensor * silu) {
+    const ggml_tensor * state = concat->src[0]; // [d_conv - 1, n_c, n_s], contiguous
+    const ggml_tensor * x     = concat->src[1]; // [n_t, n_c, n_s]
+    const ggml_tensor * w     = ssm_conv->src[1];
+    const ggml_tensor * bias  = bias_add ? (bias_add->src[0] == ssm_conv ? bias_add->src[1] : bias_add->src[0]) : nullptr;
+
+    const int64_t d_conv = w->ne[0];
+    const int64_t n_t    = x->ne[0];
+    const int64_t n_c    = state->ne[1];
+    const int64_t n_s    = state->ne[2];
+    GGML_ASSERT(state->ne[0] == d_conv - 1 && n_t <= GGML_CUDA_SSM_CONV_UPDATE_MAX_T && n_snap <= GGML_CUDA_SSM_CONV_UPDATE_MAX_SNAP);
+    GGML_ASSERT(silu->ne[0] == n_c && silu->ne[1] == n_t && silu->ne[2] == n_s && silu->nb[0] == sizeof(float));
+
+    ggml_cuda_ssm_conv_snaps sn = {};
+    sn.n = n_snap;
+    for (int k = 0; k < n_snap; ++k) {
+        const ggml_tensor * src = snaps[k]->src[0]; // a window of the concat rows
+        const ggml_tensor * dst = snaps[k]->src[1]; // [(d_conv - 1)*n_c, n_s]
+        sn.idx[k] = (int) (src->view_offs / sizeof(float));
+        sn.ptr[k] = (float *) dst->data;
+        sn.nb1[k] = dst->nb[1] / sizeof(float);
+    }
+
+    const int threads = 128;
+    const dim3 blocks(n_s, (n_c + threads - 1) / threads, 1);
+    cudaStream_t stream = ctx.stream();
+    auto launch = [&](auto D) {
+        constexpr int kD = decltype(D)::value;
+        ssm_conv_update_f32<kD><<<blocks, threads, 0, stream>>>(
+            (const float *) state->data, state->nb[1]/sizeof(float), state->nb[2]/sizeof(float),
+            (const char *) x->data, x->nb[0], x->nb[1], x->nb[2],
+            (const float *) w->data, w->nb[1]/sizeof(float), bias ? (const float *) bias->data : nullptr,
+            (float *) silu->data, silu->nb[1]/sizeof(float), silu->nb[2]/sizeof(float), sn, (int) n_t, (int) n_c);
+    };
+    switch (d_conv) {
+        case 3:  launch(std::integral_constant<int, 3>{}); break;
+        case 4:  launch(std::integral_constant<int, 4>{}); break;
+        case 5:  launch(std::integral_constant<int, 5>{}); break;
+        default: GGML_ABORT("ssm_conv_update: d_conv %d", (int) d_conv);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    ssm_conv_update_count++;
 }
