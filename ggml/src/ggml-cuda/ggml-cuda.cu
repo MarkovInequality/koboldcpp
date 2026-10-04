@@ -3649,6 +3649,50 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// the GET_ROWS that gathers a gated-delta-net state for one sequence, if the GDN can read its source row in place
+// instead (the gather is then skipped): state = reshape(get_rows(states, s_copy)), each used once
+static const ggml_tensor * ggml_cuda_gdn_state_rows(const ggml_cgraph * cgraph, const ggml_tensor * gdn) {
+    auto use_count = [&](const ggml_tensor * t) {
+        const size_t pos = ggml_hash_find(&cgraph->visited_hash_set, t);
+        return ggml_bitset_get(cgraph->visited_hash_set.used, pos) ? cgraph->use_counts[pos] : 0;
+    };
+    const ggml_tensor * state = gdn->src[5];
+    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->src[2]->ne[3] != 1 || state->op != GGML_OP_RESHAPE ||
+            use_count(state) != 1 || (state->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return nullptr;
+    }
+    const ggml_tensor * rows = state->src[0];
+    if (rows->op != GGML_OP_GET_ROWS || use_count(rows) != 1 || (rows->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            rows->type != GGML_TYPE_F32 || rows->src[0]->type != GGML_TYPE_F32 || rows->src[1]->type != GGML_TYPE_I32 ||
+            rows->src[0]->nb[0] != sizeof(float) || rows->src[0]->ne[0] != ggml_nelements(state) ||
+            rows->src[0]->nb[1] % sizeof(float) != 0 || rows->src[0]->ne[2] != 1 || rows->src[0]->ne[3] != 1 ||
+            ggml_nelements(rows->src[1]) != 1) {
+        return nullptr;
+    }
+    return rows;
+}
+
+// node i is a GET_ROWS whose GDN reads the state in place
+static bool ggml_cuda_gdn_state_rows_skipped(const ggml_cgraph * cgraph, int i) {
+    static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+    const ggml_tensor * rows = cgraph->nodes[i];
+    if (disable_fusion || rows->op != GGML_OP_GET_ROWS) {
+        return false;
+    }
+    const ggml_tensor * reshape = nullptr;
+    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (!reshape) {
+            if (n->op == GGML_OP_RESHAPE && n->src[0] == rows) {
+                reshape = n;
+            }
+        } else if (n->op == GGML_OP_GATED_DELTA_NET && n->src[5] == reshape) {
+            return ggml_cuda_gdn_state_rows(cgraph, n) == rows;
+        }
+    }
+    return false;
+}
+
 // concat(conv state, x^T) -> copies of its conv windows (rollback snapshots) -> ssm_conv -> [bias add] -> silu,
 // the conv state update of the gated-delta-net models (views between the nodes are skipped)
 struct ggml_cuda_ssm_conv_update_match {
@@ -3662,6 +3706,9 @@ struct ggml_cuda_ssm_conv_update_match {
 };
 
 static bool ggml_cuda_match_ssm_conv_update(const ggml_cgraph * cgraph, int i, ggml_cuda_ssm_conv_update_match & m);
+
+// ggml_cuda_try_fuse: the node ran (differently), no further nodes are covered
+#define GGML_CUDA_FUSED_NODE_ONLY -1
 
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -3696,8 +3743,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
+    // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache; with one sequence the state is read
+    // in place (its gather was skipped)
     if (node->op == GGML_OP_GATED_DELTA_NET) {
+        const ggml_tensor * state_rows = ggml_cuda_gdn_state_rows(cgraph, node);
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
         const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
         if (nodes_to_skip > 0) {
@@ -3705,8 +3754,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             GGML_LOG_INFO("%s: fused gated_delta_net snapshot copies for %s (skipped %d nodes)\n",
                           __func__, node->name, nodes_to_skip);
 #endif
-            ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy);
+            ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy, state_rows);
             return nodes_to_skip;
+        }
+        if (state_rows) {
+            ggml_cuda_op_gated_delta_net(*cuda_ctx, node, state_rows);
+            return GGML_CUDA_FUSED_NODE_ONLY;
         }
     }
 
@@ -4576,7 +4629,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                if (ggml_cuda_gdn_state_rows_skipped(cgraph, i)) {
+                    continue;
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                if (nodes_to_skip == GGML_CUDA_FUSED_NODE_ONLY) {
+                    continue;
+                }
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
@@ -4908,6 +4968,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         ggml_cuda_set_device(cuda_ctx->device);
         ggml_cuda_glu_add_alloc_deps(cgraph, params);
         ggml_cuda_rht_add_alloc_deps(cgraph, params);
+
+        // a GDN reading its state in place reads the gather's row index
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * rows = ggml_cuda_gdn_state_rows(cgraph, cgraph->nodes[i]);
+            if (rows) {
+                params->add_alloc_dep(params->user_data, rows->src[1], cgraph->nodes[i]);
+            }
+        }
 
         // the fused conv update reads the concat's inputs while it writes the silu output
         for (int i = 0; i < cgraph->n_nodes; ++i) {
@@ -6187,6 +6255,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_rht_fused_count") == 0) {
         return (void *)ggml_backend_cuda_rht_fused_count;
+    }
+    if (strcmp(name, "ggml_backend_cuda_gdn_state_in_place_count") == 0) {
+        return (void *)ggml_cuda_gdn_state_in_place_count;
     }
     if (strcmp(name, "ggml_backend_cuda_ssm_conv_update_count") == 0) {
         return (void *)ggml_cuda_ssm_conv_update_count;

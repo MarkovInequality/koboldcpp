@@ -9454,7 +9454,116 @@ struct test_ssm_conv_update : public test_case {
     }
 };
 
+// A gated-delta-net layer's state gather (get_rows of the cache by the sequence's row index) feeding the GDN, whose
+// snapshots are copied back into the same cache, as the models build it. With one sequence the CUDA backend skips the
+// gather and the kernel reads the row in place, also when it is a row the snapshots overwrite; its counter must show
+// that, and never with two sequences.
+struct test_gdn_state_in_place : public test_case {
+    const int64_t head_count, head_size, n_tokens, n_rows, K;
+    const std::vector<int32_t> rows; // the source row of each sequence
+
+    int64_t count0  = -1;
+    int     checked = -1;
+    ggml_tensor * cpy_node = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET_STATE_IN_PLACE";
+    }
+
+    std::string vars() override {
+        std::string r = "[";
+        for (size_t i = 0; i < rows.size(); ++i) {
+            r += (i ? "," : "") + std::to_string(rows[i]);
+        }
+        return VARS_TO_STR5(head_count, head_size, n_tokens, n_rows, K) + ",rows=" + r + "]";
+    }
+
+    test_gdn_state_in_place(int64_t head_count, int64_t head_size, int64_t n_tokens, int64_t K, std::vector<int32_t> rows)
+        : head_count(head_count), head_size(head_size), n_tokens(n_tokens), n_rows(K + 2), K(K), rows(rows) {}
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy_node }; }
+
+    static int64_t in_place_count() {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+        auto fn = reg ? (int64_t (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_gdn_state_in_place_count") : nullptr;
+        return fn ? fn() : -1;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        count0  = in_place_count();
+        checked = -1;
+
+        const int64_t n_seqs = rows.size();
+        const int64_t S_v = head_size, H = head_count, D = S_v*S_v*H;
+        const int64_t n_written = std::min<int64_t>(n_tokens, K);
+
+        ggml_tensor * q    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, n_tokens, n_seqs);
+        ggml_tensor * k    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, n_tokens, n_seqs);
+        ggml_tensor * v    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, n_tokens, n_seqs);
+        ggml_tensor * g    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, n_tokens, n_seqs);
+        ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, n_tokens, n_seqs);
+        ggml_tensor * states = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_rows*n_seqs);
+        ggml_tensor * idx    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_set_name(g, "g");
+        ggml_set_name(beta, "beta");
+        ggml_set_name(states, "states");
+        ggml_set_name(idx, "idx");
+
+        ggml_tensor * state = ggml_reshape_4d(ctx, ggml_get_rows(ctx, states, idx), S_v, S_v, H, n_seqs);
+        ggml_tensor * out   = ggml_gated_delta_net(ctx, ggml_l2_norm(ctx, q, 1e-6f), ggml_l2_norm(ctx, k, 1e-6f), v, g, beta, state, K);
+
+        // snapshot slot i of sequence s -> row i*n_seqs + s of the cache
+        ggml_tensor * src = ggml_view_3d(ctx, out, D, n_seqs, n_written, ggml_row_size(out->type, D),
+                ggml_row_size(out->type, D*n_seqs), ggml_row_size(out->type, S_v*H*n_tokens*n_seqs));
+        ggml_tensor * dst = ggml_view_3d(ctx, states, D, n_seqs, n_written, states->nb[1], n_seqs*states->nb[1], 0);
+        cpy_node = ggml_cpy(ctx, src, dst);
+        return ggml_sum(ctx, cpy_node);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "idx") == 0) {
+                ggml_backend_tensor_set(t, rows.data(), 0, rows.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -1.0f, 0.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double max_err(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        if (checked < 0) {
+            checked = 1;
+            if (strcmp(ggml_backend_reg_name(reg), "CUDA") == 0 && count0 >= 0) {
+                const char * env    = getenv("GGML_CUDA_DISABLE_FUSION");
+                const bool   expect = !(env && atoi(env)) && rows.size() == 1;
+                const bool   done   = in_place_count() > count0;
+                if (done != expect) {
+                    printf("[GDN] state %s, expected %s ", done ? "read in place" : "gathered", expect ? "in place" : "gathered");
+                    checked = 0;
+                }
+            }
+        }
+        return checked ? max_nmse_err() : -1.0;
+    }
+};
+
 static void make_test_cases_fork(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    // source row 2 is among the slots the snapshots overwrite, row 6 is not
+    for (int32_t row : { 0, 2, 6 }) {
+        test_cases.emplace_back(new test_gdn_state_in_place(4, 128, 5, 5, { row }));
+        test_cases.emplace_back(new test_gdn_state_in_place(4, 128, 1, 5, { row }));
+    }
+    test_cases.emplace_back(new test_gdn_state_in_place(4, 64, 3, 2, { 1 }));
+    test_cases.emplace_back(new test_gdn_state_in_place(4, 128, 5, 5, { 0, 7 }));
+
     for (int64_t n_t : { 1, 2, 5, 9, 32, 33 }) {
         for (int64_t n_snap : { 0, 1, 5 }) {
             test_cases.emplace_back(new test_ssm_conv_update(n_t, 384, 1, n_snap));
