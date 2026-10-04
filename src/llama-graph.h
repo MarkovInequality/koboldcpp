@@ -873,6 +873,11 @@ struct llm_graph_params {
             return false;
         }
 
+        if (cparams.draft_vocab_head != other.cparams.draft_vocab_head ||
+            cparams.draft_vocab_tail != other.cparams.draft_vocab_tail) {
+            return false;
+        }
+
         return
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
@@ -1065,6 +1070,11 @@ struct llm_graph_context {
     ggml_tensor * rotate_input_if_rotated(ggml_tensor * w, ggml_tensor * cur, bool id = false) const;
 
     mutable std::map<std::pair<ggml_tensor *, uint64_t>, ggml_tensor *> hadamard_rot_cache; // (input, seed)
+
+    // an MTP draft head with a draft vocabulary set (llama_set_draft_n_vocab): full-width logits, computed for
+    // the kept rows only through row views of w, -inf elsewhere
+    bool is_reduced_draft_head(const ggml_tensor * w) const;
+    ggml_tensor * build_reduced_draft_head(ggml_tensor * w, ggml_tensor * cur, ggml_tensor * w_s, bool lora) const;
 
     //
     // common

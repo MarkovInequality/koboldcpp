@@ -935,7 +935,7 @@ static bool speculative_state_setup(llama_context * main_ctx, const llama_contex
     return true;
 }
 
-static void mtp_decoding_setup(llama_model * main_model, llama_context * main_ctx, const llama_context_params & base_ctx_params)
+static void mtp_decoding_setup(llama_model * main_model, llama_context * main_ctx, const llama_context_params & base_ctx_params, int mtp_vocab)
 {
     if(main_model == nullptr || main_model->hparams.n_layer_nextn <= 0)
     {
@@ -960,6 +960,10 @@ static void mtp_decoding_setup(llama_model * main_model, llama_context * main_ct
     }
 
     draft_is_mtp = true;
+    if(mtp_vocab > 0)
+    {
+        llama_set_draft_n_vocab(draft_ctx, mtp_vocab);
+    }
     speculative_state_setup(main_ctx, mtp_ctx_params, -1, COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
 }
 
@@ -3795,7 +3799,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
             }
             else
             {
-                mtp_decoding_setup(llamamodel, llama_ctx_v4, llama_ctx_params);
+                mtp_decoding_setup(llamamodel, llama_ctx_v4, llama_ctx_params, inputs.mtp_vocab);
             }
 
         }

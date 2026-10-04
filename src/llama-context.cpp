@@ -1257,6 +1257,24 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
+void llama_context::set_draft_n_vocab(int32_t n_vocab) {
+    const int32_t n_vocab_all = model.vocab.n_tokens();
+    if (n_vocab <= 0 || n_vocab >= n_vocab_all || cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP ||
+            model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        cparams.draft_vocab_head = 0;
+        cparams.draft_vocab_tail = 0;
+        return;
+    }
+    // the control and end-of-generation tokens sit at the end of the vocabularies this is for; keep them all
+    int32_t tail = n_vocab;
+    while (tail < n_vocab_all && !model.vocab.is_control(tail) && !model.vocab.is_eog(tail)) {
+        tail++;
+    }
+    cparams.draft_vocab_head = n_vocab;
+    cparams.draft_vocab_tail = tail;
+    LLAMA_LOG_INFO("%s: draft head computes vocabulary rows [0, %d) and [%d, %d)\n", __func__, n_vocab, tail, n_vocab_all);
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -4060,6 +4078,10 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+void llama_set_draft_n_vocab(llama_context * ctx, int32_t n_vocab) {
+    ctx->set_draft_n_vocab(n_vocab);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

@@ -1630,7 +1630,40 @@ void llm_graph_check_hadamard_rotation(ggml_cgraph * gf, const llama_model & mod
     }
 }
 
+bool llm_graph_context::is_reduced_draft_head(const ggml_tensor * w) const {
+    // set only on MTP contexts (llama_context::set_draft_n_vocab)
+    return cparams.draft_vocab_head > 0 && hq_model &&
+           w->ne[1] == (int64_t) hq_model->vocab.n_tokens() && w->ne[2] == 1 && w->ne[3] == 1;
+}
+
+ggml_tensor * llm_graph_context::build_reduced_draft_head(ggml_tensor * w, ggml_tensor * cur, ggml_tensor * w_s, bool lora) const {
+    const int64_t n_vocab = w->ne[1];
+    const int64_t head    = cparams.draft_vocab_head;
+    const int64_t tail    = cparams.draft_vocab_tail;
+    const int64_t n_out   = cur->ne[1];
+
+    // whole stored rows, so a rotated w stays rotated (is_rotated follows view_src) and both parts share one RHT;
+    // a view has no LoRA weight
+    auto part = [&](int64_t r0, int64_t nr) {
+        ggml_tensor * wv = ggml_view_2d(ctx0, w, w->ne[0], nr, w->nb[1], r0*w->nb[1]);
+        ggml_tensor * sv = w_s && w_s->ne[0] == n_vocab ? ggml_view_1d(ctx0, w_s, nr, r0*w_s->nb[0]) : w_s;
+        return lora ? build_lora_mm(wv, cur, sv) : build_mm(wv, cur);
+    };
+
+    ggml_tensor * res = part(0, head);
+    if (tail > head) {
+        res = ggml_concat(ctx0, res, ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, tail - head, n_out), -INFINITY), 0);
+    }
+    if (tail < n_vocab) {
+        res = ggml_concat(ctx0, res, part(tail, n_vocab - tail), 0);
+    }
+    return res;
+}
+
 ggml_tensor * llm_graph_context::build_mm(ggml_tensor * w, ggml_tensor * cur) const {
+    if (is_reduced_draft_head(w)) {
+        return build_reduced_draft_head(w, cur, nullptr, false);
+    }
     return ggml_mul_mat(ctx0, w, rotate_input_if_rotated(w, cur));
 }
 
@@ -1642,6 +1675,9 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
+    if (is_reduced_draft_head(w)) {
+        return build_reduced_draft_head(w, cur, w_s, true);
+    }
     // the LoRA branch below keeps the unrotated cur: adapters are trained in the unrotated space
     ggml_tensor * cur_rot = rotate_input_if_rotated(w, cur);
 

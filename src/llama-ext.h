@@ -106,6 +106,11 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
+// An MTP context's draft head computes only the first n_vocab logits and the control/end-of-generation tokens
+// from the first one at or after n_vocab; the logits stay full width, the others -inf. 0 restores the full head.
+// Ignored for other context types and with SPLIT_MODE_TENSOR.
+LLAMA_API void llama_set_draft_n_vocab(struct llama_context * ctx, int32_t n_vocab);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);

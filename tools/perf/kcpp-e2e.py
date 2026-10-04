@@ -8,6 +8,7 @@
 # --build DIR    tree with koboldcpp.py and koboldcpp_cublas.so (default: this repo)
 # --lib FILE     A/B a scratch library: runs a symlinked copy of --build with FILE as koboldcpp_cublas.so
 # --configs      comma list of mtp, nomtp, guidance, grammar, media (default: all but media)
+# --server-args  extra koboldcpp arguments for every server, e.g. "--mtpvocab 65536"
 #
 # media: a server with MTP, the vision projector, whisper and TTS on the GPU; an image description, a TTS clip, a
 # transcription, and a TTS clip made while an MTP generation runs (both must equal their solo results)
@@ -138,7 +139,7 @@ def long_prompt(run):
 def run_server(name, args, tree, workdir, res):
     log = os.path.join(workdir, f"{name}.log")
     print(f"== {name}: loading", flush=True)
-    s = Server(tree, args.model, SERVERS[name], args.port, log)
+    s = Server(tree, args.model, SERVERS[name] + args.server_args.split(), args.port, log)
     try:
         out = res.setdefault(name, {})
         if name == "media":
@@ -217,6 +218,7 @@ def main():
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--configs", default="mtp,nomtp,guidance,grammar")
     ap.add_argument("--port", type=int, default=5098)
+    ap.add_argument("--server-args", default="")
     ap.add_argument("--min-ratio", type=float, default=0.0, help="check: fail when a speed falls below this ratio of the golden")
     ap.add_argument("--out", help="also write this run's results here")
     args = ap.parse_args()
