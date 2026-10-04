@@ -33,6 +33,7 @@
 
 #include "utils.h"
 #include "llmutils.h"
+#include "kcpp_sampler_util.h"
 #include "kcpp_backend.h"
 
 #include "llama_v2.cpp"
@@ -153,6 +154,7 @@ static std::vector<int> smartcontext;
 static float adaptive_p_weighted_sum = 0; //adaptive p sampling state vars
 static float adaptive_p_total_weight = 0;
 static std::vector<std::string> stop_sequence;
+static kcpp_stop_scanner stop_scanner; // searches only what concat_output gained since the last check
 static std::vector<int> special_stop_sequence; //for stop sequences that don't have a string representation
 static std::vector<std::string> banned_tokens;
 static std::vector<int> banned_token_ids;
@@ -1483,7 +1485,7 @@ void sample_xtc(llama_token_data_array * candidates, float xtc_threshold, float 
 
 }
 
-void sample_dry(int n_ctx, int penalty_range, float penalty_multiplier, float penalty_base, int allowed_length, const std::unordered_multimap<gpt_vocab::id, std::vector<gpt_vocab::id>>& restart_sequences, llama_token_data_array * candidates) {
+void sample_dry(int n_ctx, int penalty_range, float penalty_multiplier, float penalty_base, int allowed_length, const std::unordered_multimap<gpt_vocab::id, std::vector<gpt_vocab::id>>& restart_sequences, float * logits) {
     if (penalty_multiplier <= 0.0f || penalty_base <= 0.0f) {
         return;
     }
@@ -1677,12 +1679,8 @@ void sample_dry(int n_ctx, int penalty_range, float penalty_multiplier, float pe
             ::utreplace(tokenizedstr, "\n", "\\n");
             printf("%s(%s %.02f)", count == 0 ? "" : " ", RemoveBell(tokenizedstr).c_str(), penalty);
         }
-        candidates->data[token].logit -= penalty;
+        logits[token] -= penalty;
         ++count;
-    }
-    if(count>0)
-    {
-        candidates->sorted = false;
     }
     if (debugmode==1 && !is_quiet && !dry_max_token_repeat.empty()) {
         printf("]\n");
@@ -2362,20 +2360,27 @@ const std::vector<int> & think_start_seq, const std::vector<int> & think_end_seq
 
     kcpp_sampler_record(logits, n_vocab);
 
+    // the samplers edit a copy: llama's logits stay as decoded (savestate keeps them)
+    static thread_local std::vector<float> row;
     static thread_local std::vector<llama_token_data> candidates;
-    candidates.resize(n_vocab);
-    for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
-        candidates[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
-    }
+    row.assign(logits, logits + n_vocab);
     int id = 0;
 
     for(int i=0;i<logit_biases.size();++i)
     {
         auto & itm = logit_biases[i];
-        candidates[itm.token_id].logit += itm.bias;
+        row[itm.token_id] += itm.bias;
     }
 
-    llama_token_data_array candidates_p = { candidates.data(), candidates.size(), false };
+    // every vocabulary entry as a candidate, for the paths that need them all
+    auto all_candidates = [&]() {
+        candidates.resize(n_vocab);
+        for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+            candidates[token_id] = llama_token_data{token_id, row[token_id], 0.0f};
+        }
+        return llama_token_data_array{ candidates.data(), candidates.size(), false };
+    };
+    llama_token_data_array candidates_p;
 
     //apply reasoning budget
     int newid = apply_reasoning_budget(id, think_start_seq, think_end_seq, think_end_phrase_toks, kcpp_data->reasoning_budget);
@@ -2384,6 +2389,7 @@ const std::vector<int> & think_start_seq, const std::vector<int> & think_end_seq
         {
             printf("\n(Reasoning Budget of %d tokens exceeded! Finishing thinking...)\n", kcpp_data->reasoning_budget);
         }
+        candidates_p = all_candidates();
         candidates[newid].logit += 99999;
         sample_top_k(&candidates_p, 1);
         id = sample_token(&candidates_p, rng);
@@ -2391,15 +2397,19 @@ const std::vector<int> & think_start_seq, const std::vector<int> & think_end_seq
     }
 
     //dry always first as logits cannot be resorted
-    sample_dry(n_ctx, dry_penalty_last_n, dry_multiplier, dry_base, dry_allowed_length, dry_sequence_breakers, &candidates_p);
+    sample_dry(n_ctx, dry_penalty_last_n, dry_multiplier, dry_base, dry_allowed_length, dry_sequence_breakers, row.data());
 
     //prefilter to top 3k tokens for improved speed
     bool use_grammar = grammar != nullptr;
-    std::vector<llama_token_data> precache = (use_grammar ? std::vector<llama_token_data>(candidates) : std::vector<llama_token_data>(0));
+    std::vector<llama_token_data> precache;
 
-    sample_top_k(&candidates_p, 3000);
-
-    if (use_grammar) {
+    if (!use_grammar) {
+        kcpp_select_top_k(row.data(), n_vocab, 3000, candidates);
+        candidates_p = { candidates.data(), candidates.size(), 0, true };
+    } else {
+        candidates_p = all_candidates();
+        precache = candidates;
+        sample_top_k(&candidates_p, 3000);
         sample_grammar(file_format, n_vocab, &candidates_p, grammar);
         // if top_k 3000 doesn't contain a valid candidate for this grammar, try again pre-cull
         if (candidates_p.size <= 0) {
@@ -5707,6 +5717,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     concat_output_mtx.unlock();
     last_stop_reason = stop_reason::OUT_OF_TOKENS;
     stop_sequence.clear();
+    stop_scanner.reset();
     special_stop_sequence.clear();
     dry_repeat_count.clear();
     dry_sequence_breakers.clear();
@@ -6972,6 +6983,13 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                     //this is not the first loop, so we need to increment some things
                     n_past += 1;
                 }
+
+                // the bans below write the row's lowest logit, taken before guidance edits the row
+                const bool tcpreventtoks = ((kcpp_data->n_predict - remaining_tokens)<3);
+                const bool any_ban = (!inputs.allow_eos_token && !inputs.bypass_eos_token) || btsize>0 ||
+                    (tcpreventsize>0 && tcpreventtoks && std::count(concat_output.begin(), concat_output.end(), '[')<=1) ||
+                    antislop_banned_token_ids.find(n_past) != antislop_banned_token_ids.end();
+
                 if(file_format == FileFormat::GGML || file_format == FileFormat::GGHF || file_format == FileFormat::GGJT || file_format == FileFormat::GGJT_2 || file_format == FileFormat::GGJT_3 || file_format == FileFormat::GGUF_GENERIC)
                 {
                     if(file_format == FileFormat::GGUF_GENERIC)
@@ -6993,12 +7011,12 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                     {
                         logitsPtr = llama_v2_get_logits(llama_ctx_v2);
                     }
-                    lowestLogit = LowestLogit(logitsPtr,n_vocab);
+                    lowestLogit = any_ban ? LowestLogit(logitsPtr,n_vocab) : 0;
                 }
                 else
                 {
                     logitsPtr = logits.data(); //legacy rwkv, neox, gptj etc
-                    lowestLogit = LowestLogit(logits);
+                    lowestLogit = any_ban ? LowestLogit(logits) : 0;
                 }
 
                 if(!firstdecodedone && current_context_tokens.size()>0)
@@ -7012,7 +7030,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                         //first decode was not done. this can happen when reloading from a perfectly matched state.
                         //to prevent a catastrophic failure, we must prepare emergency logits for usage
                         logitsPtr = loaded_latest_logits.data();
-                        lowestLogit = LowestLogit(logitsPtr,n_vocab);
+                        lowestLogit = any_ban ? LowestLogit(logitsPtr,n_vocab) : 0;
                     }
                     else
                     {
@@ -7044,7 +7062,6 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                         logitsPtr[banned_token_ids[t]]=lowestLogit;
                     }
                 }
-                bool tcpreventtoks = ((kcpp_data->n_predict - remaining_tokens)<3);
                 if(tcpreventsize>0 && tcpreventtoks && std::count(concat_output.begin(), concat_output.end(), '[')<=1)
                 {
                     for(int t=0;t<tcpreventsize;++t)
@@ -7257,20 +7274,16 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
 
                 if(!early_abort)
                 {
-                    for (const auto &matched : stop_sequence)
+                    if (const std::string * matched = stop_scanner.find(concat_output, stop_sequence))
                     {
-                        if (concat_output.find(matched) != std::string::npos)
+                        early_abort = true;
+                        if(allow_regular_prints)
                         {
-                            early_abort = true;
-                            if(allow_regular_prints)
-                            {
-                                auto match_clean = matched;
-                                replace_all(match_clean, "\n", "\\n");
-                                printf("\n(Stop sequence triggered: %s)", match_clean.c_str());
-                            }
-                            last_stop_reason = stop_reason::CUSTOM_STOPPER;
-                            break;
+                            auto match_clean = *matched;
+                            replace_all(match_clean, "\n", "\\n");
+                            printf("\n(Stop sequence triggered: %s)", match_clean.c_str());
                         }
+                        last_stop_reason = stop_reason::CUSTOM_STOPPER;
                     }
                 }
 
