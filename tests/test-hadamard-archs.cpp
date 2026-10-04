@@ -3,6 +3,13 @@
 // so a graph that multiplies it without rotating its input first fails the guard or changes the logits.
 //
 // usage: test-hadamard-archs [-a REGEX] [-d DEVICE] [-s SEED] [-v]
+//        test-hadamard-archs -g [-a REGEX] [-d DEVICE] [-s SEED] [-ngl N] [-pp] [-v]
+//
+// -g: the batch shapes of MTP verify and small prompts give bitwise the same logits with CUDA graphs as without them
+// (a child process reruns everything with GGML_CUDA_DISABLE_GRAPHS=1), and multi-token batches do run as graphs:
+// per model, a 16-token prefill, then up to 4 batches of each size in G_TS, the CUDA graph launch and capture counters
+// checked per size. Each model also runs quantized to HQ4_K_M (MMVQ/MMQ, RHT, quantized experts). -ngl offloads only
+// N layers (a CPU split feeds the GPU), -pp turns on pipeline parallelism (needs two devices, e.g. GGML_CUDA_DEVICES=2).
 //
 // The random-model fixture (from get_tokens to arch_supported) is upstream's tests/test-llama-archs.cpp at
 // 53ed051ce, the fork's last upstream merge, unchanged.
@@ -27,6 +34,8 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <random>
 #include <regex>
@@ -35,6 +44,11 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <sys/wait.h>
+#include <unistd.h>
+
+extern bool kcpp_pipeline_parallelism;
 
 static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     GGML_ASSERT(a.size() == b.size());
@@ -615,11 +629,15 @@ static void log_cb(ggml_log_level level, const char * text, void *) {
     }
 }
 
-static llama_model_ptr make_model(gguf_context * gguf_ctx, size_t seed, ggml_backend_dev_t dev) {
+// dev nullptr: the CPU only, unless all_devices
+static llama_model_ptr make_model(gguf_context * gguf_ctx, size_t seed, ggml_backend_dev_t dev, int ngl = -1, bool all_devices = false) {
     llama_model_params mp = llama_model_default_params();
     mp.progress_callback = silent_model_load_progress;
     ggml_backend_dev_t devs[2] = { dev, nullptr };
-    mp.devices = devs;
+    mp.devices = dev || !all_devices ? devs : nullptr;
+    if (ngl >= 0) {
+        mp.n_gpu_layers = ngl;
+    }
     // the 1e-6 threshold below assumes this scale (upstream's fixture now defaults to 0.1)
     tensor_data_params tp = { seed, 0.01f };
     llama_model_ptr model(llama_model_init_from_user(gguf_ctx, set_tensor_data, &tp, mp));
@@ -723,19 +741,347 @@ static std::string last_lines(const std::string & s, int n) {
     return pos == std::string::npos || pos >= s.size() ? s : s.substr(pos + 1);
 }
 
+static const int G_PREFILL = 16;
+static const int G_CTX     = 256; // n_kv is capped at the cache size, so it stays the same for every batch
+static const int G_TS[]    = { 2, 4, 5, 8, 9, 33, 64 };
+static const int G_N_TS    = sizeof(G_TS)/sizeof(G_TS[0]);
+
+struct g_options {
+    std::string filter;
+    ggml_backend_dev_t dev = nullptr;
+    size_t seed = 42;
+    int ngl = -1;
+    bool pp = false;
+};
+
+struct g_counters {
+    int64_t (*launches)() = nullptr;
+    int64_t (*captures)() = nullptr;
+    bool no_vmm = false;
+};
+
+static g_counters g_get_counters() {
+    g_counters c;
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+    if (!reg) {
+        return c;
+    }
+    c.launches = (int64_t (*)()) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_graph_launch_count");
+    c.captures = (int64_t (*)()) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_graph_capture_count");
+    auto get_features = (ggml_backend_feature * (*)(ggml_backend_reg_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_features");
+    for (ggml_backend_feature * f = get_features ? get_features(reg) : nullptr; f && f->name; ++f) {
+        c.no_vmm |= strcmp(f->name, "NO_VMM") == 0;
+    }
+    return c;
+}
+
+struct g_run {
+    std::vector<float> logits;
+    int64_t launches[G_N_TS] = {};
+    int64_t captures[G_N_TS] = {};
+    int     n_batches[G_N_TS] = {};
+};
+
+static g_run g_run_sequence(llama_model * model, const std::vector<llama_token> & tokens, const g_counters & gc) {
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx           = G_CTX;
+    cp.n_batch         = 64;
+    cp.n_ubatch        = 64;
+    cp.n_threads       = 4;
+    cp.n_threads_batch = 4;
+    llama_context_ptr ctx(llama_init_from_model(model, cp));
+    if (!ctx) {
+        throw std::runtime_error("failed to create the context");
+    }
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    llama_batch batch = llama_batch_init(64, 0, 1);
+    g_run r;
+    size_t next = 0;
+    auto decode = [&](int n, int pos0) {
+        common_batch_clear(batch);
+        for (int i = 0; i < n; ++i) {
+            common_batch_add(batch, tokens[next++ % tokens.size()], pos0 + i, {0}, true);
+        }
+        if (llama_decode(ctx.get(), batch)) {
+            llama_batch_free(batch);
+            throw std::runtime_error("failed to decode batch");
+        }
+        for (int i = 0; i < n; ++i) {
+            const float * l = llama_get_logits_ith(ctx.get(), i);
+            r.logits.insert(r.logits.end(), l, l + n_vocab);
+        }
+    };
+    for (int it = 0; it < G_N_TS; ++it) {
+        llama_memory_clear(llama_get_memory(ctx.get()), true);
+        decode(G_PREFILL, 0);
+        const int T  = G_TS[it];
+        const int nb = std::min(4, (G_CTX - G_PREFILL)/T);
+        const int64_t l0 = gc.launches ? gc.launches() : 0;
+        const int64_t c0 = gc.captures ? gc.captures() : 0;
+        for (int b = 0; b < nb; ++b) {
+            decode(T, G_PREFILL + b*T);
+        }
+        r.launches[it]  = (gc.launches ? gc.launches() : 0) - l0;
+        r.captures[it]  = (gc.captures ? gc.captures() : 0) - c0;
+        r.n_batches[it] = nb;
+    }
+    llama_batch_free(batch);
+    return r;
+}
+
+// the fixture saved, quantized to HQ4_K_M and loaded back
+static llama_model_ptr g_make_hq_model(llama_model * src, const g_options & o) {
+    const std::string dir = (std::filesystem::temp_directory_path() / ("test-hadamard-archs-" + std::to_string(getpid()))).string();
+    std::filesystem::create_directories(dir);
+    const std::string f16 = dir + "/src.gguf", hq = dir + "/hq.gguf";
+    llama_model_save_to_file(src, f16.c_str());
+    llama_model_quantize_params qp = llama_model_quantize_default_params();
+    qp.ftype    = LLAMA_FTYPE_MOSTLY_Q4_K_M;
+    qp.hadamard = true;
+    qp.nthread  = 4;
+    const uint32_t rc = llama_model_quantize(f16.c_str(), hq.c_str(), &qp);
+    llama_model_ptr model;
+    if (rc == 0) {
+        llama_model_params mp = llama_model_default_params();
+        mp.progress_callback = silent_model_load_progress;
+        ggml_backend_dev_t devs[2] = { o.dev, nullptr };
+        mp.devices = o.dev ? devs : nullptr;
+        if (o.ngl >= 0) {
+            mp.n_gpu_layers = o.ngl;
+        }
+        model.reset(llama_model_load_from_file(hq.c_str(), mp));
+    }
+    std::filesystem::remove_all(dir);
+    if (!model) {
+        throw std::runtime_error(rc ? "quantization failed" : "failed to load the quantized model");
+    }
+    return model;
+}
+
+// calls f(label, model) for every model of the -g matrix; a model that fails to build is skipped by both processes
+template <typename F>
+static void g_for_each_model(const g_options & o, F && f) {
+    for (const llm_arch arch : llm_arch_all()) {
+        if (arch == LLM_ARCH_UNKNOWN || !arch_supported(arch) ||
+                (!o.filter.empty() && !std::regex_search(llm_arch_name(arch), std::regex(o.filter)))) {
+            continue;
+        }
+        if (arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE ||
+                arch == LLM_ARCH_RND1) {
+            continue; // encoders and diffusion models don't decode in batches
+        }
+        for (int cfg = 0; cfg < 4; ++cfg) {
+            const bool moe = cfg & 1;
+            const bool hq  = cfg & 2;
+            if ((moe && !moe_implemented(arch)) || (!moe && moe_mandatory(arch))) {
+                continue;
+            }
+            const std::string label = std::string(llm_arch_name(arch)) + (moe ? " (MoE)" : "") + (hq ? " HQ4_K_M" : "");
+            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+            g_log.clear();
+            llama_model_ptr model;
+            try {
+                model = make_model(gguf_ctx.get(), o.seed, o.dev, o.ngl, true);
+                if (hq) {
+                    model = g_make_hq_model(model.get(), o);
+                }
+            } catch (const std::exception & e) {
+                f(label, nullptr, moe, std::string(e.what()));
+                continue;
+            }
+            f(label, model.get(), moe, std::string());
+        }
+    }
+}
+
+static void g_write_str(std::ofstream & out, const std::string & s) {
+    const uint64_t n = s.size();
+    out.write((const char *) &n, sizeof(n));
+    out.write(s.data(), n);
+}
+
+// the child: every model's logits without CUDA graphs, written to path ("" for a model that failed)
+static int g_child(const g_options & o, const std::string & path) {
+    std::ofstream out(path, std::ios::binary);
+    const std::vector<llama_token> tokens = get_tokens(1024, 128, o.seed);
+    g_for_each_model(o, [&](const std::string & label, llama_model * model, bool, const std::string & err) {
+        std::string data;
+        if (model && err.empty()) {
+            try {
+                const g_run r = g_run_sequence(model, tokens, g_counters());
+                data.assign((const char *) r.logits.data(), r.logits.size()*sizeof(float));
+            } catch (const std::exception &) {
+            }
+        }
+        g_write_str(out, label);
+        g_write_str(out, data);
+    });
+    return out.good() ? 0 : 1;
+}
+
+static std::map<std::string, std::string> g_read(const std::string & path) {
+    std::map<std::string, std::string> res;
+    std::ifstream in(path, std::ios::binary);
+    auto read_str = [&](std::string & s) {
+        uint64_t n = 0;
+        if (!in.read((char *) &n, sizeof(n))) {
+            return false;
+        }
+        s.resize(n);
+        return (bool) in.read(s.data(), n);
+    };
+    std::string label, data;
+    while (read_str(label) && read_str(data)) {
+        res[label] = data;
+    }
+    return res;
+}
+
+static int g_main(const g_options & o, char ** argv) {
+    const std::string ref_path = (std::filesystem::temp_directory_path() / ("test-hadamard-archs-g-" + std::to_string(getpid()) + ".bin")).string();
+    std::vector<std::string> args = { argv[0], "-g", "--g-child", ref_path, "-s", std::to_string(o.seed) };
+    if (!o.filter.empty()) {
+        args.insert(args.end(), { "-a", o.filter });
+    }
+    if (o.dev) {
+        args.insert(args.end(), { "-d", ggml_backend_dev_name(o.dev) });
+    }
+    if (o.ngl >= 0) {
+        args.insert(args.end(), { "-ngl", std::to_string(o.ngl) });
+    }
+    if (o.pp) {
+        args.push_back("-pp");
+    }
+    printf("reference run without CUDA graphs...\n");
+    fflush(stdout);
+    const std::string child_log = ref_path + ".log";
+    const pid_t pid = fork();
+    if (pid == 0) {
+        setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 1);
+        if (FILE * f = fopen(child_log.c_str(), "w")) {
+            dup2(fileno(f), STDOUT_FILENO);
+            dup2(fileno(f), STDERR_FILENO);
+        }
+        std::vector<char *> cargs;
+        for (auto & a : args) {
+            cargs.push_back(a.data());
+        }
+        cargs.push_back(nullptr);
+        execv(cargs[0], cargs.data());
+        _exit(127);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    const std::map<std::string, std::string> ref = g_read(ref_path);
+    std::filesystem::remove(ref_path);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        std::ifstream log(child_log);
+        printf("FAIL: the reference process failed\n%s\n", std::string(std::istreambuf_iterator<char>(log), {}).c_str());
+        std::filesystem::remove(child_log);
+        return 1;
+    }
+    std::filesystem::remove(child_log);
+
+    const g_counters gc = g_get_counters();
+    if (!gc.launches || !gc.captures) {
+        printf("FAIL: no CUDA graph counters (not a CUDA build?)\n");
+        return 1;
+    }
+    printf("graph launches per batch size %s", gc.no_vmm ? "(NO_VMM: graphs must stay off)" : "");
+    for (int it = 0; it < G_N_TS; ++it) {
+        printf("%s%d", it ? "/" : " T=", G_TS[it]);
+    }
+    printf("\n");
+
+    const std::vector<llama_token> tokens = get_tokens(1024, 128, o.seed);
+    int n_pass = 0, n_fail = 0, n_skip = 0;
+    std::vector<std::string> failed;
+    g_for_each_model(o, [&](const std::string & label, llama_model * model, bool moe, const std::string & err) {
+        const auto it_ref = ref.find(label);
+        if (!model || it_ref == ref.end() || it_ref->second.empty()) {
+            printf("  %-40s SKIP (%s)\n", label.c_str(), !err.empty() ? err.c_str() : "fails without graphs");
+            n_skip++;
+            return;
+        }
+        std::string status = "PASS";
+        std::string counts;
+        try {
+            const g_run r = g_run_sequence(model, tokens, gc);
+            const std::string & rs = it_ref->second;
+            if (rs.size() != r.logits.size()*sizeof(float)) {
+                status = "FAIL (logit count differs)";
+            } else if (memcmp(rs.data(), r.logits.data(), rs.size()) != 0) {
+                const float * a = (const float *) rs.data();
+                size_t first = 0;
+                double max_diff = 0;
+                for (size_t i = r.logits.size(); i-- > 0;) {
+                    if (memcmp(&a[i], &r.logits[i], sizeof(float)) != 0) {
+                        first = i;
+                        max_diff = std::max(max_diff, (double) std::fabs(a[i] - r.logits[i]));
+                    }
+                }
+                char buf[128];
+                snprintf(buf, sizeof(buf), "FAIL (logits differ from #%zu, max |diff| %.3g)", first, max_diff);
+                status = buf;
+            }
+            for (int it = 0; it < G_N_TS; ++it) {
+                counts += (it ? "/" : "") + std::to_string(r.launches[it]);
+                // a re-capture on every batch (a graph property that changes between same-shaped batches) shows as
+                // captures without matching launches; a dense model must run every batch size as a graph
+                const bool churn = r.n_batches[it] >= 3 && r.launches[it] < 2*r.captures[it];
+                const bool off   = gc.no_vmm ? r.launches[it] + r.captures[it] > 0 : !moe && r.launches[it] == 0;
+                if (status == "PASS" && (churn || off)) {
+                    status = "FAIL (" + std::string(churn ? "re-captured" : gc.no_vmm ? "graphs on the legacy pool" : "no graph") +
+                             " at T=" + std::to_string(G_TS[it]) + ")";
+                }
+            }
+        } catch (const std::exception & e) {
+            status = std::string("FAIL (") + e.what() + ")";
+        }
+        printf("  %-40s launches %-22s %s\n", label.c_str(), counts.c_str(), status.c_str());
+        if (status != "PASS") {
+            const std::string tail = last_lines(g_log, 3);
+            if (!tail.empty()) {
+                printf("%s", tail.c_str());
+            }
+            failed.push_back(label);
+            n_fail++;
+        } else {
+            n_pass++;
+        }
+        fflush(stdout);
+    });
+
+    printf("\n%d passed, %d failed, %d skipped\n", n_pass, n_fail, n_skip);
+    for (const auto & f : failed) {
+        printf("  failed: %s\n", f.c_str());
+    }
+    printf("%s\n", n_fail ? "FAIL" : "PASS");
+    return n_fail ? 1 : 0;
+}
+
 int main(int argc, char ** argv) {
     std::string filter;
     std::string device;
+    std::string g_child_path;
     size_t seed = 42;
+    bool graphs = false;
+    g_options go;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
-        if ((a == "-a" || a == "-d" || a == "-s") && i + 1 < argc) {
+        if ((a == "-a" || a == "-d" || a == "-s" || a == "-ngl" || a == "--g-child") && i + 1 < argc) {
             const std::string v = argv[++i];
-            if (a == "-a") filter = v; else if (a == "-d") device = v; else seed = std::stoull(v);
+            if (a == "-a") filter = v; else if (a == "-d") device = v; else if (a == "-ngl") go.ngl = std::stoi(v);
+            else if (a == "--g-child") g_child_path = v; else seed = std::stoull(v);
         } else if (a == "-v") {
             g_verbose = true;
+        } else if (a == "-g") {
+            graphs = true;
+        } else if (a == "-pp") {
+            go.pp = true;
         } else {
-            printf("usage: %s [-a REGEX] [-d DEVICE] [-s SEED] [-v]\n", argv[0]);
+            printf("usage: %s [-a REGEX] [-d DEVICE] [-s SEED] [-v]\n"
+                   "       %s -g [-a REGEX] [-d DEVICE] [-s SEED] [-ngl N] [-pp] [-v]\n", argv[0], argv[0]);
             return 1;
         }
     }
@@ -749,6 +1095,14 @@ int main(int argc, char ** argv) {
             printf("unknown device %s\n", device.c_str());
             return 1;
         }
+    }
+
+    if (graphs) {
+        go.filter = filter;
+        go.dev    = dev;
+        go.seed   = seed;
+        kcpp_pipeline_parallelism = go.pp;
+        return g_child_path.empty() ? g_main(go, argv) : g_child(go, g_child_path);
     }
 
     const std::vector<llama_token> tokens = get_tokens(128, 128, seed);

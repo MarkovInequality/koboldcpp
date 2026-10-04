@@ -65,6 +65,9 @@ models-mnt
 /hessian-collect*
 /hessian-tokenize
 /test-hessian
+/llama-bench-cuda
+/tools/perf/stall
+/tools/perf/bench-mmvq
 /tools/hessian/hessian-tests/
 /tools/hessian/calib/work/
 /tools/hessian/eval/work/
@@ -72,6 +75,7 @@ models-mnt
 /gguf-split
 /test-backend-ops
 /test-save-load-state*
+/test-recurrent-state-rollback*
 /bench-rht
 /ggml/src/ggml-cuda/**/*.d
 /ggml/src/ggml-cuda/.flags

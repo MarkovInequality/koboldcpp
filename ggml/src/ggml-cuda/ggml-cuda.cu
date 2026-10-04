@@ -1926,6 +1926,18 @@ static int64_t ggml_backend_cuda_rht_fused_count(void) {
     return ggml_cuda_rht_fused_count();
 }
 
+// CUDA graph launches and captures since load, for tests
+static std::atomic<int64_t> ggml_cuda_graph_launches{0};
+static std::atomic<int64_t> ggml_cuda_graph_captures{0};
+
+static int64_t ggml_backend_cuda_graph_launch_count(void) {
+    return ggml_cuda_graph_launches.load();
+}
+
+static int64_t ggml_backend_cuda_graph_capture_count(void) {
+    return ggml_cuda_graph_captures.load();
+}
+
 // the RHT node whose rows t holds unchanged and in order: the RHT itself or a reshape of it that keeps the row
 // width, so either carries the same Q8_1 bytes; nullptr if none
 static const ggml_tensor * ggml_cuda_rht_rows_of(const ggml_tensor * t) {
@@ -4599,6 +4611,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
             graph_evaluated_or_captured = true; // CUDA graph has been captured
+            ggml_cuda_graph_captures++;
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
             if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
@@ -4619,6 +4632,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        ggml_cuda_graph_launches++;
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
@@ -6068,6 +6082,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_rht_fused_count") == 0) {
         return (void *)ggml_backend_cuda_rht_fused_count;
+    }
+    if (strcmp(name, "ggml_backend_cuda_graph_launch_count") == 0) {
+        return (void *)ggml_backend_cuda_graph_launch_count;
+    }
+    if (strcmp(name, "ggml_backend_cuda_graph_capture_count") == 0) {
+        return (void *)ggml_backend_cuda_graph_capture_count;
     }
     if (strcmp(name, "ggml_backend_cuda_rht_fusion_pays") == 0) {
         return (void *)ggml_cuda_rht_fusion_pays;
