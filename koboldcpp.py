@@ -118,6 +118,7 @@ maxctx = default_maxctx
 maxhordectx = 0 #set to whatever maxctx is if 0
 maxhordelen = 1024
 modelbusy = threading.Lock()
+tts_lock = threading.Lock() #tts has its own state, so it can run concurrently with other gens
 batched_lock = threading.Lock()
 batched_cond = threading.Condition(batched_lock)
 batched_request_runner_count = 0 #incremented when a batched request is running, prevents all non-batched requests
@@ -7376,7 +7377,9 @@ Change Mode<br>
         if muint > 0 and requestsinqueue < multiuserlimit:
             reqblocking = True
             requestsinqueue += 1
-        if not modelbusy.acquire(blocking=reqblocking):
+        is_tts_path = clean_path.endswith('/api/extra/tts') or clean_path.endswith('/v1/audio/speech') or clean_path=="/audio/speech" or clean_path.endswith('/tts_to_audio')
+        reqlock = tts_lock if is_tts_path else modelbusy
+        if not reqlock.acquire(blocking=reqblocking):
             self.send_response(503)
             self.end_headers(content_type='application/json')
             self.wfile.write(json.dumps({"detail": {
@@ -7506,7 +7509,7 @@ Change Mode<br>
                     is_oai_imgedit = True
             elif clean_path.endswith('/api/extra/transcribe') or clean_path.endswith('/v1/audio/transcriptions') or clean_path=="/audio/transcriptions":
                 is_transcribe = True
-            elif clean_path.endswith('/api/extra/tts') or clean_path.endswith('/v1/audio/speech') or clean_path=="/audio/speech" or clean_path.endswith('/tts_to_audio'):
+            elif is_tts_path:
                 is_tts = True
             elif clean_path.endswith('/api/extra/embeddings') or clean_path.endswith('/v1/embeddings') or clean_path=="/api/embed":
                 is_embeddings = True
@@ -7602,7 +7605,7 @@ Change Mode<br>
                     bring_terminal_to_foreground()
 
                 #if it's a non-batchable request and we already have batching ongoing, stall this request
-                if batched_request_runner_count > 0 and not continuous_batching_python_eligible(genparams, api_format):
+                if batched_request_runner_count > 0 and not is_tts and not continuous_batching_python_eligible(genparams, api_format):
                     with batched_cond:
                         while batched_request_runner_count > 0:
                             batched_cond.wait()
@@ -8044,7 +8047,7 @@ Change Mode<br>
                     batched_request_runner_count -= 1
                     batched_cond.notify_all()
             else:
-                modelbusy.release()
+                reqlock.release()
 
         self.send_response(404)
         self.end_headers(content_type='text/html')

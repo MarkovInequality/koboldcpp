@@ -2512,11 +2512,45 @@ llm_graph_params llama_context::graph_params(
     };
 }
 
+// true when no matmul/attention/rope node runs on the host (rope covers K-shift with a host KV cache),
+// e.g. a fully offloaded model whose only CPU node is the token-embedding GET_ROWS
+static bool graph_host_work_is_light(ggml_backend_sched_t sched, ggml_cgraph * gf) {
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        switch (node->op) {
+            case GGML_OP_MUL_MAT:
+            case GGML_OP_MUL_MAT_ID:
+            case GGML_OP_OUT_PROD:
+            case GGML_OP_FLASH_ATTN_EXT:
+            case GGML_OP_ROPE:
+                break;
+            default:
+                continue;
+        }
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, node);
+        if (backend == nullptr) {
+            return false;
+        }
+        const auto type = ggml_backend_dev_type(ggml_backend_get_device(backend));
+        if (type == GGML_BACKEND_DEVICE_TYPE_CPU || type == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+            return false;
+        }
+    }
+    return true;
+}
+
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
                    bool   batched) {
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
+
+    // kicking a polling threadpool for trivial host work leaves its workers spinning between graphs,
+    // starving anything else on the CPU (e.g. CPU TTS running alongside GPU generation)
+    if (n_threads > 1 && graph_host_work_is_light(sched.get(), gf)) {
+        n_threads = 1;
+        tp        = nullptr;
+    }
 
     if (backend_cpu != nullptr) {
         auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
