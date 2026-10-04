@@ -323,6 +323,21 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
         }
     }
 
+    // a batch of 32+ tokens fills the tile's columns with them: pad no Q heads, take the largest power of two that
+    // divides the GQA ratio (a small batch packs the heads instead, up to 8)
+    if constexpr (DKQ <= 256) {
+        if (use_gqa_opt && Q->ne[1] >= 32 && gqa_ratio % 8 != 0) {
+            if (gqa_ratio % 4 == 0) {
+                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
+            } else if (gqa_ratio % 2 == 0) {
+                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
+            } else {
+                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 1>(ctx, dst);
+            }
+            return;
+        }
+    }
+
     if (use_gqa_opt && gqa_ratio > 4) {
         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
         return;

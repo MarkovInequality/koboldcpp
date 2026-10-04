@@ -11300,6 +11300,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // prefill batches at GQA ratios that aren't powers of two, which take Q-head tiles that divide the ratio
+    for (int hs : { 128, 256 }) {
+        for (int gqa : { 3, 5, 6, 7, 8 }) {
+            for (int nb : { 32, 77, 512 }) {
+                for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q5_1 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {gqa, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                }
+            }
+        }
+    }
+
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
             if (hsk != 96 && hsk != 192 && hsk != 320 && hsk != 576 && hsk != hsv) continue;
