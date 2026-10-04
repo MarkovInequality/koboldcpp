@@ -6678,7 +6678,9 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
             }
             else if(file_format == FileFormat::GGUF_GENERIC)
             {
-                if(guidance_ctx && negprompt_tokens.size()>0 && inputs.guidance_scale!=1.0f && embd.size()==1 && startedsampling)
+                // guidance mixes one negative-prompt row into each sampled row, so it can't verify a drafted batch
+                const bool guidance_active = guidance_ctx && negprompt_tokens.size()>0 && inputs.guidance_scale!=1.0f;
+                if(guidance_active && embd.size()==1 && startedsampling)
                 {
                     //eval for negative prompt
                     kcpp_embd_batch gbatch = kcpp_embd_batch(embd, guidance_n_past, use_mrope, false);
@@ -6689,7 +6691,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                     }
                     guidance_n_past += 1;
                 }
-                if(embd.size()!=1 || draft_ctx==nullptr || draft_spec==nullptr || remaining_tokens<=1 || grammar!=nullptr || startedsampling==false) //for large batch, or if no draft model, PP/TG as usual
+                if(embd.size()!=1 || draft_ctx==nullptr || draft_spec==nullptr || remaining_tokens<=1 || grammar!=nullptr || guidance_active || startedsampling==false) //for large batch, or if no draft model, PP/TG as usual
                 {
                     draft_used = false;
                     kcpp_embd_batch batch = kcpp_embd_batch(embd, n_past, use_mrope, false);
