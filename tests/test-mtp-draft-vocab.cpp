@@ -1,6 +1,8 @@
 // The reduced MTP draft head (llama_set_draft_n_vocab): an MTP context with a draft vocabulary gives logits whose
-// kept rows ([0, N) and the control/end-of-generation tail) are bitwise the full head's and whose other rows are
-// -inf, for a 5-row batch and for single-token draft steps, against an MTP context with the full head.
+// kept rows ([0, N) and the control/end-of-generation tail) are the full head's and whose other rows are -inf, for
+// a 5-row batch and for single-token draft steps, against an MTP context with the full head. Bitwise, except the
+// tail in a multi-row batch: its own small matmul may take another block shape than the full head's (the Blackwell
+// MMVQ table widens launches with few warps in flight), so there within 1e-4 relative.
 //
 // usage: test-mtp-draft-vocab MODEL [N]   (a model with MTP layers; N defaults to 65536)
 
@@ -93,17 +95,21 @@ int main(int argc, char ** argv) {
         for (int i = 0; i < n; ++i) {
             const float * a = llama_get_logits_ith(full, i);
             const float * b = llama_get_logits_ith(red, i);
-            int n_diff = 0, n_not_inf = 0;
+            int n_diff = 0, n_tail_diff = 0, n_tail_far = 0, n_not_inf = 0;
             for (int32_t t = 0; t < n_vocab; ++t) {
-                if (t < n_draft || t >= tail) {
+                if (t < n_draft) {
                     n_diff += memcmp(&a[t], &b[t], sizeof(float)) != 0;
+                } else if (t >= tail) {
+                    n_tail_diff += memcmp(&a[t], &b[t], sizeof(float)) != 0;
+                    n_tail_far  += !(std::fabs(a[t] - b[t]) <= 1e-4f*(1.0f + std::fabs(a[t])));
                 } else {
                     n_not_inf += !(std::isinf(b[t]) && b[t] < 0);
                 }
             }
-            const bool ok = n_diff == 0 && n_not_inf == 0;
-            printf("  batch of %d, row %d: kept rows %s, dropped rows %s  %s\n", n, i,
+            const bool ok = n_diff == 0 && n_not_inf == 0 && (n == 1 ? n_tail_diff == 0 : n_tail_far == 0);
+            printf("  batch of %d, row %d: head rows %s, tail rows %s, dropped rows %s  %s\n", n, i,
                    n_diff ? (std::to_string(n_diff) + " differ").c_str() : "bitwise equal",
+                   n_tail_diff ? (std::to_string(n_tail_diff) + " differ, " + std::to_string(n_tail_far) + " beyond 1e-4").c_str() : "bitwise equal",
                    n_not_inf ? (std::to_string(n_not_inf) + " not -inf").c_str() : "-inf", ok ? "ok" : "FAIL");
             fails += !ok;
         }
