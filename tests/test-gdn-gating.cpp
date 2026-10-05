@@ -1,7 +1,9 @@
-// The gated-delta-net gating on CUDA: beta = sigmoid(beta projection) and g = softplus(alpha projection + dt)*a, as
-// qwen35 builds them, feeding a GDN that reads its state from the cache and writes its snapshots back. The backend
-// computes the gating inside the GDN (ggml_backend_cuda_gdn_gating_count); with g also a graph output it runs the
-// gating nodes instead. Both must give the same bytes: the kernel uses the unary ops' own helpers.
+// A gated-delta-net layer on CUDA as qwen35 builds it: beta = sigmoid(beta projection) and g = softplus(alpha
+// projection + dt)*a, q and k L2-normed heads of the conv output, and a GDN that reads its state from the cache and
+// writes its snapshots back. Two variants must give the same bytes:
+// - the gating computed inside the GDN (ggml_backend_cuda_gdn_gating_count) and, with g also a graph output, by the
+//   gating nodes: the kernel uses the unary ops' own helpers;
+// - q and k normed by one op over both (build_gdn_l2_norm_qk) and each by its own.
 //
 // usage: test-gdn-gating [-v]
 
@@ -11,6 +13,7 @@
 #include "ggml-cuda.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -19,15 +22,20 @@
 #include <vector>
 
 struct gdn_case {
-    int64_t H, S_v, n_tokens, n_seqs, K;
+    int64_t H, H_k, S_v, n_tokens, n_seqs, K;
 };
 
+static ggml_tensor * l2_norm(ggml_context * ctx, ggml_tensor * x) {
+    const float n = x->ne[0];
+    return ggml_scale(ctx, ggml_rms_norm(ctx, x, 1e-6f/n), 1.0f/sqrtf(n));
+}
+
 // the attention output and the cache after the snapshots
-static std::vector<float> run(ggml_backend_t backend, const gdn_case & c, bool g_output) {
+static std::vector<float> run(ggml_backend_t backend, const gdn_case & c, bool g_output, bool merged_qk) {
     ggml_init_params ip = { 64*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(ip);
 
-    const int64_t H = c.H, S_v = c.S_v, T = c.n_tokens, S = c.n_seqs, D = S_v*S_v*H, n_embd = 512;
+    const int64_t H = c.H, H_k = c.H_k, S_v = c.S_v, T = c.n_tokens, S = c.n_seqs, D = S_v*S_v*H, n_embd = 512;
     const int64_t n_rows    = c.K + 2;
     const int64_t n_written = std::min(T, c.K);
 
@@ -36,8 +44,7 @@ static std::vector<float> run(ggml_backend_t backend, const gdn_case & c, bool g
     ggml_tensor * w_alpha = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, H);
     ggml_tensor * dt      = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
     ggml_tensor * a       = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
-    ggml_tensor * q       = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, T, S);
-    ggml_tensor * k       = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, T, S);
+    ggml_tensor * qk_in   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, S_v*(2*H_k + 1), T, S);
     ggml_tensor * v       = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, T, S);
     ggml_tensor * states  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_rows*S);
     ggml_tensor * idx     = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, S);
@@ -50,8 +57,21 @@ static std::vector<float> run(ggml_backend_t backend, const gdn_case & c, bool g
     }
     gate = ggml_reshape_4d(ctx, gate, 1, H, T, S);
 
+    // q and k heads of a wider row, as in the conv output
+    const size_t  hs = ggml_row_size(GGML_TYPE_F32, S_v);
+    ggml_tensor * q  = ggml_view_4d(ctx, qk_in, S_v, H_k, T, S, hs, qk_in->nb[1], qk_in->nb[2], 0);
+    ggml_tensor * k  = ggml_view_4d(ctx, qk_in, S_v, H_k, T, S, hs, qk_in->nb[1], qk_in->nb[2], H_k*hs);
+    if (merged_qk) {
+        ggml_tensor * qk = l2_norm(ctx, ggml_view_4d(ctx, qk_in, S_v, 2*H_k, T, S, hs, qk_in->nb[1], qk_in->nb[2], 0));
+        q = ggml_view_4d(ctx, qk, S_v, H_k, T, S, qk->nb[1], qk->nb[2], qk->nb[3], 0);
+        k = ggml_view_4d(ctx, qk, S_v, H_k, T, S, qk->nb[1], qk->nb[2], qk->nb[3], H_k*qk->nb[1]);
+    } else {
+        q = l2_norm(ctx, q);
+        k = l2_norm(ctx, k);
+    }
+
     ggml_tensor * state = ggml_reshape_4d(ctx, ggml_get_rows(ctx, states, idx), S_v, S_v, H, S);
-    ggml_tensor * out   = ggml_gated_delta_net(ctx, ggml_l2_norm(ctx, q, 1e-6f), ggml_l2_norm(ctx, k, 1e-6f), v, gate, beta, state, c.K);
+    ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, gate, beta, state, c.K);
     ggml_tensor * src   = ggml_view_3d(ctx, out, D, S, n_written, ggml_row_size(out->type, D),
             ggml_row_size(out->type, D*S), ggml_row_size(out->type, S_v*H*T*S));
     ggml_tensor * dst   = ggml_view_3d(ctx, states, D, S, n_written, states->nb[1], S*states->nb[1], 0);
@@ -66,7 +86,7 @@ static std::vector<float> run(ggml_backend_t backend, const gdn_case & c, bool g
 
     std::mt19937 rng(42);
     std::uniform_real_distribution<float> ud(-1.0f, 1.0f);
-    for (ggml_tensor * t : { x, w_beta, w_alpha, dt, a, q, k, v, states }) {
+    for (ggml_tensor * t : { x, w_beta, w_alpha, dt, a, qk_in, v, states }) {
         std::vector<float> d(ggml_nelements(t));
         for (auto & e : d) {
             e = t == a ? -0.1f - 1.9f*(ud(rng) + 1.0f)/2 : ud(rng); // a = -exp(A_log)
@@ -106,26 +126,30 @@ int main(int argc, char ** argv) {
     for (int64_t S : { 1, 2 }) {
         for (int64_t T : { 1, 5, 64 }) {
             for (int64_t K : { 1, 5 }) {
-                cases.push_back({ 48, 128, T, S, K });
+                cases.push_back({ 48, 16, 128, T, S, K });
             }
         }
     }
-    cases.push_back({ 16, 64, 5, 1, 5 });
+    cases.push_back({ 16, 16, 64, 5, 1, 5 });
 
     int fails = 0;
     for (const auto & c : cases) {
         const int64_t n0 = gating_count();
-        const std::vector<float> fused = run(backend, c, false);
+        const std::vector<float> fused = run(backend, c, false, false);
         const int64_t n1 = gating_count();
-        const std::vector<float> ref = run(backend, c, true);
+        const std::vector<float> ref = run(backend, c, true, false);
         const int64_t n2 = gating_count();
+        const std::vector<float> merged = run(backend, c, false, true);
 
-        const bool same = memcmp(fused.data(), ref.data(), fused.size()*sizeof(float)) == 0;
-        const bool ok   = same && n1 > n0 && n2 == n1;
+        const bool same_gating = memcmp(fused.data(), ref.data(), fused.size()*sizeof(float)) == 0;
+        const bool same_qk     = memcmp(fused.data(), merged.data(), fused.size()*sizeof(float)) == 0;
+        const bool counted     = n1 > n0 && n2 == n1;
+        const bool ok          = same_gating && same_qk && counted;
         if (!ok || verbose) {
-            printf("  H %2lld S_v %3lld tokens %2lld seqs %lld K %lld: %s%s%s\n", (long long) c.H, (long long) c.S_v,
-                   (long long) c.n_tokens, (long long) c.n_seqs, (long long) c.K, same ? "bitwise equal" : "differ",
-                   n1 > n0 && n2 == n1 ? "" : " (fusion counter wrong)", ok ? "" : "  FAIL");
+            printf("  H %2lld/%2lld S_v %3lld tokens %2lld seqs %lld K %lld: gating %s, merged q/k norm %s%s%s\n",
+                   (long long) c.H, (long long) c.H_k, (long long) c.S_v, (long long) c.n_tokens, (long long) c.n_seqs,
+                   (long long) c.K, same_gating ? "bitwise equal" : "differs", same_qk ? "bitwise equal" : "differs",
+                   counted ? "" : " (fusion counter wrong)", ok ? "" : "  FAIL");
         }
         fails += !ok;
     }

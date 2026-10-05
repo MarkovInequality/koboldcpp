@@ -7,6 +7,7 @@
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
 #include <map>
+#include <tuple>
 
 class llama_memory_hybrid_idx_context;
 
@@ -15,6 +16,19 @@ static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor * 
     const float n = x->ne[0];
 
     return ggml_scale(ctx, ggml_rms_norm(ctx, x, eps/n), 1.0f/sqrtf(n));
+}
+
+// q and k as adjacent heads of one tensor (the gated-delta-net conv output) normed by one op over both; their views of
+// the result are not contiguous, which the fused gated_delta_net op reads through the strides
+static inline std::pair<ggml_tensor *, ggml_tensor *> build_gdn_l2_norm_qk(ggml_context * ctx, ggml_tensor * q, ggml_tensor * k, float eps) {
+    GGML_ASSERT(q->view_src && k->view_src == q->view_src && ggml_are_same_shape(q, k) && ggml_are_same_stride(q, k) &&
+                k->view_offs == q->view_offs + q->ne[1]*q->nb[1]);
+    ggml_tensor * qk = ggml_view_4d(ctx, q->view_src, q->ne[0], 2*q->ne[1], q->ne[2], q->ne[3], q->nb[1], q->nb[2], q->nb[3], q->view_offs);
+    qk = build_gdn_l2_norm(ctx, qk, eps);
+    return {
+        ggml_view_4d(ctx, qk, q->ne[0], q->ne[1], q->ne[2], q->ne[3], qk->nb[1], qk->nb[2], qk->nb[3], 0),
+        ggml_view_4d(ctx, qk, q->ne[0], q->ne[1], q->ne[2], q->ne[3], qk->nb[1], qk->nb[2], qk->nb[3], q->ne[1]*qk->nb[1]),
+    };
 }
 
 //
