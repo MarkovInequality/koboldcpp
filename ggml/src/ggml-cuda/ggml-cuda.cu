@@ -93,6 +93,7 @@ bool g_mul_mat_q = true;
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
@@ -3680,25 +3681,108 @@ static const ggml_tensor * ggml_cuda_gdn_state_rows(const ggml_cgraph * cgraph, 
     return rows;
 }
 
-// node i is a GET_ROWS whose GDN reads the state in place
-static bool ggml_cuda_gdn_state_rows_skipped(const ggml_cgraph * cgraph, int i) {
-    static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-    const ggml_tensor * rows = cgraph->nodes[i];
-    if (disable_fusion || rows->op != GGML_OP_GET_ROWS) {
+// g = [reshape](mul(softplus(add(alpha, dt)), a)) and beta = [reshape](sigmoid(beta_in)) as the gated-delta-net models
+// compute the gating, each node used once: the GDN computes them from alpha, dt, a and beta_in and the nodes are skipped
+struct ggml_cuda_gdn_gating_match {
+    ggml_cuda_gdn_gating gating;
+    const ggml_tensor *  alpha   = nullptr;
+    const ggml_tensor *  beta_in = nullptr;
+    const ggml_tensor *  skipped[4]; // add, softplus, mul, sigmoid
+};
+
+static bool ggml_cuda_match_gdn_gating(const ggml_cgraph * cgraph, const ggml_tensor * gdn, ggml_cuda_gdn_gating_match & m) {
+    auto use_count = [&](const ggml_tensor * t) {
+        const size_t pos = ggml_hash_find(&cgraph->visited_hash_set, t);
+        return ggml_bitset_get(cgraph->visited_hash_set.used, pos) ? cgraph->use_counts[pos] : 0;
+    };
+    // computed in the graph, used only by the next node of the chain
+    auto inner = [&](const ggml_tensor * t, ggml_op op) {
+        return t->op == op && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && use_count(t) == 1 &&
+            !(t->flags & GGML_TENSOR_FLAG_OUTPUT);
+    };
+    auto per_head = [&](const ggml_tensor * t, int64_t H) {
+        return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->ne[0] == H && ggml_nelements(t) == H;
+    };
+    if (gdn->op != GGML_OP_GATED_DELTA_NET) {
         return false;
     }
-    const ggml_tensor * reshape = nullptr;
-    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
-        const ggml_tensor * n = cgraph->nodes[j];
-        if (!reshape) {
-            if (n->op == GGML_OP_RESHAPE && n->src[0] == rows) {
-                reshape = n;
-            }
-        } else if (n->op == GGML_OP_GATED_DELTA_NET && n->src[5] == reshape) {
-            return ggml_cuda_gdn_state_rows(cgraph, n) == rows;
+    const ggml_tensor * g    = gdn->src[3];
+    const ggml_tensor * beta = gdn->src[4];
+    const int64_t       H    = gdn->src[2]->ne[1];
+    if (g->ne[0] != 1) {
+        return false;
+    }
+    const ggml_tensor * mul = g;
+    if (g->op == GGML_OP_RESHAPE) {
+        if (use_count(g) != 1 || (g->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return false;
+        }
+        mul = g->src[0];
+    }
+    if (!inner(mul, GGML_OP_MUL) || mul->ne[0] != H || ggml_nelements(mul) != ggml_nelements(g)) {
+        return false;
+    }
+    const ggml_tensor * sp = mul->src[0];
+    const ggml_tensor * a  = mul->src[1];
+    if (!inner(sp, GGML_OP_UNARY) || ggml_get_unary_op(sp) != GGML_UNARY_OP_SOFTPLUS || !per_head(a, H)) {
+        return false;
+    }
+    const ggml_tensor * add = sp->src[0];
+    if (!inner(add, GGML_OP_ADD)) {
+        return false;
+    }
+    const ggml_tensor * alpha = add->src[0];
+    const ggml_tensor * dt    = add->src[1];
+    if (alpha->type != GGML_TYPE_F32 || !ggml_is_contiguous(alpha) || !ggml_are_same_shape(alpha, add) || !per_head(dt, H)) {
+        return false;
+    }
+    const ggml_tensor * sg = beta;
+    if (beta->op == GGML_OP_RESHAPE) {
+        if (use_count(beta) != 1 || (beta->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return false;
+        }
+        sg = beta->src[0];
+    }
+    if (!inner(sg, GGML_OP_UNARY) || ggml_get_unary_op(sg) != GGML_UNARY_OP_SIGMOID || ggml_nelements(sg) != ggml_nelements(g)) {
+        return false;
+    }
+    const ggml_tensor * beta_in = sg->src[0];
+    if (beta_in->type != GGML_TYPE_F32 || !ggml_is_contiguous(beta_in) || !ggml_are_same_shape(beta_in, sg)) {
+        return false;
+    }
+    m.gating     = { (const float *) alpha->data, (const float *) dt->data, (const float *) a->data, (const float *) beta_in->data };
+    m.alpha      = alpha;
+    m.beta_in    = beta_in;
+    m.skipped[0] = add;
+    m.skipped[1] = sp;
+    m.skipped[2] = mul;
+    m.skipped[3] = sg;
+    return true;
+}
+
+// the nodes the GDN fusions make redundant in the graph being evaluated on this thread: the state gathers a GDN reads
+// in place and the gating nodes it computes itself
+static thread_local std::unordered_set<const ggml_tensor *> ggml_cuda_gdn_skipped;
+
+static void ggml_cuda_gdn_plan_skips(const ggml_cgraph * cgraph) {
+    static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+    ggml_cuda_gdn_skipped.clear();
+    if (disable_fusion) {
+        return;
+    }
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_GATED_DELTA_NET) {
+            continue;
+        }
+        if (const ggml_tensor * rows = ggml_cuda_gdn_state_rows(cgraph, node)) {
+            ggml_cuda_gdn_skipped.insert(rows);
+        }
+        ggml_cuda_gdn_gating_match m;
+        if (ggml_cuda_match_gdn_gating(cgraph, node, m)) {
+            ggml_cuda_gdn_skipped.insert(std::begin(m.skipped), std::end(m.skipped));
         }
     }
-    return false;
 }
 
 // concat(conv state, x^T) -> copies of its conv windows (rollback snapshots) -> ssm_conv -> [bias add] -> silu,
@@ -3761,6 +3845,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // in place (its gather was skipped)
     if (node->op == GGML_OP_GATED_DELTA_NET) {
         const ggml_tensor * state_rows = ggml_cuda_gdn_state_rows(cgraph, node);
+        ggml_cuda_gdn_gating_match gating_match;
+        const ggml_cuda_gdn_gating * gating = ggml_cuda_match_gdn_gating(cgraph, node, gating_match) ? &gating_match.gating : nullptr;
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
         const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
         if (nodes_to_skip > 0) {
@@ -3768,11 +3854,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             GGML_LOG_INFO("%s: fused gated_delta_net snapshot copies for %s (skipped %d nodes)\n",
                           __func__, node->name, nodes_to_skip);
 #endif
-            ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy, state_rows);
+            ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy, state_rows, gating);
             return nodes_to_skip;
         }
-        if (state_rows) {
-            ggml_cuda_op_gated_delta_net(*cuda_ctx, node, state_rows);
+        if (state_rows || gating) {
+            ggml_cuda_op_gated_delta_net(*cuda_ctx, node, state_rows, gating);
             return GGML_CUDA_FUSED_NODE_ONLY;
         }
     }
@@ -4605,6 +4691,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             ggml_cuda_rht_plan_q8_1(cuda_ctx, cgraph);
+            ggml_cuda_gdn_plan_skips(cgraph);
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
@@ -4648,7 +4735,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                if (ggml_cuda_gdn_state_rows_skipped(cgraph, i)) {
+                if (ggml_cuda_gdn_skipped.count(node)) {
                     continue;
                 }
 
@@ -4696,6 +4783,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             ggml_cuda_src1_fmts.clear();
+            ggml_cuda_gdn_skipped.clear();
         }
 
 #ifdef USE_CUDA_GRAPH
@@ -4988,11 +5076,17 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         ggml_cuda_glu_add_alloc_deps(cgraph, params);
         ggml_cuda_rht_add_alloc_deps(cgraph, params);
 
-        // a GDN reading its state in place reads the gather's row index
+        // a GDN reading its state in place reads the gather's row index; computing its gating, the gating's inputs
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             const ggml_tensor * rows = ggml_cuda_gdn_state_rows(cgraph, cgraph->nodes[i]);
             if (rows) {
                 params->add_alloc_dep(params->user_data, rows->src[1], cgraph->nodes[i]);
+            }
+            ggml_cuda_gdn_gating_match m;
+            if (ggml_cuda_match_gdn_gating(cgraph, cgraph->nodes[i], m)) {
+                for (const ggml_tensor * t : { m.alpha, m.beta_in }) {
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(t->view_src ? t->view_src : t), cgraph->nodes[i]);
+                }
             }
         }
 
@@ -6282,6 +6376,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_gdn_state_in_place_count") == 0) {
         return (void *)ggml_cuda_gdn_state_in_place_count;
+    }
+    if (strcmp(name, "ggml_backend_cuda_gdn_gating_count") == 0) {
+        return (void *)ggml_cuda_gdn_gating_count;
     }
     if (strcmp(name, "ggml_backend_cuda_ssm_conv_update_count") == 0) {
         return (void *)ggml_cuda_ssm_conv_update_count;

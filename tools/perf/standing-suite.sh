@@ -30,7 +30,7 @@ step() {
 
 make LLAMA_CUBLAS=1 -j8 test-backend-ops test-hadamard-archs-cuda test-hadamard-archs-cuda-novmm \
     test-save-load-state-cuda test-recurrent-state-rollback-cuda test-recurrent-state-rollback test-kcpp-sampler \
-    test-fattn-mma-q test-mtp-draft-vocab-cuda koboldcpp_cublas \
+    test-fattn-mma-q test-gdn-gating test-mtp-draft-vocab-cuda koboldcpp_cublas \
     > "$log/build.log" 2>&1 || { echo "build failed, see $log/build.log"; exit 1; }
 
 # cases that assert the global fusion/RHT counters run on one thread
@@ -40,6 +40,7 @@ step "test-backend-ops ops"       ./test-backend-ops -b CUDA0 -j 4 -o "$ops"
 step "test-backend-ops RHT and fusion cases" ./test-backend-ops -b CUDA0 -o "$counted"
 step "test-kcpp-sampler"          ./test-kcpp-sampler
 step "test-fattn-mma-q"           ./test-fattn-mma-q
+step "test-gdn-gating"            ./test-gdn-gating
 step "test-mtp-draft-vocab-cuda"  ./test-mtp-draft-vocab-cuda "$model"
 step "test-hadamard-archs-cuda"   ./test-hadamard-archs-cuda -d CUDA0
 step "test-hadamard-archs-cuda -g" ./test-hadamard-archs-cuda -g

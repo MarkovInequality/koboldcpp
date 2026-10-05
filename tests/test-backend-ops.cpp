@@ -9555,6 +9555,140 @@ struct test_gdn_state_in_place : public test_case {
     }
 };
 
+// A gated-delta-net layer's gating as qwen35 builds it: beta = sigmoid(beta projection), g = softplus(alpha projection
+// + dt)*a, the projections being matmuls of the layer input, feeding a GDN whose state is gathered from the cache and
+// whose snapshots go back to it. The CUDA backend computes the gating in the GDN; its counter must show that, and
+// never when beta has a second consumer or g is an output.
+enum test_gdn_gating_kind {
+    GDN_GATING,
+    GDN_GATING_BETA_TWO_USES,
+    GDN_GATING_G_OUTPUT,
+};
+
+struct test_gdn_gating : public test_case {
+    const test_gdn_gating_kind kind;
+    const int64_t head_count, head_size, n_tokens, n_seqs, K;
+
+    int64_t count0  = -1;
+    int     checked = -1;
+    std::vector<ggml_tensor *> check_nodes;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET_GATING";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR6(kind, head_count, head_size, n_tokens, n_seqs, K);
+    }
+
+    test_gdn_gating(test_gdn_gating_kind kind, int64_t head_count, int64_t head_size, int64_t n_tokens, int64_t n_seqs, int64_t K)
+        : kind(kind), head_count(head_count), head_size(head_size), n_tokens(n_tokens), n_seqs(n_seqs), K(K) {}
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return check_nodes; }
+
+    // the projections are F32 matmuls, summed in another order than on the CPU, and the state carries it over tokens
+    double max_nmse_err() override {
+        return 5e-6;
+    }
+
+    static int64_t gating_count() {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+        auto fn = reg ? (int64_t (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_gdn_gating_count") : nullptr;
+        return fn ? fn() : -1;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        count0  = gating_count();
+        checked = -1;
+        check_nodes.clear();
+
+        const int64_t S_v = head_size, H = head_count, D = S_v*S_v*H, n_embd = 256;
+        const int64_t n_rows    = K + 2;
+        const int64_t n_written = std::min<int64_t>(n_tokens, K);
+
+        ggml_tensor * x       = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_tokens, n_seqs);
+        ggml_tensor * w_beta  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, H);
+        ggml_tensor * w_alpha = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, H);
+        ggml_tensor * dt      = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+        ggml_tensor * a       = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+        ggml_tensor * q       = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, n_tokens, n_seqs);
+        ggml_tensor * k       = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, n_tokens, n_seqs);
+        ggml_tensor * v       = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, n_tokens, n_seqs);
+        ggml_tensor * states  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_rows*n_seqs);
+        ggml_tensor * idx     = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        ggml_set_name(x, "x");
+        ggml_set_name(dt, "dt");
+        ggml_set_name(a, "a");
+        ggml_set_name(states, "states");
+        ggml_set_name(idx, "idx");
+
+        ggml_tensor * beta = ggml_reshape_4d(ctx, ggml_mul_mat(ctx, w_beta, x), 1, H, n_tokens, n_seqs);
+        beta = ggml_sigmoid(ctx, beta);
+        ggml_tensor * alpha = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, w_alpha, x), H, n_tokens, n_seqs);
+        ggml_tensor * gate  = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, alpha, dt)), a);
+        if (kind == GDN_GATING_G_OUTPUT) {
+            ggml_set_output(gate);
+            check_nodes.push_back(gate);
+        }
+        gate = ggml_reshape_4d(ctx, gate, 1, H, n_tokens, n_seqs);
+
+        ggml_tensor * state = ggml_reshape_4d(ctx, ggml_get_rows(ctx, states, idx), S_v, S_v, H, n_seqs);
+        ggml_tensor * out   = ggml_gated_delta_net(ctx, ggml_l2_norm(ctx, q, 1e-6f), ggml_l2_norm(ctx, k, 1e-6f), v, gate, beta, state, K);
+
+        ggml_tensor * src = ggml_view_3d(ctx, out, D, n_seqs, n_written, ggml_row_size(out->type, D),
+                ggml_row_size(out->type, D*n_seqs), ggml_row_size(out->type, S_v*H*n_tokens*n_seqs));
+        ggml_tensor * dst = ggml_view_3d(ctx, states, D, n_seqs, n_written, states->nb[1], n_seqs*states->nb[1], 0);
+        ggml_tensor * cpy = ggml_cpy(ctx, src, dst);
+        check_nodes.push_back(cpy);
+
+        ggml_tensor * attn = ggml_view_4d(ctx, out, S_v, H, n_tokens, n_seqs, ggml_row_size(out->type, S_v),
+                ggml_row_size(out->type, S_v*H), ggml_row_size(out->type, S_v*H*n_tokens), 0);
+        ggml_tensor * res = ggml_add(ctx, ggml_sum(ctx, cpy), ggml_sum(ctx, attn));
+        if (kind == GDN_GATING_BETA_TWO_USES) {
+            res = ggml_add(ctx, res, ggml_sum(ctx, beta));
+        }
+        ggml_set_name(res, "out");
+        check_nodes.push_back(res);
+        return res;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "idx") == 0) {
+                std::vector<int32_t> rows(n_seqs);
+                for (int64_t s = 0; s < n_seqs; ++s) {
+                    rows[s] = (int32_t) (s*3 % ((K + 2)*n_seqs));
+                }
+                ggml_backend_tensor_set(t, rows.data(), 0, rows.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "a") == 0) {
+                // -exp(A_log)
+                init_tensor_uniform(t, -2.0f, -0.1f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double max_err(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        if (checked < 0) {
+            checked = 1;
+            if (strcmp(ggml_backend_reg_name(reg), "CUDA") == 0 && count0 >= 0) {
+                const char * env    = getenv("GGML_CUDA_DISABLE_FUSION");
+                const bool   expect = !(env && atoi(env)) && kind == GDN_GATING;
+                const bool   done   = gating_count() > count0;
+                if (done != expect) {
+                    printf("[GDN] gating %s, expected %s ", done ? "fused" : "not fused", expect ? "fused" : "not fused");
+                    checked = 0;
+                }
+            }
+        }
+        return checked ? max_nmse_err() : -1.0;
+    }
+};
+
 // Quantized matmuls of 1-8 columns with the epilogues the CUDA backend fuses into MMVQ, as the models build them:
 // gate and up into a GLU, and an add of a same-shape residual on either side. The input is x or its rotation, whose
 // Q8_1 the kernel may then read. The counter must show the fusion exactly where the matmul alone runs MMVQ
@@ -9666,6 +9800,17 @@ struct test_mmvq_fusion : public test_case {
 };
 
 static void make_test_cases_fork(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    for (int64_t n_seqs : { 1, 2 }) {
+        for (int64_t n_tokens : { 1, 5 }) {
+            for (int64_t K : { 1, 5 }) {
+                test_cases.emplace_back(new test_gdn_gating(GDN_GATING, 4, 128, n_tokens, n_seqs, K));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_gdn_gating(GDN_GATING, 48, 128, 5, 1, 5));
+    test_cases.emplace_back(new test_gdn_gating(GDN_GATING_BETA_TWO_USES, 4, 128, 5, 1, 5));
+    test_cases.emplace_back(new test_gdn_gating(GDN_GATING_G_OUTPUT, 4, 128, 5, 1, 5));
+
     // Q4_K and Q6_K leave MMVQ at 6 and 8 columns on some devices
     for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0 }) {
         for (test_mmvq_fusion_kind kind : { MMVQ_FUSION_GLU, MMVQ_FUSION_ADD, MMVQ_FUSION_ADD_SWAPPED, MMVQ_FUSION_ADD_BCAST,
