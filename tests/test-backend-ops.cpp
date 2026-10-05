@@ -12471,6 +12471,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // Qwen3.8-27B gated-delta-net layers (16 k heads, 48 v heads of 128, 5 snapshot slots): decode, the MTP verify
+    // and a prefill ubatch
+    for (int64_t n_tokens : {1, 5, 1024}) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n_tokens, 1, 3, false, false, 5));
+    }
+
     // Qwen3.8-27B matmuls with the epilogues MMVQ fuses, in decode and the MTP verify batch: gate/up into the GLU, and
     // ffn_down and the attention/ssm output projections plus the residual, reading the rotation the HQ weights take
     for (int64_t m : {1, 5}) {
