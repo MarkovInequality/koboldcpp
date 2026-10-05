@@ -953,10 +953,65 @@ gap per verify: spin-polling the events showed the GPU starts within 0.1 ms and 
   head's tail bitwise in a 5-row batch, which the Blackwell table's widened launch for that small matmul rounds
   differently (all within 1e-4); the head rows and the single-token draft steps stay bitwise (7f84a2224).
 
+### After the plan (2026-10-05): 6932598d0, 80960a5dd, 043f43968, 5d1b23b35, d4c86c5c3
+
+After a WSL restart the VM's clock is right again: over 90 s the guest's monotonic clock and Windows agree to 0.16 %
+(9.8 % before). Absolute rates in the records above read ~9 % low; plain decode is now 415 ms per 32 tokens in
+llama-bench where Phase 7 recorded 448.
+
+- **Deep context (finding):** MTP generation after an 88.6k prompt was 41–49 t/s while a cycle inside the loop takes
+  26.5 ms there (24.3 ms at short context: drafts 5.5, verify launch 0.2–1.0, wait 17, sampling 1.0). The rest was
+  SmartCache: hybrid models snapshot their whole state (the 88.6k context's KV is 2.2 GB) at the start of every
+  generation, and koboldcpp turns SmartCache on for them by itself. The time went into the host buffer, not the
+  copy: a buffer too small was freed and a new one faulted in with 4 KB pages, 1.3 s per 2.2 GB against 0.13 s for
+  the device-to-host copy. On WSL2 freed memory goes back to the host within seconds (free page reporting) and
+  costs ~0.4 s/GB to fault in again (0.036 s/GB right after the free).
+- **SmartCache buffers (6932598d0):** on Linux one anonymous mapping with transparent huge pages that grows with
+  mremap, keeping its pages, the kernel faulting in only the tail (MADV_POPULATE_WRITE). Snapshots that grow a slot
+  754–797 → 358–362 ms (1.3 GB); the 88.6k gen-start snapshot 1.9–3.4 → 1.3–1.6 s; in an agentic session the
+  per-turn snapshot is 89–115 ms with no reallocation spikes (the old code paid 461 ms whenever a slot outgrew its
+  headroom). test-kcpp-state-buffer (growth keeps the bytes written, huge pages; both fail with the old vector).
+- **Tools (80960a5dd):** kcpp-e2e `agentic`: a 27.5k-token conversation extended by ~3k tokens of new input per turn,
+  150 tokens generated per turn, `--smartcache 2`; turns at 30–42k tokens take 1.7–2.5 s (~1 s prompt processing,
+  ~1 s generation, ~0.1 s snapshot). `tools/perf/lb-ab.py` replaces the scratch A/B scripts lost with /tmp.
+- **Deferred MTP catch-up (4c's first option): dropped.** With the right clock the catch-up decode costs 0.29 ms
+  of host time per cycle (not 0.49), and its GPU time runs while the CPU samples the verify rows; merged into draft
+  step 1 it would save under 1 % of a cycle.
+- **`--mtpvocab 65536`** re-measured (3 interleaved rounds): short-context MTP generation +5–9 %, generation in the
+  agentic turns +3 %, turn wall −1.9 %. Still off by default.
+- **GDN, two state columns per warp (043f43968):** bitwise; for prompt batches when the one-column grid fills 3/4 of
+  the resident block slots (it lost 34 % at 4.5 blocks per SM and gained 30 % at 12). pp1024 275.1 → 268.9 ms.
+  Register prefetch of the next token was slower again (580 → 860 µs); one fused reduction per token
+  (attn = g S.q + delta k.q) gave only −7 % and is not reproducible across launch shapes without explicit FMAs.
+- **GDN chunked kernels (5d1b23b35, 6c step 3, in FP32 rather than on tensor cores):** prep (T by forward
+  substitution with shuffles, P, decays; k.k and q.k once per q/k head) and a scan over blocks of 16 state columns,
+  the recurrent kernel for the snapshot tail. The first version was slower (813 vs 588 µs); staging k/q in shared
+  memory, fitting 3 blocks per SM, register-tiled products, a bank-conflict-free lane order and the per-q/k-head
+  prep brought the 27B layer at 1024 tokens to 306–316 µs (recurrent 583–587). llama-bench pp1024 268.1 → 248.1
+  ms (−7.5 %), pp512 −6.4 %, verify and decode unchanged.
+  - Accuracy: both kernels at NMSE ≤ 1e-12 against an FP64 recurrence (also with correlated keys and slow decays);
+    on the 27B's real activations each call matches the recurrent kernel to NMSE 1e-13 to 3e-12.
+  - **The model amplifies any rounding change.** Against the recurrent run the chunked one has a self-KL of 0.0014
+    (top-1 99.3 %), but so does the recurrent run itself with 256-token ubatches (0.0016) or a q8_0 K/V cache
+    (0.0013): about a fifth of the model's KL against BF16. KL against BF16 moved within that noise
+    (wiki/heldout/opencode 0.009498/0.008381/0.007022 → 0.009566/0.008600/0.006219), perplexity unchanged.
+    Greedy texts diverged at top-2 gaps of 0.13–0.15 after 9.6k-token prompts; KL checks of future changes should be
+    read against this floor.
+- Prefill at 1024-token ubatches after this batch: 275.1 → 248.1 ms (two GDN commits), with pp5 and tg unchanged.
+- Golden re-recorded after the chunked kernels (d4c86c5c3); the standing suite (now with test-kcpp-state-buffer and
+  the agentic e2e config) passes in full, including the rollback suite on CUDA, without fusion and on the CPU.
+
 ### Open after this plan
 
-- A chunked tensor-core gated-delta-net prefill kernel with a recurrent K-tail (6c step 3): ~17 % of prefill.
-- Deferring the MTP catch-up decode into the first draft step (4c's first option): ~0.49 ms per cycle of wall.
+- Taking the SmartCache gen-start snapshot off the generation path: the attention KV below the prompt end doesn't
+  change while generating, so it could be copied on a second stream after the recurrent state; ~0.1 s per agentic
+  turn now, more at 100k+ tokens. Needs a deferred-copy hook in llama's state writer.
+- The prefill KQ mask at long context: ~3.9 ms per 1024-token ubatch at 48k on the host, plus its upload (100 MB);
+  only the decode/verify masks have the fast path.
 - The MMVQ block shape by K from 5 columns (1 warp over 4 rows for K ≥ 6144): 2.7 % of MMVQ time in isolation,
-  nothing measurable in the graph; worth revisiting with the fused kernels in the sweep.
-- `--mtpvocab 65536` (4b) stays off by default; +5–19 % MTP generation on this model.
+  nothing measurable in the graph.
+- `--mtpvocab 65536` (4b) stays off by default; +5–9 % short-context MTP generation, +3 % in agentic turns.
+- The latent MMVQ bound in MUL_MAT_ID (rows per block not a power of two write past their rows; Phase 6 keeps 4 warps
+  for those launches): an upstream report.
+- Not pursued further: the deferred MTP catch-up (see above); a tensor-core (TF32/BF16) GDN scan, whose rounding would
+  exceed the FP32 kernels' and gains less on consumer Blackwell, where TF32 runs at the FP32 rate.
