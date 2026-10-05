@@ -4537,6 +4537,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // two matmuls of the same input in one MMVQ launch, the second through the gate: e.g. a gated-delta-net layer's
+    // beta and alpha projections, which the models expand next to each other
+    if (node->op == GGML_OP_MUL_MAT && i + 1 < cgraph->n_nodes) {
+        ggml_tensor * mm2 = cgraph->nodes[i + 1];
+        const int out_nodes[] = { i, i + 1 };
+        if (mm2->op == GGML_OP_MUL_MAT && (mm2->flags & GGML_TENSOR_FLAG_COMPUTE) && mm2->src[1] == node->src[1] &&
+                mm2->src[0]->type == node->src[0]->type && ggml_are_same_shape(mm2->src[0], node->src[0]) &&
+                ggml_are_same_stride(mm2->src[0], node->src[0]) && mm2->type == node->type && ggml_are_same_stride(mm2, node) &&
+                ggml_cuda_should_fuse_mul_mat_vec_q(node) && ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 2)) {
+            ggml_cuda_mm_fusion_args_host fusion_data{};
+            fusion_data.gate     = mm2->src[0];
+            fusion_data.gate_dst = mm2;
+            ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], nullptr, node, &fusion_data);
+            return 1;
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
         return 4;

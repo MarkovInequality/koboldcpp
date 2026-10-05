@@ -9690,16 +9690,20 @@ struct test_gdn_gating : public test_case {
 };
 
 // Quantized matmuls of 1-8 columns with the epilogues the CUDA backend fuses into MMVQ, as the models build them:
-// gate and up into a GLU, and an add of a same-shape residual on either side. The input is x or its rotation, whose
-// Q8_1 the kernel may then read. The counter must show the fusion exactly where the matmul alone runs MMVQ
-// (ggml_backend_cuda_mul_mat_runs_mmvq), and with more than one column never for a broadcast bias; never when the
-// matmul is an output.
+// gate and up into a GLU, an add of a same-shape residual on either side, and two matmuls of the same input next to
+// each other (a gated-delta-net layer's beta and alpha). The input is x or its rotation, whose Q8_1 the kernel may then
+// read. The counter must show the fusion exactly where the matmul alone runs MMVQ (ggml_backend_cuda_mul_mat_runs_mmvq),
+// and with more than one column never for a broadcast bias; never when the matmul is an output or the pair's weights
+// differ in type or shape.
 enum test_mmvq_fusion_kind {
     MMVQ_FUSION_GLU,
     MMVQ_FUSION_ADD,           // mm + r
     MMVQ_FUSION_ADD_SWAPPED,   // r + mm
     MMVQ_FUSION_ADD_BCAST,     // mm + b, b one column
     MMVQ_FUSION_ADD_MM_OUTPUT, // mm + r, mm an output
+    MMVQ_FUSION_PAIR,          // mm and mm2 of the same input
+    MMVQ_FUSION_PAIR_TYPES,    // mm2's weight of another type
+    MMVQ_FUSION_PAIR_SHAPES,   // mm2's weight of another shape
 };
 
 struct test_mmvq_fusion : public test_case {
@@ -9759,6 +9763,12 @@ struct test_mmvq_fusion : public test_case {
             case MMVQ_FUSION_GLU:
                 out = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, type, k, n), in), mm);
                 break;
+            case MMVQ_FUSION_PAIR:
+            case MMVQ_FUSION_PAIR_TYPES:
+            case MMVQ_FUSION_PAIR_SHAPES: {
+                const ggml_type type2 = kind != MMVQ_FUSION_PAIR_TYPES ? type : type == GGML_TYPE_Q8_0 ? GGML_TYPE_Q4_0 : GGML_TYPE_Q8_0;
+                out = ggml_concat(ctx, mm, ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, type2, k, kind == MMVQ_FUSION_PAIR_SHAPES ? n + 32 : n), in), 0);
+            } break;
             case MMVQ_FUSION_ADD_SWAPPED:
                 out = ggml_add(ctx, r, mm);
                 break;
@@ -9786,7 +9796,7 @@ struct test_mmvq_fusion : public test_case {
                 GGML_ASSERT(runs_mmvq);
                 const char * env     = getenv("GGML_CUDA_DISABLE_FUSION");
                 const bool   fusable = kind == MMVQ_FUSION_GLU || kind == MMVQ_FUSION_ADD || kind == MMVQ_FUSION_ADD_SWAPPED ||
-                                       (kind == MMVQ_FUSION_ADD_BCAST && m == 1);
+                                       kind == MMVQ_FUSION_PAIR || (kind == MMVQ_FUSION_ADD_BCAST && m == 1);
                 const bool   expect  = !(env && atoi(env)) && fusable && runs_mmvq(ggml_backend_get_device(backend), mm);
                 const bool   fused   = fused_count() > count0;
                 if (fused != expect) {
@@ -9814,7 +9824,8 @@ static void make_test_cases_fork(std::vector<std::unique_ptr<test_case>> & test_
     // Q4_K and Q6_K leave MMVQ at 6 and 8 columns on some devices
     for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0 }) {
         for (test_mmvq_fusion_kind kind : { MMVQ_FUSION_GLU, MMVQ_FUSION_ADD, MMVQ_FUSION_ADD_SWAPPED, MMVQ_FUSION_ADD_BCAST,
-                                            MMVQ_FUSION_ADD_MM_OUTPUT }) {
+                                            MMVQ_FUSION_ADD_MM_OUTPUT, MMVQ_FUSION_PAIR, MMVQ_FUSION_PAIR_TYPES,
+                                            MMVQ_FUSION_PAIR_SHAPES }) {
             for (int64_t m : { 1, 2, 3, 5, 6, 8 }) {
                 for (bool rht : { false, true }) {
                     test_cases.emplace_back(new test_mmvq_fusion(kind, type, 5120, 1023, m, rht));
@@ -9824,6 +9835,10 @@ static void make_test_cases_fork(std::vector<std::unique_ptr<test_case>> & test_
     }
     test_cases.emplace_back(new test_mmvq_fusion(MMVQ_FUSION_GLU, GGML_TYPE_Q4_0, 256, 48, 5, false));
     test_cases.emplace_back(new test_mmvq_fusion(MMVQ_FUSION_ADD, GGML_TYPE_Q4_0, 256, 48, 5, false));
+    // the 27B beta/alpha projections
+    for (int64_t m : { 1, 5 }) {
+        test_cases.emplace_back(new test_mmvq_fusion(MMVQ_FUSION_PAIR, GGML_TYPE_Q8_0, 5120, 48, m, true));
+    }
 
     // source row 2 is among the slots the snapshots overwrite, row 6 is not
     for (int32_t row : { 0, 2, 6 }) {

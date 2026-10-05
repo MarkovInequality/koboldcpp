@@ -2,10 +2,11 @@
 // Each case multiplies a cycle of weight copies of at least 384 MB (L2 is 96 MB on the 5090) in one graph, so CUDA
 // graphs launch it and no weight byte comes from L2; GB/s is against 1792 GB/s and a measured LDG.128 read roofline.
 //
-// With -e add each product gets a same-shape residual added, with -e glu pairs of copies are gate and up into a
-// SWIGLU: the epilogues MMVQ fuses (GGML_CUDA_DISABLE_FUSION=1 for the unfused kernels).
+// Consecutive products read alternating inputs, so none run as a pair. With -e add each product gets a same-shape
+// residual added, with -e glu pairs of copies are gate and up into a SWIGLU, with -e pair consecutive products read
+// the same input: the fusions MMVQ does (GGML_CUDA_DISABLE_FUSION=1 for the unfused kernels).
 //
-// usage: bench-mmvq [-t TYPES] [-k KS] [-n NS] [-c NCOLS] [-r REPS] [-e none|add|glu]   (comma lists; types by ggml name)
+// usage: bench-mmvq [-t TYPES] [-k KS] [-n NS] [-c NCOLS] [-r REPS] [-e none|add|glu|pair]   (comma lists; types by ggml name)
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -131,7 +132,8 @@ int main(int argc, char ** argv) {
                     ggml_context * ctx = ggml_init(ip);
                     std::vector<ggml_tensor *> ws(n_copies);
                     for (auto & w : ws) w = ggml_new_tensor_2d(ctx, type, K, N);
-                    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, nc);
+                    ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, nc);
+                    ggml_tensor * x1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, nc);
                     ggml_tensor * r = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N, nc);
                     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 3*n_copies + 8, false);
                     for (int c = 0; c < n_copies; ++c) {
@@ -141,7 +143,7 @@ int main(int argc, char ** argv) {
                         } else if (epilogue == "add") {
                             ggml_build_forward_expand(gf, ggml_add(ctx, ggml_mul_mat(ctx, ws[c], x), r));
                         } else {
-                            ggml_build_forward_expand(gf, ggml_mul_mat(ctx, ws[c], x));
+                            ggml_build_forward_expand(gf, ggml_mul_mat(ctx, ws[c], epilogue == "pair" || c % 2 == 0 ? x : x1));
                         }
                     }
                     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
@@ -156,6 +158,7 @@ int main(int argc, char ** argv) {
                     std::vector<float> xf(K*nc);
                     for (auto & v : xf) v = nd(rng);
                     ggml_backend_tensor_set(x, xf.data(), 0, xf.size()*sizeof(float));
+                    ggml_backend_tensor_set(x1, xf.data(), 0, xf.size()*sizeof(float));
                     std::vector<float> rf(N*nc, 1.0f);
                     ggml_backend_tensor_set(r, rf.data(), 0, rf.size()*sizeof(float));
 
