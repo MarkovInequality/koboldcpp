@@ -4537,6 +4537,30 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // mul_mat + add through a reshape that keeps the rows (a gated-delta-net layer's ssm_out and the residual): the sum
+    // and the bias seen in the matmul's shape, which the reshape gave the same layout
+    if (node->op == GGML_OP_MUL_MAT) {
+        const ggml_op ops[]       = { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD };
+        const int     out_nodes[] = { i + 2 };
+        if (ggml_can_fuse_subgraph(cgraph, i, 3, ops, out_nodes, 1)) {
+            ggml_tensor * rs   = cgraph->nodes[i + 1];
+            ggml_tensor * add  = cgraph->nodes[i + 2];
+            ggml_tensor * bias = add->src[0] == rs ? add->src[1] : add->src[1] == rs ? add->src[0] : nullptr;
+            if (bias && rs->src[0] == node && rs->ne[0] == node->ne[0] && ggml_is_contiguous(node) && ggml_is_contiguous(add) &&
+                    ggml_is_contiguous(bias) && ggml_are_same_shape(bias, add) && bias->type == GGML_TYPE_F32 &&
+                    ggml_cuda_should_fuse_mul_mat_vec_q(node) && ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 1)) {
+                ggml_tensor sum_mm  = *node;
+                ggml_tensor bias_mm = *node;
+                sum_mm.data  = add->data;
+                bias_mm.data = bias->data;
+                ggml_cuda_mm_fusion_args_host fusion_data{};
+                fusion_data.x_bias = &bias_mm;
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], nullptr, &sum_mm, &fusion_data);
+                return 2;
+            }
+        }
+    }
+
     // two matmuls of the same input in one MMVQ launch, the second through the gate: e.g. a gated-delta-net layer's
     // beta and alpha projections, which the models expand next to each other
     if (node->op == GGML_OP_MUL_MAT && i + 1 < cgraph->n_nodes) {
