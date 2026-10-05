@@ -9219,17 +9219,21 @@ struct test_rht_q8_1 : public test_case {
     }
 };
 
-// A producer the CUDA backend fuses into the rotation (RMS_NORM + MUL or a GLU in front of an RHT), run as one
-// graph against the CPU. Where the graph allows it, the backend must fuse exactly when the shape pays
-// (ggml_backend_cuda_rht_fusion_pays). Checked through the backend's counter; never with GGML_CUDA_DISABLE_FUSION=1.
+// A producer the CUDA backend fuses into the rotation (RMS_NORM + MUL, a GLU, or silu(g)*u as UNARY and MUL, possibly
+// reshaped, in front of an RHT), run as one graph against the CPU. Where the graph allows it, the backend must fuse
+// exactly when the shape pays (ggml_backend_cuda_rht_fusion_pays). Checked through the backend's counter; never with
+// GGML_CUDA_DISABLE_FUSION=1.
 enum test_rht_fused_kind {
     RHT_FUSED_NORM,           // rms_norm(x)*w
     RHT_FUSED_SWIGLU_SPLIT,   // swiglu(g, u)
     RHT_FUSED_GEGLU_SPLIT,
     RHT_FUSED_SWIGLU,         // swiglu of the two halves of each row
     RHT_FUSED_GEGLU_SWAPPED,
+    RHT_FUSED_SILU_MUL,       // silu(g)*u as UNARY and MUL
+    RHT_FUSED_SILU_MUL_HEADS, // the same over 64-wide heads, reshaped to the rows
     RHT_FUSED_NORM_TWO_USES,  // the MUL also feeds an ADD: not fusable
     RHT_FUSED_SWIGLU_OAI,     // not a fused GLU op
+    RHT_FUSED_SIGMOID_MUL,    // sigmoid(g)*u: no prologue
 };
 
 struct test_rht_fused : public test_case {
@@ -9305,6 +9309,17 @@ struct test_rht_fused : public test_case {
             case RHT_FUSED_GEGLU_SWAPPED:
                 y = ggml_geglu_swapped(ctx, input(ctx, 2*n, "gu"));
                 break;
+            case RHT_FUSED_SILU_MUL:
+                y = ggml_mul(ctx, input(ctx, n, "u"), ggml_silu(ctx, input(ctx, n, "g")));
+                break;
+            case RHT_FUSED_SILU_MUL_HEADS: {
+                ggml_tensor * u = ggml_reshape_4d(ctx, input(ctx, n, "u"), 64, n/64, ne[1], ne[2]);
+                ggml_tensor * g = ggml_reshape_4d(ctx, input(ctx, n, "g"), 64, n/64, ne[1], ne[2]);
+                y = ggml_reshape_3d(ctx, ggml_mul(ctx, u, ggml_silu(ctx, g)), n, ne[1], ne[2]);
+            } break;
+            case RHT_FUSED_SIGMOID_MUL:
+                y = ggml_mul(ctx, input(ctx, n, "u"), ggml_sigmoid(ctx, input(ctx, n, "g")));
+                break;
             case RHT_FUSED_SWIGLU_OAI:
                 y = ggml_swiglu_oai(ctx, input(ctx, n, "g"), input(ctx, n, "u"), 1.702f, 7.0f);
                 break;
@@ -9347,7 +9362,7 @@ struct test_rht_fused : public test_case {
                 const bool   disabled = env && atoi(env);
                 auto         pays     = (bool (*)(const ggml_tensor *)) cuda_fn("ggml_backend_cuda_rht_fusion_pays");
                 GGML_ASSERT(pays);
-                const bool fusable = kind != RHT_FUSED_NORM_TWO_USES && kind != RHT_FUSED_SWIGLU_OAI;
+                const bool fusable = kind != RHT_FUSED_NORM_TWO_USES && kind != RHT_FUSED_SWIGLU_OAI && kind != RHT_FUSED_SIGMOID_MUL;
                 const bool expect  = fusable && !disabled && pays(rht);
                 const bool fused   = fused_count() > count0;
                 if (fused != expect) {
@@ -9977,7 +9992,8 @@ static void make_test_cases_fork(std::vector<std::unique_ptr<test_case>> & test_
 
     // producers fused into the rotation: every kernel path (one-warp rows, the mix, K-split, generic, narrow, strided,
     // kernel B, the compute-bound order that isn't fused), with and without Q8_1 consumers, 3D rows
-    for (test_rht_fused_kind kind : {RHT_FUSED_NORM, RHT_FUSED_SWIGLU_SPLIT, RHT_FUSED_GEGLU_SPLIT, RHT_FUSED_SWIGLU, RHT_FUSED_GEGLU_SWAPPED}) {
+    for (test_rht_fused_kind kind : {RHT_FUSED_NORM, RHT_FUSED_SWIGLU_SPLIT, RHT_FUSED_GEGLU_SPLIT, RHT_FUSED_SWIGLU, RHT_FUSED_GEGLU_SWAPPED,
+                                     RHT_FUSED_SILU_MUL, RHT_FUSED_SILU_MUL_HEADS}) {
         for (int64_t n : {1024, 2048, 5120, 17408, 11008, 36*256, 36*16, 1 << 16}) {
             for (int64_t rows : {1, 8, 9, 512}) {
                 if (n*rows > (1 << 22)) {
@@ -10000,6 +10016,7 @@ static void make_test_cases_fork(std::vector<std::unique_ptr<test_case>> & test_
     for (int64_t rows : {1, 9}) {
         test_cases.emplace_back(new test_rht_fused(RHT_FUSED_NORM_TWO_USES, {5120, rows, 1}));
         test_cases.emplace_back(new test_rht_fused(RHT_FUSED_SWIGLU_OAI, {5120, rows, 1}));
+        test_cases.emplace_back(new test_rht_fused(RHT_FUSED_SIGMOID_MUL, {5120, rows, 1}));
     }
 }
 

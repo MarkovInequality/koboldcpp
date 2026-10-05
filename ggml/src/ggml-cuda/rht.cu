@@ -167,6 +167,39 @@ static bool rht_glu_fusable(const ggml_cgraph * cgraph, const int i) {
         ggml_cuda_rht_fusion_pays(rht);
 }
 
+// {UNARY silu, MUL, [RESHAPE], RHT} at node i, silu(z)*x rotated (a gated-delta-net layer's gated norm before
+// ssm_out): one rotation reading z and x through the SWIGLU prologue, which computes what the unary-mul kernel does.
+// z, x and the product are contiguous, so a row of the rotation is the same elements of each. Returns the RHT's
+// index, or 0.
+static int rht_silu_mul_fusable(const ggml_cgraph * cgraph, const int i) {
+    const ggml_tensor * u = cgraph->nodes[i];
+    if (u->op != GGML_OP_UNARY || ggml_get_unary_op(u) != GGML_UNARY_OP_SILU || i + 2 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const bool    reshape = cgraph->nodes[i + 2]->op == GGML_OP_RESHAPE;
+    const int     n_ops   = reshape ? 4 : 3;
+    const int     r       = i + n_ops - 1;
+    const ggml_op ops_reshape[] = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_RHT };
+    const ggml_op ops[]         = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_RHT };
+    if (r >= cgraph->n_nodes || !ggml_can_fuse_subgraph(cgraph, i, n_ops, reshape ? ops_reshape : ops, &r, 1)) {
+        return 0;
+    }
+    const ggml_tensor * mul = cgraph->nodes[i + 1];
+    const ggml_tensor * rht = cgraph->nodes[r];
+    const ggml_tensor * src = rht->src[0];
+    const ggml_tensor * z   = u->src[0];
+    const ggml_tensor * x   = mul->src[0] == u ? mul->src[1] : mul->src[0];
+    if ((mul->src[0] != u && mul->src[1] != u) || src != (reshape ? cgraph->nodes[i + 2] : mul) || (reshape && src->src[0] != mul)) {
+        return 0;
+    }
+    for (const ggml_tensor * t : { z, x, u, mul, src }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+            return 0;
+        }
+    }
+    return ggml_are_same_shape(z, u) && ggml_are_same_shape(x, u) && ggml_cuda_rht_fusion_pays(rht) ? r : 0;
+}
+
 // A fused rotation writes its output while it reads the producers' inputs, which therefore must not share memory
 // with it: the inputs stay allocated until the RHT node.
 void ggml_cuda_rht_add_alloc_deps(ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
@@ -179,6 +212,11 @@ void ggml_cuda_rht_add_alloc_deps(ggml_cgraph * cgraph, ggml_backend_graph_optim
                 if (node->src[j]) {
                     params->add_alloc_dep(params->user_data, node->src[j], cgraph->nodes[i + 1]);
                 }
+            }
+        } else if (const int r = node->op == GGML_OP_UNARY ? rht_silu_mul_fusable(cgraph, i) : 0) {
+            const ggml_tensor * mul = cgraph->nodes[i + 1];
+            for (ggml_tensor * t : { node->src[0], mul->src[0] == node ? mul->src[1] : mul->src[0] }) {
+                params->add_alloc_dep(params->user_data, t->view_src ? t->view_src : t, cgraph->nodes[r]);
             }
         }
     }
@@ -202,6 +240,23 @@ int ggml_cuda_rht_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * 
         rht_run(ctx, rht, in);
         rht_fused_count++;
         return 2;
+    }
+
+    if (const int r = node->op == GGML_OP_UNARY ? rht_silu_mul_fusable(cgraph, i) : 0) {
+        ggml_tensor       * rht = cgraph->nodes[r];
+        const ggml_tensor * mul = cgraph->nodes[i + 1];
+        const ggml_tensor * z   = node->src[0];
+        const ggml_tensor * x   = mul->src[0] == node ? mul->src[1] : mul->src[0];
+        GGML_ASSERT(!rht_overlap(rht, z) && !rht_overlap(rht, x) && "fused RHT input not kept allocated (ggml_cuda_rht_add_alloc_deps)");
+        rht_input in;
+        in.x    = z->data;
+        in.nbx  = rht->src[0]->nb;
+        in.pro  = RHT_PRO_SWIGLU;
+        in.x2   = x->data;
+        in.nbx2 = rht->src[0]->nb;
+        rht_run(ctx, rht, in);
+        rht_fused_count++;
+        return r - i;
     }
 
     if (node->op == GGML_OP_GLU && rht_glu_fusable(cgraph, i)) {
