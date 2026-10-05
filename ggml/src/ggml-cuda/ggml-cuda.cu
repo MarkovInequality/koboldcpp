@@ -3802,6 +3802,12 @@ static bool ggml_cuda_match_ssm_conv_update(const ggml_cgraph * cgraph, int i, g
 // ggml_cuda_try_fuse: the node ran (differently), no further nodes are covered
 #define GGML_CUDA_FUSED_NODE_ONLY -1
 
+static bool ggml_cuda_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const char * a0 = (const char *) a->data;
+    const char * b0 = (const char *) b->data;
+    return a0 < b0 + ggml_backend_buft_get_alloc_size(b->buffer->buft, b) && b0 < a0 + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
+}
+
 // a bias the fused matmul kernels add, which they read with the output's strides
 static bool ggml_cuda_mm_bias_fits(const ggml_tensor * bias, const ggml_tensor * out) {
     return !bias || out->ne[1] == 1 || ggml_are_same_stride(bias, out);
@@ -4538,7 +4544,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // mul_mat + add through a reshape that keeps the rows (a gated-delta-net layer's ssm_out and the residual): the sum
-    // and the bias seen in the matmul's shape, which the reshape gave the same layout
+    // and the bias seen in the matmul's shape, which the reshape gave the same layout. The sum may be the bias in place
+    // (each block reads its rows' bias before it writes them), not src1, which all blocks read.
     if (node->op == GGML_OP_MUL_MAT) {
         const ggml_op ops[]       = { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD };
         const int     out_nodes[] = { i + 2 };
@@ -4548,7 +4555,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_tensor * bias = add->src[0] == rs ? add->src[1] : add->src[1] == rs ? add->src[0] : nullptr;
             if (bias && rs->src[0] == node && rs->ne[0] == node->ne[0] && ggml_is_contiguous(node) && ggml_is_contiguous(add) &&
                     ggml_is_contiguous(bias) && ggml_are_same_shape(bias, add) && bias->type == GGML_TYPE_F32 &&
-                    ggml_cuda_should_fuse_mul_mat_vec_q(node) && ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 1)) {
+                    ggml_cuda_should_fuse_mul_mat_vec_q(node) && !ggml_cuda_tensors_overlap(add, node->src[1]) &&
+                    (bias->data == add->data || !ggml_cuda_tensors_overlap(add, bias))) {
                 ggml_tensor sum_mm  = *node;
                 ggml_tensor bias_mm = *node;
                 sum_mm.data  = add->data;

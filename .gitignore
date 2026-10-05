@@ -80,6 +80,7 @@ models-mnt
 /test-mtp-draft-vocab*
 /test-fattn-mma-q
 /test-gdn-gating
+/test-cuda-fusion-alloc
 /bench-rht
 /ggml/src/ggml-cuda/**/*.d
 /ggml/src/ggml-cuda/.flags

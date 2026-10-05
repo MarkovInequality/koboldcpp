@@ -9717,6 +9717,7 @@ enum test_mmvq_fusion_kind {
     MMVQ_FUSION_ADD_BCAST,     // mm + b, b one column
     MMVQ_FUSION_ADD_MM_OUTPUT, // mm + r, mm an output
     MMVQ_FUSION_ADD_RESHAPE,   // reshape(mm) + r, the reshape keeping the rows
+    MMVQ_FUSION_ADD_RESHAPE_R, // the same with r computed (the sum in its place: test-cuda-fusion-alloc)
     MMVQ_FUSION_ADD_FLAT,      // reshape_1d(mm) + r: fused only with one column
     MMVQ_FUSION_PAIR,          // mm and mm2 of the same input
     MMVQ_FUSION_PAIR_TYPES,    // mm2's weight of another type
@@ -9792,6 +9793,10 @@ struct test_mmvq_fusion : public test_case {
             case MMVQ_FUSION_ADD_RESHAPE:
                 out = ggml_add(ctx, ggml_reshape_3d(ctx, mm, n, 1, m), ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, 1, m));
                 break;
+            case MMVQ_FUSION_ADD_RESHAPE_R:
+                // r first, so it's computed before the matmul as a residual is
+                out = ggml_add(ctx, ggml_scale(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, 1, m), 2.0f), ggml_reshape_3d(ctx, mm, n, 1, m));
+                break;
             case MMVQ_FUSION_ADD_FLAT:
                 out = ggml_add(ctx, ggml_reshape_1d(ctx, mm, n*m), ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n*m));
                 break;
@@ -9819,7 +9824,7 @@ struct test_mmvq_fusion : public test_case {
                 GGML_ASSERT(runs_mmvq);
                 const char * env     = getenv("GGML_CUDA_DISABLE_FUSION");
                 const bool   fusable = kind == MMVQ_FUSION_GLU || kind == MMVQ_FUSION_ADD || kind == MMVQ_FUSION_ADD_SWAPPED ||
-                                       kind == MMVQ_FUSION_PAIR || kind == MMVQ_FUSION_ADD_RESHAPE ||
+                                       kind == MMVQ_FUSION_PAIR || kind == MMVQ_FUSION_ADD_RESHAPE || kind == MMVQ_FUSION_ADD_RESHAPE_R ||
                                        ((kind == MMVQ_FUSION_ADD_BCAST || kind == MMVQ_FUSION_ADD_FLAT) && m == 1);
                 const bool   expect  = !(env && atoi(env)) && fusable && runs_mmvq(ggml_backend_get_device(backend), mm);
                 const bool   fused   = fused_count() > count0;
@@ -9848,8 +9853,9 @@ static void make_test_cases_fork(std::vector<std::unique_ptr<test_case>> & test_
     // Q4_K and Q6_K leave MMVQ at 6 and 8 columns on some devices
     for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0 }) {
         for (test_mmvq_fusion_kind kind : { MMVQ_FUSION_GLU, MMVQ_FUSION_ADD, MMVQ_FUSION_ADD_SWAPPED, MMVQ_FUSION_ADD_BCAST,
-                                            MMVQ_FUSION_ADD_MM_OUTPUT, MMVQ_FUSION_ADD_RESHAPE, MMVQ_FUSION_ADD_FLAT,
-                                            MMVQ_FUSION_PAIR, MMVQ_FUSION_PAIR_TYPES, MMVQ_FUSION_PAIR_SHAPES }) {
+                                            MMVQ_FUSION_ADD_MM_OUTPUT, MMVQ_FUSION_ADD_RESHAPE, MMVQ_FUSION_ADD_RESHAPE_R,
+                                            MMVQ_FUSION_ADD_FLAT, MMVQ_FUSION_PAIR, MMVQ_FUSION_PAIR_TYPES,
+                                            MMVQ_FUSION_PAIR_SHAPES }) {
             for (int64_t m : { 1, 2, 3, 5, 6, 8 }) {
                 for (bool rht : { false, true }) {
                     test_cases.emplace_back(new test_mmvq_fusion(kind, type, 5120, 1023, m, rht));
