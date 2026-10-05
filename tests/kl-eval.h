@@ -144,6 +144,7 @@ static void scored_logprobs(llama_context * ctx, int w, int n_ctx, int n_vocab, 
 
 // the KV cache type of every context (both K and V); a quantized one needs flash attention
 static ggml_type kl_eval_kv_type = GGML_TYPE_F16;
+static int       kl_eval_n_ubatch = 0; // 0: one ubatch per batch
 
 // n_par windows per batch
 static llama_context * make_ctx(llama_model * model, int n_ctx, const std::string & lora = "", int n_par = 1) {
@@ -155,7 +156,7 @@ static llama_context * make_ctx(llama_model * model, int n_ctx, const std::strin
     }
     cp.n_ctx         = n_par*n_ctx;
     cp.n_batch       = n_par*n_ctx;
-    cp.n_ubatch      = n_par*n_ctx;
+    cp.n_ubatch      = kl_eval_n_ubatch > 0 ? kl_eval_n_ubatch : n_par*n_ctx;
     cp.n_seq_max     = n_par;
     cp.n_outputs_max = n_par*n_ctx;
     llama_context * ctx = llama_init_from_model(model, cp);

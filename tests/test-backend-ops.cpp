@@ -9843,6 +9843,20 @@ struct test_mmvq_fusion : public test_case {
 };
 
 static void make_test_cases_fork(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    // MMVQ block shapes by column count: both sides of the Blackwell widening (few warps in flight: 48 and 1023 rows),
+    // its short (5120) and long (6144) K from 5 columns, and small K (rows per block 4) with rows not a multiple of it
+    for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,
+                            GGML_TYPE_Q3_K, GGML_TYPE_IQ2_XXS }) {
+        for (int64_t n = 1; n <= 8; ++n) {
+            for (int64_t m : { 48, 1023, 6144 }) {
+                for (int64_t k : { 5120, 6144 }) {
+                    test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
+                }
+            }
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 1021, n, 256, { 1, 1 }, { 1, 1 }));
+        }
+    }
+
     for (int64_t n_seqs : { 1, 2 }) {
         for (int64_t n_tokens : { 1, 5 }) {
             for (int64_t K : { 1, 5 }) {

@@ -2,7 +2,7 @@
 // agreement over non-overlapping windows of a text file, plus bits per weight.
 //
 // usage: test-hadamard-ppl [-ngl N] [--ref-ngl N] [-c N_CTX] [--chunks N] [--parallel N] [--cache FILE] [--lora FILE]
-//                          [-ctk TYPE] [--special] [--chat-mask] <text-file> <reference.gguf> [model.gguf...]
+//                          [-ctk TYPE] [-ub N] [--special] [--chat-mask] <text-file> <reference.gguf> [model.gguf...]
 //
 // The reference's log-probabilities are written to the cache file (FP16) once and streamed back for
 // every model; a cache with more windows than asked for is reused, and then the reference is only read for
@@ -11,7 +11,8 @@
 // log-probs are computed; --parallel N decodes N windows per batch, so that weights in RAM cross to the GPU
 // once per batch; --special parses special tokens in the text; --chat-mask (with --special) scores only the
 // tokens a chat model generates, its own turns and text outside any turn; --lora applies a runtime adapter to
-// the reference and to every model; -ctk sets the K and V cache type of every context (default f16).
+// the reference and to every model; -ctk sets the K and V cache type of every context (default f16); -ub N decodes
+// in ubatches of N tokens (with N <= 8 the matrix-vector kernels run, as in decode and speculative verify).
 // The fork has no perplexity tool; this is its replacement for these runs.
 
 #include "kl-eval.h"
@@ -56,6 +57,8 @@ int main(int argc, char ** argv) {
             cache_path = argv[arg + 1];
         } else if (!strcmp(argv[arg], "--lora")) {
             lora = argv[arg + 1];
+        } else if (!strcmp(argv[arg], "-ub")) {
+            kl_eval_n_ubatch = atoi(argv[arg + 1]);
         } else if (!strcmp(argv[arg], "-ctk")) {
             bool found = false;
             for (int t = 0; t < GGML_TYPE_COUNT && !found; ++t) {
@@ -74,7 +77,7 @@ int main(int argc, char ** argv) {
     }
     if (argc - arg < 2) {
         fprintf(stderr, "usage: %s [-ngl N] [--ref-ngl N] [-c N_CTX] [--chunks N] [--parallel N] [--cache FILE] [--lora FILE] "
-                        "[-ctk TYPE] [--special] [--chat-mask] <text-file> <reference.gguf> [model.gguf...]\n", argv[0]);
+                        "[-ctk TYPE] [-ub N] [--special] [--chat-mask] <text-file> <reference.gguf> [model.gguf...]\n", argv[0]);
         return 1;
     }
     ref_ngl = ref_ngl < 0 ? n_gpu_layers : ref_ngl;
