@@ -3,7 +3,8 @@
 // writes its snapshots back. Two variants must give the same bytes:
 // - the gating computed inside the GDN (ggml_backend_cuda_gdn_gating_count) and, with g also a graph output, by the
 //   gating nodes: the kernel uses the unary ops' own helpers;
-// - q and k normed by one op over both (build_gdn_l2_norm_qk) and each by its own.
+// - q and k normed by one op over both (build_gdn_l2_norm_qk) and each by its own;
+// - each warp of the GDN kernel owning 2 or 4 state columns, or as many as it picks, and one (GGML_CUDA_GDN_COLS=1).
 //
 // usage: test-gdn-gating [-v]
 
@@ -124,7 +125,7 @@ int main(int argc, char ** argv) {
 
     std::vector<gdn_case> cases;
     for (int64_t S : { 1, 2 }) {
-        for (int64_t T : { 1, 5, 64 }) {
+        for (int64_t T : { 1, 5, 33, 64, 1024 }) {
             for (int64_t K : { 1, 5 }) {
                 cases.push_back({ 48, 16, 128, T, S, K });
             }
@@ -134,6 +135,19 @@ int main(int argc, char ** argv) {
 
     int fails = 0;
     for (const auto & c : cases) {
+        bool same_cols = true;
+        setenv("GGML_CUDA_GDN_COLS", "1", 1);
+        const std::vector<float> one_col = run(backend, c, false, false);
+        for (const char * nc : { "2", "4", "" }) {
+            if (*nc) {
+                setenv("GGML_CUDA_GDN_COLS", nc, 1);
+            } else {
+                unsetenv("GGML_CUDA_GDN_COLS");
+            }
+            const std::vector<float> r = run(backend, c, false, false);
+            same_cols &= memcmp(r.data(), one_col.data(), r.size()*sizeof(float)) == 0;
+        }
+
         const int64_t n0 = gating_count();
         const std::vector<float> fused = run(backend, c, false, false);
         const int64_t n1 = gating_count();
@@ -144,12 +158,12 @@ int main(int argc, char ** argv) {
         const bool same_gating = memcmp(fused.data(), ref.data(), fused.size()*sizeof(float)) == 0;
         const bool same_qk     = memcmp(fused.data(), merged.data(), fused.size()*sizeof(float)) == 0;
         const bool counted     = n1 > n0 && n2 == n1;
-        const bool ok          = same_gating && same_qk && counted;
+        const bool ok          = same_gating && same_qk && same_cols && counted;
         if (!ok || verbose) {
-            printf("  H %2lld/%2lld S_v %3lld tokens %2lld seqs %lld K %lld: gating %s, merged q/k norm %s%s%s\n",
+            printf("  H %2lld/%2lld S_v %3lld tokens %4lld seqs %lld K %lld: gating %s, merged q/k norm %s, columns per warp %s%s%s\n",
                    (long long) c.H, (long long) c.H_k, (long long) c.S_v, (long long) c.n_tokens, (long long) c.n_seqs,
                    (long long) c.K, same_gating ? "bitwise equal" : "differs", same_qk ? "bitwise equal" : "differs",
-                   counted ? "" : " (fusion counter wrong)", ok ? "" : "  FAIL");
+                   same_cols ? "bitwise equal" : "differ", counted ? "" : " (fusion counter wrong)", ok ? "" : "  FAIL");
         }
         fails += !ok;
     }
