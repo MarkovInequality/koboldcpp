@@ -1,4 +1,5 @@
 #include "gated_delta_net.cuh"
+#include "gated_delta_net_chunked.cuh"
 #include "ggml-cuda/common.cuh"
 #include "unary.cuh"
 
@@ -35,7 +36,8 @@ gated_delta_net_cuda(const float * q,
                                      int           K,
                                      const int32_t * state_rows,
                                      int64_t       state_rows_stride,
-                                     const ggml_cuda_gdn_gating gating) {
+                                     const ggml_cuda_gdn_gating gating,
+                                     int64_t       n_tokens_attn) {
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
     // each warp owns NC columns, using warp-level primitives to reduce across rows
@@ -56,7 +58,7 @@ gated_delta_net_cuda(const float * q,
     const int64_t state_out_offset     = (sequence * H + h_idx) * S_v * S_v;
     state += state_out_offset;
     curr_state += state_in_offset + col0 * S_v;
-    attn_data += (sequence * n_tokens * H + h_idx) * S_v;
+    attn_data += (sequence * n_tokens_attn * H + h_idx) * S_v;
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v;
     static_assert(S_v % warp_size == 0, "S_v must be a multiple of warp_size");
@@ -245,8 +247,7 @@ static void launch_gated_delta_net(
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
         float scale, int64_t state_slot_stride, int K, const int32_t * state_rows, int64_t state_rows_stride,
-        const ggml_cuda_gdn_gating & gating, cudaStream_t stream) {
-    //TODO: Add chunked kernel for even faster pre-fill
+        const ggml_cuda_gdn_gating & gating, cudaStream_t stream, int64_t n_tokens_attn) {
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int num_warps = 4;
     dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
@@ -265,7 +266,8 @@ static void launch_gated_delta_net(
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
 #define GDN_ARGS q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, \
-                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, state_rows, state_rows_stride, gating
+                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, state_rows, state_rows_stride, gating, \
+                 n_tokens_attn
     switch (S_v) {
         case 16:  launch_gated_delta_net_cols<16,  KDA, keep_rs_t>(nc, launch_params, GDN_ARGS); break;
         case 32:  launch_gated_delta_net_cols<32,  KDA, keep_rs_t>(nc, launch_params, GDN_ARGS); break;
@@ -276,6 +278,63 @@ static void launch_gated_delta_net(
             break;
     }
 #undef GDN_ARGS
+}
+
+static std::atomic<int64_t> gdn_chunked_count{0};
+
+int64_t ggml_cuda_gdn_chunked_count() {
+    return gdn_chunked_count.load();
+}
+
+// Prompt batches with one gate per head and 128-wide heads go through the chunked kernels; with snapshots their last
+// K tokens go through the recurrent kernel, from the chunked state. GGML_CUDA_GDN_CHUNKED=0 keeps the recurrent kernel
+// (tests).
+static bool gated_delta_net_chunked(
+        ggml_backend_cuda_context & ctx,
+        const float * q_d, const float * k_d, const float * v_d, const float * g_d, const float * b_d, const float * s_d,
+        float * dst_d, float * state_d, int64_t S_v, int64_t H, int64_t n_tokens, int64_t n_seqs,
+        int64_t sq1, int64_t sq2, int64_t sq3, int64_t sv1, int64_t sv2, int64_t sv3, int64_t sb1, int64_t sb2, int64_t sb3,
+        int64_t neqk1, int64_t rq3, float scale, int64_t state_slot_stride, int K, const int32_t * rows_d, int64_t rows_stride,
+        const ggml_cuda_gdn_gating & gating, cudaStream_t stream) {
+    constexpr int C = GDN_CHUNK_C;
+    constexpr int W = GDN_CHUNK_W;
+    const char * env  = getenv("GGML_CUDA_GDN_CHUNKED");
+    const int64_t tail      = K > 1 ? std::min<int64_t>(n_tokens, K) : 0;
+    const int64_t n_chunked = n_tokens - tail;
+    // the prep kernel serves the v heads of a q/k head together and loads q/k rows as float4
+    const bool aligned = (uintptr_t) q_d % 16 == 0 && (uintptr_t) k_d % 16 == 0 && sq1 % 4 == 0 && sq2 % 4 == 0 && sq3 % 4 == 0;
+    if (S_v != 128 || n_chunked < 2*C || H % neqk1 != 0 || !aligned || (env && atoi(env) == 0)) {
+        return false;
+    }
+    const int n_chunks = (int) ((n_chunked + C - 1) / C);
+    gdn_chunked_count++;
+
+    ggml_cuda_pool_alloc<float> prep(ctx.pool(), (size_t) n_seqs*H*n_chunks*gdn_chunk_stride(C));
+    ggml_cuda_pool_alloc<float> mid(ctx.pool());
+    if (tail > 0) {
+        mid.alloc((size_t) S_v*S_v*H*n_seqs);
+    }
+
+    gdn_chunk_prep<C, 128><<<dim3(n_chunks, neqk1, n_seqs), 256, 0, stream>>>(
+        q_d, k_d, g_d, b_d, gating, prep.get(), H, n_chunked, n_chunks, neqk1, rq3, sq1, sq2, sq3, sb1, sb2, sb3);
+    CUDA_CHECK(cudaGetLastError());
+    gdn_chunk_scan<C, 128, W><<<dim3(128/W, H, n_seqs), 256, 0, stream>>>(
+        q_d, k_d, v_d, prep.get(), s_d, rows_d, rows_stride, dst_d, tail > 0 ? mid.get() : state_d, H, n_chunked, n_tokens,
+        n_chunks, neqk1, rq3, sq1, sq2, sq3, sv1, sv2, sv3, scale);
+    CUDA_CHECK(cudaGetLastError());
+
+    if (tail > 0) {
+        ggml_cuda_gdn_gating gating_tail = gating;
+        if (gating.alpha) {
+            gating_tail.alpha   += n_chunked*sb2;
+            gating_tail.beta_in += n_chunked*sb2;
+        }
+        launch_gated_delta_net<false, true>(q_d + n_chunked*sq2, k_d + n_chunked*sq2, v_d + n_chunked*sv2,
+            g_d + n_chunked*sb2, b_d + n_chunked*sb2, mid.get(), dst_d + n_chunked*S_v*H, state_d,
+            S_v, H, tail, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3,
+            scale, state_slot_stride, K, nullptr, 0, gating_tail, stream, n_tokens);
+    }
+    return true;
 }
 
 static void ggml_cuda_op_gated_delta_net_impl(
@@ -358,25 +417,31 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_slot_stride = cache->slot_stride;
     }
 
+    if (!kda && gated_delta_net_chunked(ctx, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, S_v, H, n_tokens, n_seqs,
+                                        sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K,
+                                        rows_d, rows_stride, gating_d, stream)) {
+        return;
+    }
+
     if (kda) {
         if (keep_rs) {
             launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, rows_d, rows_stride, gating_d, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, rows_d, rows_stride, gating_d, stream, n_tokens);
         } else {
             launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, rows_d, rows_stride, gating_d, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, rows_d, rows_stride, gating_d, stream, n_tokens);
         }
     } else {
         if (keep_rs) {
             launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, rows_d, rows_stride, gating_d, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, rows_d, rows_stride, gating_d, stream, n_tokens);
         } else {
             launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, rows_d, rows_stride, gating_d, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, rows_d, rows_stride, gating_d, stream, n_tokens);
         }
     }
 }

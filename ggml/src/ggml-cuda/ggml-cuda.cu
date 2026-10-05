@@ -6429,6 +6429,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_gdn_gating_count") == 0) {
         return (void *)ggml_cuda_gdn_gating_count;
     }
+    if (strcmp(name, "ggml_backend_cuda_gdn_chunked_count") == 0) {
+        return (void *)ggml_cuda_gdn_chunked_count;
+    }
     if (strcmp(name, "ggml_backend_cuda_ssm_conv_update_count") == 0) {
         return (void *)ggml_cuda_ssm_conv_update_count;
     }

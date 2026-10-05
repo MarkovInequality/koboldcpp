@@ -5,6 +5,9 @@
 //   gating nodes: the kernel uses the unary ops' own helpers;
 // - q and k normed by one op over both (build_gdn_l2_norm_qk) and each by its own;
 // - each warp of the GDN kernel owning 2 or 4 state columns, or as many as it picks, and one (GGML_CUDA_GDN_COLS=1).
+// Prompt batches (64+ tokens before the snapshot tail) take the chunked kernels (ggml_backend_cuda_gdn_chunked_count),
+// which must agree with the recurrent kernel (GGML_CUDA_GDN_CHUNKED=0) within NMSE_CHUNKED, attention outputs and
+// states each.
 //
 // usage: test-gdn-gating [-v]
 
@@ -21,6 +24,17 @@
 #include <random>
 #include <string>
 #include <vector>
+
+static const double NMSE_CHUNKED = 1e-9;
+
+static double nmse(const float * a, const float * b, size_t n) {
+    double num = 0.0, den = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        num += ((double) a[i] - b[i]) * ((double) a[i] - b[i]);
+        den += (double) b[i] * b[i];
+    }
+    return den > 0.0 ? num / den : num;
+}
 
 struct gdn_case {
     int64_t H, H_k, S_v, n_tokens, n_seqs, K;
@@ -117,9 +131,10 @@ int main(int argc, char ** argv) {
         printf("no CUDA device\n");
         return 1;
     }
-    auto gating_count = (int64_t (*)()) ggml_backend_reg_get_proc_address(ggml_backend_reg_by_name("CUDA"), "ggml_backend_cuda_gdn_gating_count");
-    if (!gating_count) {
-        printf("no ggml_backend_cuda_gdn_gating_count\n");
+    auto gating_count  = (int64_t (*)()) ggml_backend_reg_get_proc_address(ggml_backend_reg_by_name("CUDA"), "ggml_backend_cuda_gdn_gating_count");
+    auto chunked_count = (int64_t (*)()) ggml_backend_reg_get_proc_address(ggml_backend_reg_by_name("CUDA"), "ggml_backend_cuda_gdn_chunked_count");
+    if (!gating_count || !chunked_count) {
+        printf("no ggml_backend_cuda_gdn_gating_count or ggml_backend_cuda_gdn_chunked_count\n");
         return 1;
     }
 
@@ -134,7 +149,25 @@ int main(int argc, char ** argv) {
     cases.push_back({ 16, 16, 64, 5, 1, 5 });
 
     int fails = 0;
+    double worst = 0.0;
     for (const auto & c : cases) {
+        const int64_t tail     = c.K > 1 ? std::min(c.n_tokens, c.K) : 0;
+        const bool    chunked  = c.S_v == 128 && c.n_tokens - tail >= 64;
+        const size_t  n_attn   = (size_t) (c.S_v*c.H*c.n_tokens*c.n_seqs);
+
+        setenv("GGML_CUDA_GDN_CHUNKED", "0", 1);
+        unsetenv("GGML_CUDA_GDN_COLS");
+        const int64_t m0 = chunked_count();
+        const std::vector<float> recurrent = run(backend, c, false, false);
+        unsetenv("GGML_CUDA_GDN_CHUNKED");
+        const int64_t m1 = chunked_count();
+        const std::vector<float> dflt = run(backend, c, false, false);
+        const int64_t m2 = chunked_count();
+        const double e_attn  = nmse(dflt.data(), recurrent.data(), n_attn);
+        const double e_state = nmse(dflt.data() + n_attn, recurrent.data() + n_attn, dflt.size() - n_attn);
+        worst = std::max(worst, std::max(e_attn, e_state));
+        const bool path_ok = m1 == m0 && (m2 > m1) == chunked && e_attn <= NMSE_CHUNKED && e_state <= NMSE_CHUNKED;
+
         bool same_cols = true;
         setenv("GGML_CUDA_GDN_COLS", "1", 1);
         const std::vector<float> one_col = run(backend, c, false, false);
@@ -158,16 +191,18 @@ int main(int argc, char ** argv) {
         const bool same_gating = memcmp(fused.data(), ref.data(), fused.size()*sizeof(float)) == 0;
         const bool same_qk     = memcmp(fused.data(), merged.data(), fused.size()*sizeof(float)) == 0;
         const bool counted     = n1 > n0 && n2 == n1;
-        const bool ok          = same_gating && same_qk && same_cols && counted;
+        const bool ok          = same_gating && same_qk && same_cols && counted && path_ok;
         if (!ok || verbose) {
-            printf("  H %2lld/%2lld S_v %3lld tokens %4lld seqs %lld K %lld: gating %s, merged q/k norm %s, columns per warp %s%s%s\n",
+            printf("  H %2lld/%2lld S_v %3lld tokens %4lld seqs %lld K %lld: gating %s, merged q/k norm %s, columns per warp %s, "
+                   "%s nmse attn %.1e state %.1e%s%s\n",
                    (long long) c.H, (long long) c.H_k, (long long) c.S_v, (long long) c.n_tokens, (long long) c.n_seqs,
                    (long long) c.K, same_gating ? "bitwise equal" : "differs", same_qk ? "bitwise equal" : "differs",
-                   same_cols ? "bitwise equal" : "differ", counted ? "" : " (fusion counter wrong)", ok ? "" : "  FAIL");
+                   same_cols ? "bitwise equal" : "differ", chunked ? "chunked vs recurrent" : "recurrent", e_attn, e_state,
+                   counted ? "" : " (fusion counter wrong)", ok ? "" : "  FAIL");
         }
         fails += !ok;
     }
-    printf("%zu cases, %d failed\n%s\n", cases.size(), fails, fails ? "FAIL" : "PASS");
+    printf("%zu cases, %d failed, worst chunked nmse %.1e\n%s\n", cases.size(), fails, worst, fails ? "FAIL" : "PASS");
     ggml_backend_free(backend);
     return fails ? 1 : 0;
 }

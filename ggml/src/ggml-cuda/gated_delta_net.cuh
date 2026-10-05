@@ -26,6 +26,7 @@ void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, g
                                               const ggml_tensor * state_rows = nullptr,
                                               const ggml_cuda_gdn_gating * gating = nullptr);
 
-// GDN launches that read the state in place / that computed the gating, for tests
+// GDN launches that read the state in place / that computed the gating / that took the chunked path, for tests
 int64_t ggml_cuda_gdn_state_in_place_count();
 int64_t ggml_cuda_gdn_gating_count();
+int64_t ggml_cuda_gdn_chunked_count();

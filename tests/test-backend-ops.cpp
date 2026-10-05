@@ -12151,6 +12151,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  64, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  33, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1, 1, false, true));
+    // the CUDA chunked path (128-wide heads, one gate per head, 64+ tokens), alone and before the recurrent snapshot
+    // tail: chunk boundaries, two sequences, q/k heads shared by 3 v heads, permuted inputs
+    for (int64_t T : { 64, 69, 100, 200, 1024 }) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, T, 1));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, T, 2, 3, false, false, 5));
+    }
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 100, 2, 1, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 100, 2, 1, true, false, 3));
 
     // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
     // (slot 0 = final state, slot s = state s tokens back).
