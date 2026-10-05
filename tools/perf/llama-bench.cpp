@@ -40,7 +40,8 @@
 
 // utils
 static uint64_t get_time_ns() {
-    using clock = std::chrono::high_resolution_clock;
+    // steady: high_resolution_clock is the wall clock in libstdc++, which steps under WSL2's time sync
+    using clock = std::chrono::steady_clock;
     return std::chrono::nanoseconds(clock::now().time_since_epoch()).count();
 }
 

@@ -100,9 +100,9 @@ class Server:
 
     def gen(self, prompt, max_length, params, **extra):
         body = dict(params, prompt=prompt, max_length=max_length, logprobs=True, **extra)
-        t = time.time()
+        t = time.monotonic()
         r = self.post("/api/v1/generate", body)
-        wall = time.time() - t
+        wall = time.monotonic() - t
         perf = self.post("/api/extra/perf")
         text = r["results"][0]["text"]
         tokens = [c["token"] for c in (r["results"][0].get("logprobs") or {}).get("content", [])]

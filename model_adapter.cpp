@@ -18,15 +18,16 @@
 #include <filesystem>
 #include "src/llama-arch.h"
 
-static thread_local auto bench_timer = std::chrono::high_resolution_clock().now();
+// steady: high_resolution_clock is the wall clock in libstdc++, which steps under time sync (WSL2: seconds)
+static thread_local auto bench_timer = std::chrono::steady_clock::now();
 
 void timer_start()
 {
-    bench_timer = std::chrono::high_resolution_clock().now();
+    bench_timer = std::chrono::steady_clock::now();
 }
 double timer_check()
 {
-    auto endtime = std::chrono::high_resolution_clock().now();
+    auto endtime = std::chrono::steady_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endtime - bench_timer);
     double time_taken = duration.count()/1000.0;
     return time_taken;
