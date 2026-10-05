@@ -780,7 +780,7 @@ music_default.o: otherarch/acestep/music_adapter.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # idiotic "for easier compilation"
-GPTTYPE_ADAPTER = gpttype_adapter.cpp kcpp_backend.h model_adapter.h src/llama-context.h src/llama-graph.h src/llama-cparams.h otherarch/otherarch.h include/llama.h otherarch/llama_v2.cpp otherarch/llama_v3.cpp otherarch/gptj_v1.cpp otherarch/gptj_v2.cpp otherarch/gptj_v3.cpp otherarch/gpt2_v1.cpp otherarch/gpt2_v2.cpp otherarch/gpt2_v3.cpp otherarch/rwkv_v2.cpp otherarch/rwkv_v3.cpp otherarch/neox_v2.cpp otherarch/neox_v3.cpp otherarch/mpt_v3.cpp
+GPTTYPE_ADAPTER = gpttype_adapter.cpp kcpp_backend.h model_adapter.h src/llama-context.h src/llama-graph.h src/llama-cparams.h otherarch/otherarch.h otherarch/kcpp_state_buffer.h otherarch/kcpp_sampler_util.h include/llama.h otherarch/llama_v2.cpp otherarch/llama_v3.cpp otherarch/gptj_v1.cpp otherarch/gptj_v2.cpp otherarch/gptj_v3.cpp otherarch/gpt2_v1.cpp otherarch/gpt2_v2.cpp otherarch/gpt2_v3.cpp otherarch/rwkv_v2.cpp otherarch/rwkv_v3.cpp otherarch/neox_v2.cpp otherarch/neox_v3.cpp otherarch/mpt_v3.cpp
 gpttype_adapter_default.o: $(GPTTYPE_ADAPTER)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
@@ -1109,6 +1109,9 @@ test-fattn-mma-q: tests/test-fattn-mma-q.cpp $(filter-out ggml.o ggml-backend-re
 	$(CXX) $(CXXFLAGS) $(CUBLAS_FLAGS) $(filter-out %.h,$^) -o $@ $(CUBLASLD_FLAGS) $(LDFLAGS)
 
 test-kv-mask: tests/test-kv-mask.cpp src/llama-kv-cells.h src/llama-kv-cache-mask.h
+	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@ $(LDFLAGS)
+
+test-kcpp-state-buffer: tests/test-kcpp-state-buffer.cpp otherarch/kcpp_state_buffer.h
 	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@ $(LDFLAGS)
 
 test-cuda-fusion-alloc: tests/test-cuda-fusion-alloc.cpp $(filter-out ggml.o ggml-backend-reg_default.o,$(HADAMARD_TEST_OBJS)) ggml_v4_cublas.o ggml-backend-reg_cublas.o $(CUBLAS_OBJS_V4)

@@ -13,6 +13,7 @@
 
 #include "utils.h"
 #include "model_adapter.h"
+#include "kcpp_state_buffer.h"
 
 //for sampler params
 struct kcpp_params {
@@ -536,17 +537,6 @@ struct speculative_draft_result
     int verify_n_past = 0;
 };
 
-// resize() leaves the new bytes uninitialized: zero-filling a ~400 MB state buffer costs far more than the copy into it
-template <typename T>
-struct kcpp_noinit_allocator : std::allocator<T>
-{
-    template <typename U> struct rebind { using other = kcpp_noinit_allocator<U>; };
-    kcpp_noinit_allocator() = default;
-    template <typename U> kcpp_noinit_allocator(const kcpp_noinit_allocator<U> &) {}
-    template <typename U> void construct(U * p) { ::new (static_cast<void *>(p)) U; }
-    template <typename U, typename... Args> void construct(U * p, Args &&... args) { ::new (static_cast<void *>(p)) U(std::forward<Args>(args)...); }
-};
-using kcpp_state_buffer = std::vector<uint8_t, kcpp_noinit_allocator<uint8_t>>;
 
 struct savestate_data
 {

@@ -82,6 +82,7 @@ models-mnt
 /test-gdn-gating
 /test-cuda-fusion-alloc
 /test-kv-mask
+/test-kcpp-state-buffer
 /bench-rht
 /ggml/src/ggml-cuda/**/*.d
 /ggml/src/ggml-cuda/.flags
