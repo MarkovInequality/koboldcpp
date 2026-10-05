@@ -1108,6 +1108,9 @@ test-mtp-draft-vocab-cuda: tests/test-mtp-draft-vocab.cpp $(LLAMA_TOOL_OBJS_CUDA
 test-fattn-mma-q: tests/test-fattn-mma-q.cpp $(filter-out ggml.o ggml-backend-reg_default.o,$(HADAMARD_TEST_OBJS)) ggml_v4_cublas.o ggml-backend-reg_cublas.o $(CUBLAS_OBJS_V4)
 	$(CXX) $(CXXFLAGS) $(CUBLAS_FLAGS) $(filter-out %.h,$^) -o $@ $(CUBLASLD_FLAGS) $(LDFLAGS)
 
+test-kv-mask: tests/test-kv-mask.cpp src/llama-kv-cells.h src/llama-kv-cache-mask.h
+	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@ $(LDFLAGS)
+
 test-cuda-fusion-alloc: tests/test-cuda-fusion-alloc.cpp $(filter-out ggml.o ggml-backend-reg_default.o,$(HADAMARD_TEST_OBJS)) ggml_v4_cublas.o ggml-backend-reg_cublas.o $(CUBLAS_OBJS_V4)
 	$(CXX) $(CXXFLAGS) $(CUBLAS_FLAGS) $(filter-out %.h,$^) -o $@ $(CUBLASLD_FLAGS) $(LDFLAGS)
 

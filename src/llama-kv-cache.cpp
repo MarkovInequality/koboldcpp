@@ -1,4 +1,5 @@
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-mask.h"
 
 #include "llama-impl.h"
 #include "llama-io.h"
@@ -1631,6 +1632,14 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                     idxs.reserve(ubatch->n_tokens + n_swa + 32);
 
                     seq_srct[seq_id] = i;
+                }
+            }
+
+            if constexpr (causal && !swa && !alibi) {
+                if (!prev && cells.seq_has_all_used(seq_id)) {
+                    llama_kv_mask_row_causal(cells, n_kv, p1, is_2d, p1_x, p1_y, seq_pos_min[seq_id] - (llama_pos) (n_swa + 32),
+                                             mask_keep, mask_drop, data + idst, idxs);
+                    continue;
                 }
             }
 

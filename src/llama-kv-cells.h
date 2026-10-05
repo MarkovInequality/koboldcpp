@@ -394,6 +394,16 @@ public:
         return pos[i];
     }
 
+    // every used cell carries seq_id
+    bool seq_has_all_used(llama_seq_id seq_id) const {
+        return seq_pos[seq_id].size() == used.size();
+    }
+
+    // the cells' positions, -1 for an empty cell
+    const llama_pos * pos_data() const {
+        return pos.data();
+    }
+
     const llama_kv_cell_ext & ext_get(uint32_t i) const {
         assert(i < pos.size());
         assert(pos[i] != -1);
