@@ -45,6 +45,12 @@ SHORT = [
 GUIDANCE = ("Describe a quiet morning in a small coastal town.", "sad, gloomy, rain")
 GRAMMAR = ("List three primary colors as a JSON array of lowercase strings.",
            'root ::= "[" ws item ("," ws item)* ws "]"\nitem ::= "\\"" [a-z]+ "\\""\nws ::= " "?')
+# long enough for MTP to draft under the grammar
+GRAMMAR_LONG = ("Describe three fictional books as a JSON array of objects with a title, an author, a year and a one-sentence summary.",
+                'root ::= "[" ws book ("," ws book)* ws "]"\n'
+                'book ::= "{" ws "\\"title\\": " str "," ws "\\"author\\": " str "," ws "\\"year\\": " [0-9]+ "," ws "\\"summary\\": " str ws "}"\n'
+                'str ::= "\\"" [^"\\\\\\n]* "\\""\n'
+                'ws ::= [ \\n]*')
 
 def chat(p):
     return f"<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
@@ -205,6 +211,9 @@ def run_server(name, args, tree, workdir, res):
                 r = s.gen(chat(GRAMMAR[0]), 64, GREEDY, grammar=GRAMMAR[1])
                 out["grammar"] = r
                 print(f"  grammar: [{r['hash']}] {r['text']!r}, drafts {r['draft_ok']}/{r['draft_fail']}", flush=True)
+                r = s.gen(chat(GRAMMAR_LONG[0]), 300, GREEDY, grammar=GRAMMAR_LONG[1])
+                out["grammar_long"] = r
+                print(f"  grammar_long: [{r['hash']}] {r['n_out']} tok -> {r['n_out']/r['eval_s']:.1f} t/s, drafts {r['draft_ok']}/{r['draft_fail']}", flush=True)
         else:
             r = s.gen(chat(GUIDANCE[0]), 200, GREEDY, negative_prompt=chat(GUIDANCE[1]), guidance_scale=1.5)
             out["guidance"] = r
@@ -260,11 +269,18 @@ def main():
         if name == "guidance-nomtp" and "guidance-mtp" in res:
             cross = ("guidance", res["guidance-mtp"]["guidance"], res["guidance-nomtp"]["guidance"], chat(GUIDANCE[0]),
                      {"negative_prompt": chat(GUIDANCE[1]), "guidance_scale": 1.5})
+        crosses = [cross] if cross else []
         if name == "nomtp" and "mtp" in res and "grammar" in res["mtp"]:
-            cross = ("grammar", res["mtp"]["grammar"], res["nomtp"]["grammar"], chat(GRAMMAR[0]), {"grammar": GRAMMAR[1]})
+            crosses = [("grammar", res["mtp"]["grammar"], res["nomtp"]["grammar"], chat(GRAMMAR[0]), {"grammar": GRAMMAR[1]})]
+            if "grammar_long" in res["mtp"]:
+                crosses.append(("grammar_long", res["mtp"]["grammar_long"], res["nomtp"]["grammar_long"], chat(GRAMMAR_LONG[0]),
+                                {"grammar": GRAMMAR_LONG[1]}))
         try:
-            if cross:
+            for cross in crosses:
                 good = same_or_near_tie(s, cross[3], cross[1], cross[2], f"{cross[0]}: MTP vs no MTP", **cross[4])
+                if cross[0] == "grammar_long" and cross[1]["draft_ok"] == 0:
+                    print("  grammar_long: MTP did not draft under the grammar  FAIL")
+                    good = False
                 res.setdefault("_cross", {})[cross[0]] = good
                 ok &= good
         finally:
