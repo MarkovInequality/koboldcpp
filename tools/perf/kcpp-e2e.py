@@ -12,6 +12,10 @@
 #
 # deep: MTP generation after ~32k- and ~96k-token prompts (pinned sources), at a 131072-token context
 #
+# agentic: a conversation that grows like an agent's: a ~27k-token first prompt, then turns that each append the
+# reply and ~3k tokens of new input, 150 tokens generated per turn, SmartCache on as in a real setup; reports each
+# turn's wall time (prompt processing, generation and SmartCache snapshots)
+#
 # media: a server with MTP, the vision projector, whisper and TTS on the GPU; an image description, a TTS clip, a
 # transcription, and a TTS clip made while an MTP generation runs (both must equal their solo results)
 #
@@ -19,7 +23,7 @@
 # checks (guidance and grammar give the same text with and without MTP) accept a divergence only at a near-tie,
 # probed with top-2 logprobs at the first differing token.
 
-import argparse, base64, hashlib, json, os, shutil, signal, subprocess, sys, tempfile, threading, time, urllib.request
+import argparse, base64, hashlib, json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, urllib.request
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 DEFAULT_MODEL = os.path.expanduser("~/AI/qwen3/Qwen3.8-27B-HQ4_K_M.gguf")
@@ -35,6 +39,8 @@ TTS_TEXT = "The quick brown fox jumps over the lazy dog, then naps in the warm a
 LONG_SRC = ("53ed051ce", "src/llama-graph.cpp", 30000)  # pinned, so edits to the tree don't change the prompt
 DEEP_SRC = ("53ed051ce", ["src/llama-context.cpp", "src/llama-graph.cpp", "ggml/src/ggml.c", "src/llama-vocab.cpp"])
 DEEP_CHARS = {"deep32k": 100000, "deep96k": 300000}
+AGENTIC_SRC = ("53ed051ce", ["src/llama-model.cpp", "src/llama-vocab.cpp"])
+AGENTIC_TURNS, AGENTIC_TURN_CHARS = 5, 10000
 NEAR_TIE = 1e-3
 
 SHORT = [
@@ -74,6 +80,7 @@ SERVERS = {
     "guidance-mtp":   ["--usemtp", "--draftamount", "4", "--enableguidance"],
     "guidance-nomtp": ["--enableguidance"],
     "deep":           ["--usemtp", "--draftamount", "4", "--contextsize", "131072"],
+    "agentic":        ["--usemtp", "--draftamount", "4", "--contextsize", "131072", "--smartcache", "2"],
     "media":          ["--usemtp", "--draftamount", "4", "--mmproj", MEDIA["mmproj"], "--whispermodel", MEDIA["whisper"],
                        "--ttsmodel", MEDIA["tts"], "--ttswavtokenizer", MEDIA["wavtokenizer"], "--ttsgpu"],
 }
@@ -84,6 +91,7 @@ def h(s):
 class Server:
     def __init__(self, tree, model, flags, port, log):
         self.port = port
+        self.log = log
         cmd = [sys.executable, os.path.join(tree, "koboldcpp.py"), "--model", model, "--usecuda", "normal", "0",
                "--gpulayers", "99", "--contextsize", "32768", "--quantkv", "q5_1", "--batchsize", "1024",
                "--port", str(port), "--quiet", "--skiplauncher", "--nopipelineparallel"] + flags
@@ -115,6 +123,13 @@ class Server:
         return {"hash": h(text), "text": text, "tokens": tokens, "wall": wall, "n_in": perf["last_input_count"],
                 "n_out": perf["last_token_count"], "pp_s": perf["last_process_time"], "eval_s": perf["last_eval_time"],
                 "draft_ok": perf.get("last_draft_success"), "draft_fail": perf.get("last_draft_failed")}
+
+    # (tokens, seconds) of the last request's prompt processing from koboldcpp's summary line; the perf endpoint
+    # counts reused prompt tokens as processed
+    def last_processed(self):
+        lines = [l for l in open(self.log, errors="replace").read().splitlines() if "CtxLimit:" in l]
+        m = re.search(r"Processed:(\d+) in ([\d.]+)s", lines[-1]) if lines else None
+        return (int(m.group(1)), float(m.group(2))) if m else (0, 0.0)
 
     def top2_gap(self, prompt, **extra):
         r = self.post("/api/v1/generate", dict({"prompt": prompt, "max_length": 1, "temperature": 1.0, "top_k": 2, "top_p": 1.0,
@@ -153,6 +168,12 @@ def deep_prompt(n_chars):
                    for p in paths)[:n_chars]
     return chat(f"Summarize what this code does in three sentences:\n{text}")
 
+def agentic_turns():
+    sha, paths = AGENTIC_SRC
+    text = "".join(subprocess.run(["git", "-C", REPO, "show", f"{sha}:{p}"], capture_output=True, text=True, check=True).stdout
+                   for p in paths)
+    return [text[i*AGENTIC_TURN_CHARS:(i+1)*AGENTIC_TURN_CHARS] for i in range(AGENTIC_TURNS)]
+
 def run_server(name, args, tree, workdir, res):
     log = os.path.join(workdir, f"{name}.log")
     print(f"== {name}: loading", flush=True)
@@ -165,6 +186,19 @@ def run_server(name, args, tree, workdir, res):
                 out[k] = r
                 print(f"  {k}: [{r['hash']}] {r['n_in']} tok, process {r['pp_s']:.1f}s -> {r['n_in']/r['pp_s']:.0f} t/s; "
                       f"{r['n_out']} tok -> {r['n_out']/r['eval_s']:.1f} t/s, drafts {r['draft_ok']}/{r['draft_fail']}", flush=True)
+        elif name == "agentic":
+            prompt = deep_prompt(DEEP_CHARS["deep32k"])
+            for i, chunk in enumerate([None] + agentic_turns()):
+                if chunk is not None:
+                    prompt += f"<|im_end|>\n<|im_start|>user\nNow this part, in three sentences:\n{chunk}<|im_end|>\n" \
+                              "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+                r = s.gen(prompt, 150, GREEDY)
+                r["n_pp"], r["pp_s"] = s.last_processed()
+                prompt += r["text"]
+                out[f"turn{i}"] = r
+                print(f"  turn{i}: [{r['hash']}] {r['n_in']} tok, wall {r['wall']:.2f}s: processed {r['n_pp']} in {r['pp_s']:.2f}s, "
+                      f"{r['n_out']} tok in {r['eval_s']:.2f}s, other {r['wall'] - r['pp_s'] - r['eval_s']:.2f}s, "
+                      f"drafts {r['draft_ok']}/{r['draft_fail']}", flush=True)
         elif name == "media":
             img = base64.b64encode(open(MEDIA["image"], "rb").read()).decode()
             r = s.gen(chat("Describe this image in two sentences."), 80, GREEDY, images=[img])
@@ -259,8 +293,7 @@ def main():
         names += ["guidance-mtp", "guidance-nomtp"]
     if "media" in args.configs:
         names += ["media"]
-    if "deep" in args.configs:
-        names += ["deep"]
+    names += [n for n in ("deep", "agentic") if n in args.configs]
 
     res, ok = {}, True
     for name in names:
@@ -315,6 +348,9 @@ def main():
                 if k.startswith("long"):
                     speed, gs = r["n_in"]/r["pp_s"], g["n_in"]/g["pp_s"]
                     what = "prompt t/s"
+                elif k.startswith("turn"):
+                    speed, gs = 1/r["wall"], 1/g["wall"]
+                    what = "turns/s"
                 else:
                     speed, gs = r["n_out"]/r["eval_s"], g["n_out"]/g["eval_s"]
                     what = "gen t/s"

@@ -58,7 +58,7 @@ if [ $quick = 1 ]; then
     step "rollback suite (CUDA)"  ./test-recurrent-state-rollback-cuda -m "$model" -ngl 99 -c 4096 -p "The quick brown fox jumps over the lazy dog. Once upon a time in a land far away there lived"
 else
     step "rollback suite (CUDA, no fusion, CPU)" tests/test-recurrent-state-rollback.sh "$model"
-    step "kcpp-e2e check"         venv/bin/python tools/perf/kcpp-e2e.py check "$golden" --configs mtp,nomtp,guidance,grammar,media,deep
+    step "kcpp-e2e check"         venv/bin/python tools/perf/kcpp-e2e.py check "$golden" --configs mtp,nomtp,guidance,grammar,media,deep,agentic
 fi
 
 echo
