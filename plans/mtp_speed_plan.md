@@ -840,3 +840,54 @@ All A/Bs interleaved, 3 rounds, 27B HQ4_K_M, q5_1 K/V, FA, contention 13–16 %.
   moved; the guidance/grammar cross-checks, media and deep configs pass. `deep` is a new e2e config (32k and 96k
   prompts at a 131072 context).
 - Standing suite at Phase 4 end: PASS (all steps, including the CPU rollback leg and the e2e check with deep).
+
+### Phase 5: item 6a (996092a1f, 24a3cd980, 1eb9fde73, 1265c94af, 0c8ee129b, 456805cd7, 756c559de, 3e8ae2c1f, dc62c870e)
+
+The pp5 verify graph at `n_rs_seq = 4` went from 2389 kernels (Phase 4 census) to 1553; ncu's serialized time at base
+clocks from 21.76 to 19.52 ms. Each step is one commit with its test and an interleaved llama-bench A/B (8 rounds
+unless noted; "paired" is the per-round difference).
+
+- **Step 1, conv update** (996092a1f): {CONCAT, CPY × K, SSM_CONV, [ADD], SILU} as one kernel, with alloc deps for
+  its inputs. pp5 19.99 → 19.22 ms, tg32 471 → 458 ms. SSM_CONV_UPDATE in test-backend-ops (counter; concat as output
+  and more than 32 tokens not fused).
+- **Step 2, state in place** (24a3cd980): with one sequence the GDN reads its state row through `s_copy`, the gather
+  skipped. pp5 19.69 → 18.72 ms. GATED_DELTA_NET_STATE_IN_PLACE (rows the snapshots overwrite; two sequences not).
+- **Step 4 before 3, MMVQ fusions for 2–8 columns** (1eb9fde73): gate/up/GLU and the residual adds of down and wo.
+  - First attempt slower (pp5 19.29 → 20.35 ms): the fused kernel checks for a gate at run time, which at 5 columns
+    cost enough registers (134–137 vs 96–118) that fused GLU ran ~40 % slower than the two matmuls. With more than one
+    column the gate is now a template flag. bench-mmvq at 5 columns: GLU equal or faster, residual add ~1 µs faster,
+    except IQ4_XS at K 17408 (~3 µs slower; loading the bias in the epilogue instead was slower for every type).
+  - Fused only where the node alone runs MMVQ (`ggml_cuda_mul_mat_runs_mmvq`), as an RHT may have written src1 in
+    that kernel's Q8_1 layout; biases must have the output's strides.
+  - pp5 19.05 → 18.62 ms (6 rounds), tg32 neutral. MMVQ_FUSION (counter, broadcast bias, matmul as output).
+- **Step 3, gating in the GDN** (1265c94af): sigmoid(β) and softplus(α + dt)·A computed in the kernel through the
+  unary ops' helpers (now in unary.cuh); add, softplus, mul and sigmoid skipped, planned once per evaluation with the
+  in-place gathers. Bitwise the same (`test-gdn-gating`). pp5 20.59 → 20.34 ms in 10 rounds under 13 % GPU contention,
+  8 of 10 paired rounds faster. GATED_DELTA_NET_GATING (second consumer of β, g as output).
+- **Step 5, α and β in one launch** (0c8ee129b): two adjacent MUL_MATs of the same input with weights of one type and
+  shape run as one MMVQ launch, the second through the gate plumbing written to its own output. The models expand the
+  β and α projections next to each other. At 5120 → 48 Q8_0 (24 blocks) a pair takes 7.5 µs instead of 13.5 at 5
+  columns, 3.4 instead of 5.5 at one. pp5 18.28 → 18.12 ms, tg32 462.5 → 455.6 ms.
+- **Step 6, reshape-tolerant matchers:**
+  - {MUL_MAT, RESHAPE, ADD} with a row-keeping reshape (ssm_out and the residual; 456805cd7). It fused 1 of 48 at
+    first: the allocator puts the sum in place of the residual, which the generic memory-range check refuses. The
+    kernel allows that alias (each block reads its rows' bias before writing them); only src1 must not overlap
+    (3e8ae2c1f). `test-cuda-fusion-alloc` allocates with ggml_gallocr as the scheduler does, which test-backend-ops
+    can't (6 of 6 failed with the old check). pp5 18.20 → 18.09 ms after the fix.
+  - Not a GLU but the same prologue: {UNARY silu, MUL, [RESHAPE], RHT}, the gated norm before ssm_out's rotation,
+    computed in the rotation's SWIGLU prologue (756c559de). unary_gated kernels 64 → 16; A/B within noise.
+- **Step 7, one L2 norm over q and k** (dc62c870e): on the fused GDN path the models norm a [d, 2·H_k, T, S] view and
+  pass two strided views; every backend's GDN reads q/k through strides. rms_norm 177 → 129. pp5 18.10 → 17.84 ms.
+- **Not done:** α + dt through MMVQ (superseded by step 3); conv snapshot planes min(T, K) (after step 1 the copies
+  are inside the fused kernel, so only the unused planes' bytes would go, not kernels).
+- Every step: kcpp-e2e hashes unchanged.
+- **Phase 4 end → Phase 5 end** (interleaved, 0 % contention): llama-bench pp5 `-nrs 4` 20.08 → 17.87 ms (8 of 8
+  rounds), tg32 483 → 451 ms; at depth 88k pp5 37.8 → 32.6 ms, tg16 359 → 345 ms. kcpp-e2e (3 rounds): MTP generation
+  +5–11 %, MTP off +3–4 %, short prompts +5–14 %, long prompts unchanged.
+- **Timing on this box:** the WSL2 guest TSC ran 9.8 % fast against the Windows clock and time sync stepped the wall
+  clock back 2.7 s every 32 s. Durations from the wall clock (koboldcpp's timer, llama-bench) came out negative or
+  seconds off when they spanned a step; the deep96k generation rates of single kcpp-e2e runs were unusable for that
+  reason (one Phase 5 run at 41.8 t/s, two at 33.3). Both timers now use the steady clock (9d3152d27); absolute rates
+  read ~9 % low until the VM's clock is recalibrated (`wsl --shutdown`), ratios are unaffected.
+- Standing suite at Phase 5 end: PASS, with the new steps test-gdn-gating and test-cuda-fusion-alloc and the counted
+  cases MMVQ_FUSION, SSM_CONV_UPDATE, GATED_DELTA_NET_STATE_IN_PLACE (the last two had been missing from the list).
