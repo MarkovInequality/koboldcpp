@@ -891,3 +891,72 @@ unless noted; "paired" is the per-round difference).
   read ~9 % low until the VM's clock is recalibrated (`wsl --shutdown`), ratios are unaffected.
 - Standing suite at Phase 5 end: PASS, with the new steps test-gdn-gating and test-cuda-fusion-alloc and the counted
   cases MMVQ_FUSION, SSM_CONV_UPDATE, GATED_DELTA_NET_STATE_IN_PLACE (the last two had been missing from the list).
+
+### Phase 6: item 6b (88504aed4, golden 3689ffed3)
+
+- **Sweep:** bench-mmvq built 14 times with the GENERIC table overridden (nwarps 1/2/4/5/8 × rows per block 1/2/4;
+  8 × 4 exceeds static shared memory for the fused kernels), the 27B's shapes (K 5120 → N 48/1024/6144/10240/12288/17408,
+  6144 → 5120, 17408 → 5120), Q4_K/Q5_K/Q6_K/IQ4_XS/Q8_0, 1/2/5/8 columns, 2 rotated rounds (bench-mmvq now warms up
+  for 300 ms: the GPU idles at ~200 MHz).
+  - The clear result: launches with few warps in flight (5120 → 48 and → 1024) are 15–45 % faster with 5 warps.
+  - Re-tuned tables gained up to 2.7 % of MMVQ time in isolation (weighted by the 27B's shape counts) but lost 5–10 %
+    on some shapes; a K-aware one (1 warp over 4 rows for K ≥ 6144 from 5 columns, 2 over 2 below) gained 2.7 % in
+    bench-mmvq and nothing in the model's graph (pp5 17.74 → 17.79 ms), where these shapes run as fused kernels.
+- **Kept:** `MMVQ_PARAMETERS_BLACKWELL` = the generic table, but a launch with fewer than 6 warps per SM in flight
+  takes 5 warps per block (the `halve_iters` variant, now also from 2 columns and at 1 column outside GB10). Host and
+  device pick the table as for GB10, so a portable build agrees: a CU13 portable mmvq (PTX for compute_75..120,
+  `KCPP_LIMIT_CUDA_MAX_ARCH=1200`) passes the matmul tests through JIT and launches the same block shapes (ncu).
+- **Bug found on the way:** a 5-row block over 512 MUL_MAT_ID rows wrote past its rows: the kernel's last-block bound
+  is `stride_col_dst`, which for MUL_MAT_ID spans the experts. Latent upstream (rows per block were powers of two);
+  `small_k` launches keep 4 warps. Caught by the existing MUL_MAT_ID sentinels.
+- **Results:** bench-mmvq (3 rounds, 27B-weighted) 1/2/5/8 columns −0.5/−1.4/−1.0/−0.3 %, no shape slower beyond
+  noise; llama-bench pp5 `-nrs 4` 17.68 → 17.64 ms (7 of 8 paired rounds), tg32 neutral. Under the plan's estimate
+  (−0.2 to −0.5 ms).
+- **Quality:** KL against BF16 in 5-token ubatches (new `test-hadamard-ppl -ub N`, the verify regime), mean KL
+  wiki/heldout/opencode 0.00932/0.00814/0.00594 → 0.00935/0.00806/0.00588. Greedy texts moved at near-ties: golden
+  re-recorded (cross-checks pass).
+
+### Phase 7: gated items (ab916ca46 3d, 7086d7f44 grammar, 0432296e9 GDN perf cases)
+
+Gate measurements with a scratch build timing every graph (CUDA events), each draft call and each KQ mask build,
+under kcpp-e2e. On this VM the monotonic clock ran 9.8 % fast (see Phase 5), which first looked like a 1.4 ms host
+gap per verify: spin-polling the events showed the GPU starts within 0.1 ms and the gap is exactly the clock's 9.8 %.
+
+- **3d, KQ mask (done):** at 88k context a 1-token mask took ~100 µs (the first row scans every cell with per-cell
+  checks; later rows copy), ~6 per MTP cycle: 0.4–0.6 ms per cycle at 96k, linear in the context (the user runs 262k).
+  When every used cell carries the sequence (`llama_kv_cells::seq_has_all_used`, O(1)) the row needs only the
+  positions array: causal masks without SWA or ALiBi, 2D (M-RoPE, qwen35) checked on the cells at the token's
+  position. 1-token mask 94–105 → 32 µs, 5-token 123–131 → 59 µs at 88k. Masks identical: kcpp-e2e hashes (incl.
+  deep 32k/96k) and the rollback suite unchanged. `test-kv-mask`: 16000 random layouts (empty cells, cells used
+  without a sequence, shared cells, positions out of order/repeated/past, 1D and 2D) against the per-cell checks.
+- **Grammar (done):** drafting was disabled under any grammar (f75bbb945, no reason). The verify samples each row
+  with the grammar advanced through accepted tokens only, so it is exact. kcpp-e2e's new `grammar_long` prompt
+  (212 tokens of JSON) gives the no-MTP text with MTP, 58.1 → 105.9 t/s (142 of 190 drafts accepted); the check
+  requires drafting under it (failed before).
+- **4c (gate not met):** per cycle the 5 MTP graphs (catch-up 0.375 ms GPU, 4 draft steps 1.005 ms each) run in
+  5.14 ms of real time against 4.40 ms GPU: ~0.18 ms host gap per draft step, under the 0.3 ms gate. The catch-up
+  decode itself is 0.49 ms of wall per cycle; deferring it into draft step 1 stays a candidate (~2 %).
+- **6c (no gain):**
+  - Step 1: prefetching the next token's q/k/v/g/β in `gated_delta_net_cuda` (bitwise) made it 5–10 % slower at
+    1/5/1024 tokens (the kernel already hides load latency across warps; the extra registers cost occupancy);
+    `__restrict__` alone is neutral. Not committed.
+  - Step 2: upstream's chunked graph path (`build_delta_net_chunking`, `fused_gdn_ch` off) is 17 % slower on pp1024
+    (2875–2922 vs 3468–3488 t/s).
+  - Step 3 (a chunked tensor-core kernel with a recurrent K-tail) not attempted: the GDN is 1.02 ms per layer per
+    1024-token ubatch, ~17 % of prefill, so this stays the largest prefill opportunity, as its own project.
+  - GDN perf cases at the 27B's shapes added to test-backend-ops.
+- **3c (not pursued):** the Q/K rotation pair and the K/V set_rows pair are adjacent and fusable, but together ~32
+  launches (~0.05 ms) per graph, ~0.3 % of a verify.
+- **Phase 5 end → Phase 7 end** (llama-bench, interleaved, steady clock): depth 0 pp5 17.64 → 17.60 ms, tg32 neutral;
+  at 88k pp5 28.03 → 27.74 ms and tg16 288.7 → 286.3 ms (3 of 3 rounds, the KQ mask); MTP under a grammar +82 %.
+- **Standing suite at Phase 7 end:** PASS after one test refinement: test-mtp-draft-vocab compared the reduced draft
+  head's tail bitwise in a 5-row batch, which the Blackwell table's widened launch for that small matmul rounds
+  differently (all within 1e-4); the head rows and the single-token draft steps stay bitwise (7f84a2224).
+
+### Open after this plan
+
+- A chunked tensor-core gated-delta-net prefill kernel with a recurrent K-tail (6c step 3): ~17 % of prefill.
+- Deferring the MTP catch-up decode into the first draft step (4c's first option): ~0.49 ms per cycle of wall.
+- The MMVQ block shape by K from 5 columns (1 warp over 4 rows for K ≥ 6144): 2.7 % of MMVQ time in isolation,
+  nothing measurable in the graph; worth revisiting with the fused kernels in the sweep.
+- `--mtpvocab 65536` (4b) stays off by default; +5–19 % MTP generation on this model.
