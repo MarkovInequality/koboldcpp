@@ -1794,6 +1794,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     return use_mul_mat_vec_f;
 }
 
+static bool ggml_cuda_mul_mat_runs_mmvq(const ggml_tensor * mm);
+
 static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
@@ -1811,8 +1813,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
-    //we only support fusion for ncols_dst = 1
-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
+    // more than one column only where the node alone runs MMVQ too, whose Q8_1 layout an RHT may have written
+    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1 && !ggml_cuda_mul_mat_runs_mmvq(tensor)) {
         return false;
     }
 
@@ -1867,6 +1869,13 @@ static ggml_cuda_mm_path ggml_cuda_mul_mat_path(const ggml_tensor * src0, const 
         return GGML_CUDA_MM_Q;
     }
     return GGML_CUDA_MM_CUBLAS;
+}
+
+static bool ggml_cuda_mul_mat_runs_mmvq(const ggml_tensor * mm) {
+    const int device = ggml_cuda_get_device();
+    return ggml_get_op_params_i32(mm, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
+        ggml_cuda_mul_mat_path(mm->src[0], mm->src[1], mm, ggml_cuda_info().devices[device].cc,
+                               ggml_cuda_info().devices[device].warp_size) == GGML_CUDA_MM_VEC_Q;
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -3648,7 +3657,6 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
-// try and fuse nodes and return the number of nodes to skip
 // the GET_ROWS that gathers a gated-delta-net state for one sequence, if the GDN can read its source row in place
 // instead (the gather is then skipped): state = reshape(get_rows(states, s_copy)), each used once
 static const ggml_tensor * ggml_cuda_gdn_state_rows(const ggml_cgraph * cgraph, const ggml_tensor * gdn) {
@@ -3710,6 +3718,12 @@ static bool ggml_cuda_match_ssm_conv_update(const ggml_cgraph * cgraph, int i, g
 // ggml_cuda_try_fuse: the node ran (differently), no further nodes are covered
 #define GGML_CUDA_FUSED_NODE_ONLY -1
 
+// a bias the fused matmul kernels add, which they read with the output's strides
+static bool ggml_cuda_mm_bias_fits(const ggml_tensor * bias, const ggml_tensor * out) {
+    return !bias || out->ne[1] == 1 || ggml_are_same_stride(bias, out);
+}
+
+// try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4047,7 +4061,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 const ggml_tensor * up_bias   = with_bias ? get_bias_tensor(up_out_n, up_scale_n, bias_op) : nullptr;
                 const ggml_tensor * gate_bias = with_bias ? get_bias_tensor(gate_out_n, gate_scale_n, bias_op) : nullptr;
                 if (with_bias && (!ggml_are_same_shape(gate_out_n->src[0], gate_out_n->src[1]) ||
-                        !ggml_are_same_shape(up_out_n->src[0], up_out_n->src[1]))) {
+                        !ggml_are_same_shape(up_out_n->src[0], up_out_n->src[1]) ||
+                        !ggml_cuda_mm_bias_fits(up_bias, glu) || !ggml_cuda_mm_bias_fits(gate_bias, glu))) {
                     continue;
                 }
 
@@ -4199,7 +4214,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
             // we don't support repeating adds
             if (bias_op == GGML_OP_ADD && (!ggml_are_same_shape(gate_bias_n->src[0], gate_bias_n->src[1]) ||
-                                           !ggml_are_same_shape(up_bias_n->src[0], up_bias_n->src[1]))) {
+                                           !ggml_are_same_shape(up_bias_n->src[0], up_bias_n->src[1]) ||
+                                           !ggml_cuda_mm_bias_fits(up_bias_tensor, glu) ||
+                                           !ggml_cuda_mm_bias_fits(gate_bias_tensor, glu))) {
                 continue;
             }
 
@@ -4340,7 +4357,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (with_bias && !bias) {
                 continue;
             }
-            if (with_bias && bias_op == GGML_OP_ADD && !ggml_are_same_shape(out_node->src[0], out_node->src[1])) {
+            if (with_bias && bias_op == GGML_OP_ADD && (!ggml_are_same_shape(out_node->src[0], out_node->src[1]) ||
+                                                        !ggml_cuda_mm_bias_fits(bias, out_node))) {
                 continue;
             }
             if (with_bias && bias_op == GGML_OP_ADD_ID && out_node->src[2] != mm_node->src[2]) {
@@ -4406,7 +4424,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             continue;
         }
 
-        if (bias_op == GGML_OP_ADD && !ggml_are_same_shape(bias_node->src[0], bias_node->src[1])) {
+        if (bias_op == GGML_OP_ADD && (!ggml_are_same_shape(bias_node->src[0], bias_node->src[1]) ||
+                                       !ggml_cuda_mm_bias_fits(bias_tensor, bias_node))) {
             continue;
         }
 
@@ -4850,9 +4869,6 @@ static const ggml_tensor * ggml_cuda_glu_input_mm(const ggml_tensor * t) {
     return is_mm(t) ? t : nullptr;
 }
 
-// The fused gate/up/GLU kernels read the GEMMs' shared input while they write the GLU, so the input stays allocated
-// until the GLU. Otherwise the GLU output can land on it (with Hadamard-rotated weights, on the freed RHT) and
-// ggml_cuda_check_fusion_memory_ranges refuses the fusion.
 static bool ggml_cuda_match_ssm_conv_update(const ggml_cgraph * cgraph, int i, ggml_cuda_ssm_conv_update_match & m) {
     ggml_tensor * concat = cgraph->nodes[i];
     if (concat->op != GGML_OP_CONCAT || ggml_get_op_params_i32(concat, 0) != 0 || concat->type != GGML_TYPE_F32 ||
@@ -4923,6 +4939,9 @@ static bool ggml_cuda_match_ssm_conv_update(const ggml_cgraph * cgraph, int i, g
     return true;
 }
 
+// The fused gate/up/GLU kernels read the GEMMs' shared input while they write the GLU, so the input stays allocated
+// until the GLU. Otherwise the GLU output can land on it (with Hadamard-rotated weights, on the freed RHT) and
+// ggml_cuda_check_fusion_memory_ranges refuses the fusion.
 static void ggml_cuda_glu_add_alloc_deps(ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * glu = cgraph->nodes[i];
@@ -6230,6 +6249,11 @@ static bool ggml_backend_cuda_rht_write_q8_1(const ggml_tensor * rht, int fmt, i
     return ggml_cuda_rht_write_q8_1(rht, fmt, n_consumers);
 }
 
+static bool ggml_backend_cuda_mul_mat_runs_mmvq(ggml_backend_dev_t dev, const ggml_tensor * mm) {
+    ggml_cuda_set_device(((ggml_backend_cuda_device_context *) dev->context)->device);
+    return ggml_cuda_mul_mat_runs_mmvq(mm);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -6279,6 +6303,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_rht_write_q8_1") == 0) {
         return (void *)ggml_backend_cuda_rht_write_q8_1;
+    }
+    if (strcmp(name, "ggml_backend_cuda_mul_mat_runs_mmvq") == 0) {
+        return (void *)ggml_backend_cuda_mul_mat_runs_mmvq;
+    }
+    if (strcmp(name, "ggml_backend_cuda_mmvq_fused_count") == 0) {
+        return (void *)ggml_cuda_mmvq_fused_count;
     }
     return nullptr;
 }

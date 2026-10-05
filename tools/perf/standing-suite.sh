@@ -35,7 +35,7 @@ make LLAMA_CUBLAS=1 -j8 test-backend-ops test-hadamard-archs-cuda test-hadamard-
 
 # cases that assert the global fusion/RHT counters run on one thread
 ops="FLASH_ATTN_EXT,MUL_MAT,MUL_MAT_ID,GATED_DELTA_NET,RMS_NORM,RMS_NORM_SCALE,NORM_SCALE,SSM_CONV,GLU,SET_ROWS"
-counted="RHT,RHT_FUSED,ADD_ADD,ADD_RMS_NORM,GATED_DELTA_NET_CACHE_FUSION,MUL_MAT_ID_FUSION,MUL_MAT_VEC_FUSION,RMS_NORM_MUL_ADD,RMS_NORM_MUL_ROPE,ROPE_SET_ROWS,SSM_CONV_BIAS_SILU,SSM_SCAN_ROLLBACK,TOPK_MOE,MUL_MAT_HADAMARD"
+counted="RHT,RHT_FUSED,MMVQ_FUSION,SSM_CONV_UPDATE,GATED_DELTA_NET_STATE_IN_PLACE,ADD_ADD,ADD_RMS_NORM,GATED_DELTA_NET_CACHE_FUSION,MUL_MAT_ID_FUSION,MUL_MAT_VEC_FUSION,RMS_NORM_MUL_ADD,RMS_NORM_MUL_ROPE,ROPE_SET_ROWS,SSM_CONV_BIAS_SILU,SSM_SCAN_ROLLBACK,TOPK_MOE,MUL_MAT_HADAMARD"
 step "test-backend-ops ops"       ./test-backend-ops -b CUDA0 -j 4 -o "$ops"
 step "test-backend-ops RHT and fusion cases" ./test-backend-ops -b CUDA0 -o "$counted"
 step "test-kcpp-sampler"          ./test-kcpp-sampler

@@ -2,7 +2,10 @@
 // Each case multiplies a cycle of weight copies of at least 384 MB (L2 is 96 MB on the 5090) in one graph, so CUDA
 // graphs launch it and no weight byte comes from L2; GB/s is against 1792 GB/s and a measured LDG.128 read roofline.
 //
-// usage: bench-mmvq [-t TYPES] [-k KS] [-n NS] [-c NCOLS] [-r REPS]   (comma lists; types by ggml name)
+// With -e add each product gets a same-shape residual added, with -e glu pairs of copies are gate and up into a
+// SWIGLU: the epilogues MMVQ fuses (GGML_CUDA_DISABLE_FUSION=1 for the unfused kernels).
+//
+// usage: bench-mmvq [-t TYPES] [-k KS] [-n NS] [-c NCOLS] [-r REPS] [-e none|add|glu]   (comma lists; types by ggml name)
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -86,6 +89,7 @@ int main(int argc, char ** argv) {
     std::vector<int64_t> ns = { 48, 96, 1024, 6144, 10240, 17408 };
     std::vector<int64_t> ncols = { 1, 2, 3, 4, 5, 6, 7, 8 };
     int reps = 10;
+    std::string epilogue = "none";
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::string a = argv[i];
         auto to_i64 = [](const std::string & s) { return (int64_t) std::stoll(s); };
@@ -94,6 +98,7 @@ int main(int argc, char ** argv) {
         else if (a == "-n") ns = parse_list<int64_t>(argv[i + 1], to_i64);
         else if (a == "-c") ncols = parse_list<int64_t>(argv[i + 1], to_i64);
         else if (a == "-r") reps = std::stoi(argv[i + 1]);
+        else if (a == "-e") epilogue = argv[i + 1];
         else { fprintf(stderr, "unknown option %s\n", a.c_str()); return 1; }
     }
 
@@ -113,7 +118,7 @@ int main(int argc, char ** argv) {
             }
             for (int64_t N : ns) {
                 const size_t w_bytes = ggml_row_size(type, K)*N;
-                const int n_copies = (int) std::min<size_t>(4096, (cycle_bytes + w_bytes - 1)/w_bytes);
+                const int n_copies = 2*(int) std::min<size_t>(2048, (cycle_bytes + 2*w_bytes - 1)/(2*w_bytes));
 
                 // one quantized random weight, copied n_copies times on the device
                 std::vector<float> wf(K*N);
@@ -122,14 +127,22 @@ int main(int argc, char ** argv) {
                 ggml_quantize_chunk(type, wf.data(), wq.data(), 0, N, K, nullptr);
 
                 for (int64_t nc : ncols) {
-                    ggml_init_params ip = { ggml_tensor_overhead()*(2*n_copies + 8) + ggml_graph_overhead_custom(n_copies + 8, false), nullptr, true };
+                    ggml_init_params ip = { ggml_tensor_overhead()*(4*n_copies + 8) + ggml_graph_overhead_custom(3*n_copies + 8, false), nullptr, true };
                     ggml_context * ctx = ggml_init(ip);
                     std::vector<ggml_tensor *> ws(n_copies);
                     for (auto & w : ws) w = ggml_new_tensor_2d(ctx, type, K, N);
                     ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, nc);
-                    ggml_cgraph * gf = ggml_new_graph_custom(ctx, n_copies + 8, false);
-                    for (auto * w : ws) {
-                        ggml_build_forward_expand(gf, ggml_mul_mat(ctx, w, x));
+                    ggml_tensor * r = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N, nc);
+                    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 3*n_copies + 8, false);
+                    for (int c = 0; c < n_copies; ++c) {
+                        if (epilogue == "glu") {
+                            ggml_build_forward_expand(gf, ggml_swiglu_split(ctx, ggml_mul_mat(ctx, ws[c], x), ggml_mul_mat(ctx, ws[c + 1], x)));
+                            ++c;
+                        } else if (epilogue == "add") {
+                            ggml_build_forward_expand(gf, ggml_add(ctx, ggml_mul_mat(ctx, ws[c], x), r));
+                        } else {
+                            ggml_build_forward_expand(gf, ggml_mul_mat(ctx, ws[c], x));
+                        }
                     }
                     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
                     if (!buf) {
@@ -143,9 +156,13 @@ int main(int argc, char ** argv) {
                     std::vector<float> xf(K*nc);
                     for (auto & v : xf) v = nd(rng);
                     ggml_backend_tensor_set(x, xf.data(), 0, xf.size()*sizeof(float));
+                    std::vector<float> rf(N*nc, 1.0f);
+                    ggml_backend_tensor_set(r, rf.data(), 0, rf.size()*sizeof(float));
 
-                    for (int warm = 0; warm < 3; ++warm) {
+                    // at least 300 ms, so the clocks are up
+                    for (const auto w0 = std::chrono::steady_clock::now(); std::chrono::steady_clock::now() - w0 < std::chrono::milliseconds(300);) {
                         ggml_backend_graph_compute(backend, gf);
+                        ggml_backend_synchronize(backend);
                     }
                     std::vector<double> t;
                     for (int r = 0; r < reps; ++r) {

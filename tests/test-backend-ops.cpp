@@ -9555,7 +9555,131 @@ struct test_gdn_state_in_place : public test_case {
     }
 };
 
+// Quantized matmuls of 1-8 columns with the epilogues the CUDA backend fuses into MMVQ, as the models build them:
+// gate and up into a GLU, and an add of a same-shape residual on either side. The input is x or its rotation, whose
+// Q8_1 the kernel may then read. The counter must show the fusion exactly where the matmul alone runs MMVQ
+// (ggml_backend_cuda_mul_mat_runs_mmvq), and with more than one column never for a broadcast bias; never when the
+// matmul is an output.
+enum test_mmvq_fusion_kind {
+    MMVQ_FUSION_GLU,
+    MMVQ_FUSION_ADD,           // mm + r
+    MMVQ_FUSION_ADD_SWAPPED,   // r + mm
+    MMVQ_FUSION_ADD_BCAST,     // mm + b, b one column
+    MMVQ_FUSION_ADD_MM_OUTPUT, // mm + r, mm an output
+};
+
+struct test_mmvq_fusion : public test_case {
+    const test_mmvq_fusion_kind kind;
+    const ggml_type type;
+    const int64_t k, n, m;
+    const bool rht;
+
+    int64_t count0  = -1;
+    int     checked = -1;
+    ggml_tensor * mm = nullptr;
+    std::vector<ggml_tensor *> check_nodes;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MMVQ_FUSION";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR6(kind, type, k, n, m, rht);
+    }
+
+    test_mmvq_fusion(test_mmvq_fusion_kind kind, ggml_type type, int64_t k, int64_t n, int64_t m, bool rht)
+        : kind(kind), type(type), k(k), n(n), m(m), rht(rht) {}
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return check_nodes; }
+
+    double max_nmse_err() override {
+        return kind == MMVQ_FUSION_GLU ? 1e-3 : 5e-4;
+    }
+
+    static void * cuda_fn(const char * name) {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+        return reg ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
+    }
+
+    static int64_t fused_count() {
+        auto fn = (int64_t (*)(void)) cuda_fn("ggml_backend_cuda_mmvq_fused_count");
+        return fn ? fn() : -1;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        count0  = fused_count();
+        checked = -1;
+        check_nodes.clear();
+
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+        ggml_set_name(x, "x");
+        ggml_tensor * in = rht ? ggml_rht(ctx, x, 42) : x;
+
+        mm = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, type, k, n), in);
+        ggml_tensor * r = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, kind == MMVQ_FUSION_ADD_BCAST ? 1 : m);
+        ggml_set_name(r, "r");
+        ggml_tensor * out = nullptr;
+        switch (kind) {
+            case MMVQ_FUSION_GLU:
+                out = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, type, k, n), in), mm);
+                break;
+            case MMVQ_FUSION_ADD_SWAPPED:
+                out = ggml_add(ctx, r, mm);
+                break;
+            case MMVQ_FUSION_ADD:
+            case MMVQ_FUSION_ADD_BCAST:
+            case MMVQ_FUSION_ADD_MM_OUTPUT:
+                out = ggml_add(ctx, mm, r);
+                break;
+        }
+        if (kind == MMVQ_FUSION_ADD_MM_OUTPUT) {
+            ggml_set_output(mm);
+            check_nodes.push_back(mm);
+        }
+        ggml_set_name(out, "out");
+        check_nodes.push_back(out);
+        return out;
+    }
+
+    double max_err(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        if (checked < 0) {
+            checked = 1;
+            if (strcmp(ggml_backend_reg_name(reg), "CUDA") == 0 && count0 >= 0) {
+                auto runs_mmvq = (bool (*)(ggml_backend_dev_t, const ggml_tensor *)) cuda_fn("ggml_backend_cuda_mul_mat_runs_mmvq");
+                GGML_ASSERT(runs_mmvq);
+                const char * env     = getenv("GGML_CUDA_DISABLE_FUSION");
+                const bool   fusable = kind == MMVQ_FUSION_GLU || kind == MMVQ_FUSION_ADD || kind == MMVQ_FUSION_ADD_SWAPPED ||
+                                       (kind == MMVQ_FUSION_ADD_BCAST && m == 1);
+                const bool   expect  = !(env && atoi(env)) && fusable && runs_mmvq(ggml_backend_get_device(backend), mm);
+                const bool   fused   = fused_count() > count0;
+                if (fused != expect) {
+                    printf("[MMVQ] %s, expected %s ", fused ? "fused" : "not fused", expect ? "fused" : "not fused");
+                    checked = 0;
+                }
+            }
+        }
+        return checked ? max_nmse_err() : -1.0;
+    }
+};
+
 static void make_test_cases_fork(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    // Q4_K and Q6_K leave MMVQ at 6 and 8 columns on some devices
+    for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0 }) {
+        for (test_mmvq_fusion_kind kind : { MMVQ_FUSION_GLU, MMVQ_FUSION_ADD, MMVQ_FUSION_ADD_SWAPPED, MMVQ_FUSION_ADD_BCAST,
+                                            MMVQ_FUSION_ADD_MM_OUTPUT }) {
+            for (int64_t m : { 1, 2, 3, 5, 6, 8 }) {
+                for (bool rht : { false, true }) {
+                    test_cases.emplace_back(new test_mmvq_fusion(kind, type, 5120, 1023, m, rht));
+                }
+            }
+        }
+    }
+    test_cases.emplace_back(new test_mmvq_fusion(MMVQ_FUSION_GLU, GGML_TYPE_Q4_0, 256, 48, 5, false));
+    test_cases.emplace_back(new test_mmvq_fusion(MMVQ_FUSION_ADD, GGML_TYPE_Q4_0, 256, 48, 5, false));
+
     // source row 2 is among the slots the snapshots overwrite, row 6 is not
     for (int32_t row : { 0, 2, 6 }) {
         test_cases.emplace_back(new test_gdn_state_in_place(4, 128, 5, 5, { row }));
@@ -12130,6 +12254,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 }
                 test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
             }
+        }
+    }
+
+    // Qwen3.8-27B matmuls with the epilogues MMVQ fuses, in decode and the MTP verify batch: gate/up into the GLU, and
+    // ffn_down and the attention/ssm output projections plus the residual, reading the rotation the HQ weights take
+    for (int64_t m : {1, 5}) {
+        for (ggml_type type : {GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K}) {
+            test_cases.emplace_back(new test_mmvq_fusion(MMVQ_FUSION_GLU, type,  5120, 17408, m, true));
+            test_cases.emplace_back(new test_mmvq_fusion(MMVQ_FUSION_ADD, type, 17408,  5120, m, true));
+            test_cases.emplace_back(new test_mmvq_fusion(MMVQ_FUSION_ADD, type,  6144,  5120, m, true));
         }
     }
 
