@@ -14,6 +14,7 @@
 #include "utils.h"
 #include "model_adapter.h"
 #include "kcpp_state_buffer.h"
+#include "kcpp_smartcache.h"
 
 //for sampler params
 struct kcpp_params {
@@ -538,6 +539,16 @@ struct speculative_draft_result
 };
 
 
+// SmartCache checkpoints of hybrid and recurrent models: the partial (recurrent) state at a position, the attention
+// KV being cut back with seq_rm
+struct kcpp_ckpt_data
+{
+    kcpp_state_buffer tgt;
+    kcpp_state_buffer dft; // only for a draft context with recurrent state; MTP's attention KV is cut back instead
+    std::vector<uint8_t> spec;
+    std::vector<float> logits; // latest checkpoints only
+};
+
 struct savestate_data
 {
     size_t current_savestate_size = 0;
@@ -547,7 +558,8 @@ struct savestate_data
     std::vector<gpt_vocab::id> savestate_context_tokens; //for context clones
     std::vector<float> latest_logits;
     std::vector<uint8_t> spec_state; //the speculative decoder's state that goes with the snapshot (MTP: the pending hidden row)
-    int64_t last_used = 0; //unix timestamp, updated on save or load
+    int64_t last_used = 0; //use order, updated on save, load or touch
+    kcpp_ckpt_list<kcpp_ckpt_data> ckpts; //the snapshot's checkpoints, shared with the live context it came from
     std::string media_signature = "";
 };
 

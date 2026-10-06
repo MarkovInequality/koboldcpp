@@ -4139,6 +4139,14 @@ def repack_toolcall_tags(text: str, original_tools:list):
     tool_calls = coerce_tool_argtypes(tool_calls, original_tools)
     return tool_calls
 
+# the SmartCache slot count in effect (hybrid models get 2 unless --smartcache sets it) and the checkpoints of the
+# live context and of each slot
+def smartcache_info():
+    try:
+        return json.loads(ctypes.string_at(handle.get_smartcache_info()).decode("UTF-8"))
+    except Exception:
+        return {"slots": 0, "checkpoints": [], "slot_checkpoints": []}
+
 def format_jinja(messages_orig, tools, chat_template_kwargs=None):
     try:
         def strftime_now(format='%Y-%m-%d %H:%M:%S'):
@@ -7703,19 +7711,19 @@ Change Mode<br>
             global_memory["triggered_sleeping"] = False
             if clean_path.endswith('/api/admin/check_state'):
                 if global_memory and args.admin and args.admindir and os.path.exists(args.admindir) and self.check_header_password(args.adminpassword):
+                    info = smartcache_info()
                     cur_states = []
-                    for sl in range(savestate_limit): #0,1,2,3
+                    for sl in range(info["slots"]):
                         oldstate = handle.calc_old_state_kv(sl)
                         oldtokencnt = handle.calc_old_state_tokencount(sl)
-                        cur_states.append({"tokens":oldtokencnt,"size":oldstate})
+                        cur_states.append({"tokens":oldtokencnt,"size":oldstate,"checkpoints":info["slot_checkpoints"][sl]})
                     newstate = handle.calc_new_state_kv()
                     newtokencnt = handle.calc_new_state_tokencount()
-                    info = json.loads(ctypes.string_at(handle.get_smartcache_info()).decode("UTF-8"))
-                    response_body = (json.dumps({"success": True, "old_states":cur_states, "new_state_size":newstate, "new_tokens":newtokencnt, "checkpoints":info["checkpoints"]}).encode())
+                    response_body = (json.dumps({"success": True, "slots":info["slots"], "old_states":cur_states, "new_state_size":newstate, "new_tokens":newtokencnt, "checkpoints":info["checkpoints"]}).encode())
                 else:
                     response_body = (json.dumps({"success": False, "old_states":[], "new_state_size":0, "new_tokens":0}).encode())
             elif clean_path.endswith('/api/admin/load_state'):
-                if global_memory and savestate_limit>0 and args.admin and args.admindir and os.path.exists(args.admindir) and self.check_header_password(args.adminpassword):
+                if global_memory and smartcache_info()["slots"]>0 and args.admin and args.admindir and os.path.exists(args.admindir) and self.check_header_password(args.adminpassword):
                     targetslot = 0
                     try:
                         tempbody = json.loads(body)
@@ -7723,14 +7731,14 @@ Change Mode<br>
                             targetslot = tempbody.get('slot', 0)
                     except Exception:
                         pass
-                    targetslot = (targetslot if targetslot<savestate_limit else 0)
+                    targetslot = (targetslot if targetslot<smartcache_info()["slots"] else 0)
                     result = handle.load_state_kv(targetslot)
                     tokencnt = handle.calc_new_state_tokencount()
                     response_body = (json.dumps({"success": result, "new_tokens":tokencnt}).encode())
                 else:
                     response_body = (json.dumps({"success": False, "new_tokens":0}).encode())
             elif clean_path.endswith('/api/admin/save_state'):
-                if global_memory and savestate_limit>0 and args.admin and args.admindir and os.path.exists(args.admindir) and self.check_header_password(args.adminpassword):
+                if global_memory and smartcache_info()["slots"]>0 and args.admin and args.admindir and os.path.exists(args.admindir) and self.check_header_password(args.adminpassword):
                     targetslot = 0
                     try:
                         tempbody = json.loads(body)
@@ -7738,14 +7746,14 @@ Change Mode<br>
                             targetslot = tempbody.get('slot', 0)
                     except Exception:
                         pass
-                    targetslot = (targetslot if targetslot<savestate_limit else 0)
+                    targetslot = (targetslot if targetslot<smartcache_info()["slots"] else 0)
                     result = handle.save_state_kv(targetslot)
                     tokencnt = handle.calc_new_state_tokencount()
                     response_body = (json.dumps({"success": (result>0), "new_state_size":result, "new_tokens":tokencnt}).encode())
                 else:
                     response_body = (json.dumps({"success": False, "new_state_size":0, "new_tokens":0}).encode())
             elif clean_path.endswith('/api/admin/clear_state'):
-                if global_memory and savestate_limit>0 and args.admin and args.admindir and os.path.exists(args.admindir) and self.check_header_password(args.adminpassword):
+                if global_memory and smartcache_info()["slots"]>0 and args.admin and args.admindir and os.path.exists(args.admindir) and self.check_header_password(args.adminpassword):
                     result = handle.clear_state_kv()
                     response_body = (json.dumps({"success": result}).encode())
                 else:

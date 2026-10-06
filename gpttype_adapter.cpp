@@ -67,7 +67,6 @@
 #include "llama-vocab.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-recurrent.h"
-#include "kcpp_smartcache.h"
 #include "nlohmann/json.hpp"
 
 //const
@@ -187,16 +186,7 @@ static std::map<int,std::vector<int>> antislop_banned_token_ids; //first is the 
 
 static int savestate_limit = 0;
 static std::vector<savestate_data> savestates;
-
-// SmartCache checkpoints of hybrid and recurrent models: the partial (recurrent) state at a position, the attention
-// KV being cut back with seq_rm
-struct kcpp_ckpt_data
-{
-    kcpp_state_buffer tgt;
-    kcpp_state_buffer dft; // only for a draft context with recurrent state; MTP's attention KV is cut back instead
-    std::vector<uint8_t> spec;
-    std::vector<float> logits; // latest checkpoints only
-};
+static int64_t smartcache_clock = 0;
 static kcpp_ckpt_pool<kcpp_ckpt_data> ckpt_pool;
 static kcpp_ckpt_list<kcpp_ckpt_data> live_ckpts;
 static bool draft_has_recurrent_state = false;
@@ -3655,6 +3645,10 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
             {
                 printf("RNN or Hybrid model with FF and shifting flags enabled - SmartCache will be enabled. Disable CtxShift if you do not want this.\n");
                 kcpp_data->smartcache = true;
+                if(!inputs.smartcache)
+                {
+                    savestate_limit = 2;
+                }
             }
         }
         savestates.resize(savestate_limit);
@@ -5679,9 +5673,43 @@ static bool smartcache_load_checkpoint(const kcpp_ckpt<kcpp_ckpt_data> & c)
     return true;
 }
 
-// Hybrid and recurrent models with SmartCache: the prompt continues from the furthest restore point (the live
-// context's end, one of its checkpoints, or a slot the prompt contains). Sets n_past, current_context_tokens,
-// last_n_tokens and embd_inp to match and returns the restore point in tokens.
+// Saves the live context before it is discarded, in kcpp_save_target's order. False when the only slot is the one
+// about to be loaded.
+static bool smartcache_save_live(int exclude)
+{
+    std::vector<kcpp_slot_view> views(savestate_limit);
+    for(int i = 0; i < savestate_limit; ++i)
+    {
+        const savestate_data & sd = savestates[i];
+        views[i].empty = sd.current_savestate_size == 0;
+        views[i].last_used = (uint64_t) sd.last_used;
+        if(views[i].empty || sd.media_signature != media_composite_image_signature)
+        {
+            continue;
+        }
+        const int n = (int) sd.savestate_context_tokens.size();
+        const int shared = kcpp_shared_prefix(sd.savestate_context_tokens, current_context_tokens);
+        views[i].identical = shared == n && n == (int) current_context_tokens.size();
+        views[i].prefix = shared == n ? n : 0;
+    }
+    int slot = -1;
+    const kcpp_save_action act = kcpp_save_target((int) current_context_tokens.size(), views, exclude, slot);
+    if(act == kcpp_save_action::touch)
+    {
+        touch_slot(slot);
+        savestates[slot].ckpts = live_ckpts;
+    }
+    else if(act == kcpp_save_action::save)
+    {
+        gpttype_save_state_kv(slot);
+    }
+    return act != kcpp_save_action::none || (int) current_context_tokens.size() <= kcpp_ckpt_tail;
+}
+
+// Hybrid and recurrent models with SmartCache: the prompt continues from the furthest restore point (a context's
+// end that the prompt contains, or a checkpoint of the live context or of a slot). The live context goes to a slot
+// first if the prompt keeps less than 70 % of it. Sets n_past, current_context_tokens, last_n_tokens and embd_inp
+// to match and returns the restore point in tokens.
 static int smartcache_restore(std::vector<int> & embd_inp, bool blank_prompt)
 {
     const std::vector<int> prompt = embd_inp;
@@ -5696,43 +5724,39 @@ static int smartcache_restore(std::vector<int> & embd_inp, bool blank_prompt)
         kcpp_ctx_view<kcpp_ckpt_data> v;
         v.src       = i;
         v.tokens    = &savestates[i].savestate_context_tokens;
+        v.ckpts     = &savestates[i].ckpts;
         v.limit     = INT_MAX;
-        v.last_used = savestates[i].last_used;
+        v.last_used = (uint64_t) savestates[i].last_used;
         v.usable    = savestates[i].current_savestate_size > 0 && savestates[i].media_signature == media_composite_image_signature;
         views.push_back(v);
     }
-    kcpp_restore<kcpp_ckpt_data> choice;
-    if(!blank_prompt)
-    {
-        choice = kcpp_choose_restore(prompt, views);
-    }
-    // a live context with every token decoded and nothing new: only a latest checkpoint there has the logits
-    if(choice.src < 0 && choice.full && choice.point == (int) prompt.size() && views[0].limit == choice.point)
-    {
-        auto c = live_ckpts.find(choice.point);
-        if(!c || c->kind != kcpp_ckpt_kind::latest)
+    auto choose = [&](const std::vector<kcpp_ctx_view<kcpp_ckpt_data>> & from) {
+        kcpp_restore<kcpp_ckpt_data> r;
+        if(blank_prompt)
         {
-            choice.full = false;
-            choice.ckpt = live_ckpts.at_or_before(choice.point - 1, (int) prompt.size());
-            choice.point = choice.ckpt ? choice.ckpt->pos : 0;
+            return r;
         }
-        else
+        r = kcpp_choose_restore(prompt, from);
+        // a live context with every token decoded and nothing new: only a latest checkpoint there has the logits
+        if(r.src < 0 && r.full && r.point == (int) prompt.size() && views[0].limit == r.point)
         {
-            loaded_latest_logits = c->data.logits;
+            auto c = live_ckpts.find(r.point);
+            if(!c || c->kind != kcpp_ckpt_kind::latest)
+            {
+                r.full = false;
+                r.ckpt = live_ckpts.at_or_before(r.point - 1, (int) prompt.size());
+                r.point = r.ckpt ? r.ckpt->pos : 0;
+            }
         }
-    }
+        return r;
+    };
+    kcpp_restore<kcpp_ckpt_data> choice = choose(views);
 
-    if(!(choice.src < 0 && choice.full) && current_context_tokens.size() > kcpp_ckpt_tail)
+    const int live_len = (int) current_context_tokens.size();
+    if(!(choice.src < 0 && choice.full) && live_len > kcpp_ckpt_tail &&
+        kcpp_keep_is_low(kcpp_shared_prefix(current_context_tokens, prompt), live_len) && !smartcache_save_live(choice.src))
     {
-        const int identical_slot = get_identical_existing_slot();
-        if(identical_slot != -1)
-        {
-            touch_slot(identical_slot);
-        }
-        else
-        {
-            gpttype_save_state_kv(get_oldest_slot(choice.src));
-        }
+        choice = choose({views[0]});
     }
 
     int point = choice.point;
@@ -5761,6 +5785,10 @@ static int smartcache_restore(std::vector<int> & embd_inp, bool blank_prompt)
         if(dec == n - 1)
         {
             point = n - 1;
+        }
+        else if(dec == n && point == (int) prompt.size() && choice.src < 0)
+        {
+            loaded_latest_logits = live_ckpts.find(point)->data.logits;
         }
         start_over = dec != n && dec != n - 1;
     }
@@ -6399,43 +6427,21 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                 // Whenever loading or saving current slot, simply tag the slot with a timestamp. When running out of slots after all 3 are used, delete the oldest timestamped slot.
                 // Slot loading and saving completely reuses gpttype_load_state_kv and gpttype_save_state_kv, nothing else is needed.
                 bool foundswap = false;
-                int identical_slot = get_identical_existing_slot(); //see if a slot already exists with identical data to current
                 for(int i=0;i<savestate_limit;++i)
                 {
                     float similaritybeat = ComputePrefixMatchPercent(savestates[i].savestate_context_tokens,embd_inp);
-                    if(savestates[i].media_signature!=media_composite_image_signature)
+                    if(savestates[i].current_savestate_size==0 || savestates[i].media_signature!=media_composite_image_signature)
                     {
                         continue;
                     }
                     if(similaritybeat > similarity_threshold || (shiftable && CanContextShift(savestates[i].savestate_context_tokens, embd_inp, inputs.max_length, nctx)))
                     {
-                        //found a match. save to the oldest slot thats not the one we are loading
-                        int oldest_slot = get_oldest_slot(i);
-                        if(oldest_slot!=i)
+                        //found a match: switch to it if the current context can be saved elsewhere
+                        if(smartcache_save_live(i))
                         {
-                            if(current_context_tokens.size() > 32) //do not save tiny contexts
+                            if(!is_quiet)
                             {
-                                if(identical_slot==-1)
-                                {
-                                    if(!is_quiet)
-                                    {
-                                        printf("\n[SmartCache Match of %.2f in slot %d. Saving into slot %d and switching...]\n",similaritybeat,i,oldest_slot);
-                                    }
-                                    gpttype_save_state_kv(oldest_slot);
-                                } else {
-                                    if(!is_quiet)
-                                    {
-                                        printf("\n[SmartCache Match of %.2f in slot %d. Already saved in slot %d, switching...]\n",similaritybeat,i,identical_slot);
-                                    }
-                                    touch_slot(identical_slot);
-                                }
-                            }
-                            else
-                            {
-                                if(!is_quiet)
-                                {
-                                    printf("\n[SmartCache Match of %.2f in slot %d. Switching...]\n",similaritybeat,i);
-                                }
+                                printf("\n[SmartCache Match of %.2f in slot %d. Switching...]\n",similaritybeat,i);
                             }
                             gpttype_load_state_kv(i);
                             foundswap = true;
@@ -6445,26 +6451,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                 }
                 if(!foundswap) //could not match anything, just save kv and continue
                 {
-                    if(current_context_tokens.size() > 32) //do not save tiny contexts
-                    {
-                        if(identical_slot==-1)
-                        {
-                            int oldest_slot = get_oldest_slot(-1);
-                            if(!is_quiet)
-                            {
-                                printf("\n[SmartCache No Match, Saving into slot %d...]\n",oldest_slot);
-                            }
-                            gpttype_save_state_kv(oldest_slot);
-                        }
-                        else
-                        {
-                            if(!is_quiet)
-                            {
-                                printf("\n[SmartCache No Match, Already saved in slot %d]\n",identical_slot);
-                            }
-                            touch_slot(identical_slot);
-                        }
-                    }
+                    smartcache_save_live(-1);
                 }
             }
         }
@@ -7629,6 +7616,7 @@ size_t gpttype_save_state_kv(int slot)
             savestates[slot].savestate_context_tokens.clear();
             savestates[slot].latest_logits.clear();
             savestates[slot].spec_state.clear();
+            savestates[slot].ckpts.clear();
             savestates[slot].current_savestate_size = 0;
             savestates[slot].current_draft_savestate_size = 0;
             savestates[slot].media_signature = "";
@@ -7645,6 +7633,7 @@ size_t gpttype_save_state_kv(int slot)
             totalbytes += res;
             savestates[slot].current_savestate_size   = newsize;
             savestates[slot].savestate_context_tokens = current_context_tokens;
+            savestates[slot].ckpts = live_ckpts;
             savestates[slot].media_signature = media_composite_image_signature;
             float * lgptr = (draft_is_mtp ? llama_get_logits_ith(llama_ctx_v4, -1) : llama_get_logits(llama_ctx_v4));
             savestates[slot].latest_logits.assign(lgptr,lgptr+n_vocab);
@@ -7712,7 +7701,7 @@ bool gpttype_load_state_kv(int slot)
         if(res > 0)
         {
             current_context_tokens = savestates[slot].savestate_context_tokens;
-            live_ckpts.clear();
+            live_ckpts = savestates[slot].ckpts;
             loaded_latest_logits = savestates[slot].latest_logits;
             if(!savestates[slot].spec_state.empty())
             {
@@ -7744,6 +7733,7 @@ bool gpttype_clear_state_kv(bool shrink)
                 }
                 savestates[slot].savestate_context_tokens.clear();
                 savestates[slot].spec_state.clear();
+                savestates[slot].ckpts.clear();
                 savestates[slot].current_savestate_size = 0;
                 savestates[slot].media_signature = "";
                 if(draft_ctx && savestates[slot].current_draft_savestate_size>0)
@@ -7758,71 +7748,33 @@ bool gpttype_clear_state_kv(bool shrink)
                 savestates[slot].last_used = 0;
             }
         }
+        if(shrink)
+        {
+            ckpt_pool.release_free();
+        }
         return true;
     }
     return false;
 }
-// the live context's checkpoints, as [position, kind] pairs
+// the slot count and the checkpoints of the live context and each slot, as [position, kind] pairs
 std::string gpttype_smartcache_info()
 {
-    nlohmann::json live = nlohmann::json::array();
-    for(const auto & c : live_ckpts.items)
-    {
-        live.push_back({c->pos, kcpp_ckpt_kind_name(c->kind)});
-    }
-    return nlohmann::json{{"checkpoints", live}}.dump();
-}
-void touch_slot(int slot) //update the slot's last used time and nothing else
-{
-    auto timenow = std::chrono::system_clock::now();
-    auto timestamp = std::chrono::duration_cast<std::chrono::seconds>(timenow.time_since_epoch()).count();
-    savestates[slot].last_used = timestamp;
-}
-int get_identical_existing_slot() //returns slot number of slot containing exactly the same data, or -1 if nothing
-{
-    int64_t slotage = INT64_MAX; // Initialize with maximum possible value
-    int slotid = -1;
-    int currctxsize = current_context_tokens.size();
-    for(int i=0;i<savestate_limit;++i)
-    {
-        if(savestates[i].savestate_context_tokens.size() == currctxsize && savestates[i].media_signature==media_composite_image_signature)
+    auto list = [](const kcpp_ckpt_list<kcpp_ckpt_data> & l) {
+        nlohmann::json out = nlohmann::json::array();
+        for(const auto & c : l.items)
         {
-            bool is_identical = true;
-            const auto& slot_tokens = savestates[i].savestate_context_tokens;
-            for (size_t j = 0; j < currctxsize; ++j)
-            {
-                if (slot_tokens[j] != current_context_tokens[j])
-                {
-                    is_identical = false;
-                    break;
-                }
-            }
-
-            if (is_identical)
-            {
-                slotid = i;
-                break;
-            }
+            out.push_back({c->pos, kcpp_ckpt_kind_name(c->kind)});
         }
-    }
-    return slotid;
-}
-
-int get_oldest_slot(int excludeSlotId)
-{
-    int64_t slotage = INT64_MAX; // Initialize with maximum possible value
-    int slotid = 0;
-    for(int i=0;i<savestate_limit;++i)
+        return out;
+    };
+    nlohmann::json slots = nlohmann::json::array();
+    for(int i = 0; i < savestate_limit; ++i)
     {
-        if(i==excludeSlotId)
-        {
-            continue;
-        }
-        if(savestates[i].last_used <= slotage)
-        {
-            slotage = savestates[i].last_used;
-            slotid = i;
-        }
+        slots.push_back(list(savestates[i].ckpts));
     }
-    return slotid;
+    return nlohmann::json{{"slots", savestate_limit}, {"checkpoints", list(live_ckpts)}, {"slot_checkpoints", slots}}.dump();
+}
+void touch_slot(int slot) //update the slot's last use and nothing else
+{
+    savestates[slot].last_used = ++smartcache_clock;
 }
