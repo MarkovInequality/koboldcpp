@@ -84,6 +84,7 @@ models-mnt
 /test-cuda-fusion-alloc
 /test-kv-mask
 /test-kcpp-state-buffer
+/test-kcpp-smartcache
 /bench-rht
 /ggml/src/ggml-cuda/**/*.d
 /ggml/src/ggml-cuda/.flags

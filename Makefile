@@ -1117,6 +1117,9 @@ test-kv-mask: tests/test-kv-mask.cpp src/llama-kv-cells.h src/llama-kv-cache-mas
 test-kcpp-state-buffer: tests/test-kcpp-state-buffer.cpp otherarch/kcpp_state_buffer.h
 	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@ $(LDFLAGS)
 
+test-kcpp-smartcache: tests/test-kcpp-smartcache.cpp otherarch/kcpp_smartcache.h
+	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@ $(LDFLAGS)
+
 test-cuda-fusion-alloc: tests/test-cuda-fusion-alloc.cpp $(filter-out ggml.o ggml-backend-reg_default.o,$(HADAMARD_TEST_OBJS)) ggml_v4_cublas.o ggml-backend-reg_cublas.o $(CUBLAS_OBJS_V4)
 	$(CXX) $(CXXFLAGS) $(CUBLAS_FLAGS) $(filter-out %.h,$^) -o $@ $(CUBLASLD_FLAGS) $(LDFLAGS)
 
