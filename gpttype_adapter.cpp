@@ -6143,6 +6143,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
         }
     }
 
+    const size_t prompt_bytes_given = kcpp_data->prompt.size();
     ApplyPromptFormatAdjustments(addedmemory, kcpp_data->prompt);
 
     //thinking budget handling
@@ -6346,6 +6347,23 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     }
 
     AppendDedicatedMemoryAndNegativePrompt(embd_inp, embd_inp_mem, negprompt_tokens, kcpp_data->n_predict, nctx);
+
+    // the end of the system prompt: the memory and the prompt's first system_prompt_bytes (less what the format
+    // adjustments moved off its front), if the prompt's tokens start with them
+    int smartcache_system = -1;
+    {
+        const int64_t nb = (int64_t) inputs.system_prompt_bytes - (int64_t) (prompt_bytes_given - kcpp_data->prompt.size());
+        if((inputs.system_prompt_bytes > 0 && nb > 0 && (size_t) nb <= kcpp_data->prompt.size()) || (inputs.system_prompt_bytes <= 0 && embd_inp_mem.size() > 0))
+        {
+            std::vector<int> pre;
+            TokenizeString(kcpp_data->prompt.substr(0, inputs.system_prompt_bytes > 0 ? (size_t) nb : 0), pre, file_format, add_bos_token);
+            AppendDedicatedMemoryAndNegativePrompt(pre, embd_inp_mem, negprompt_tokens, kcpp_data->n_predict, nctx);
+            if(pre.size() > 0 && pre.size() < embd_inp.size() && std::equal(pre.begin(), pre.end(), embd_inp.begin()))
+            {
+                smartcache_system = (int) pre.size();
+            }
+        }
+    }
 
     //prepare negative prompt
     if(guidance_ctx && negprompt_tokens.size()>0 && inputs.guidance_scale!=1.0f)
@@ -6594,13 +6612,20 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
         current_context_tokens.resize(n_past);
     }
 
-    // checkpoints made while the prompt is processed: before its last kcpp_ckpt_tail tokens, at a token boundary
+    // checkpoints made while the prompt is processed: at the end of the system prompt and before the last
+    // kcpp_ckpt_tail tokens, at token boundaries outside media
     const int smartcache_len = (int) current_context_tokens.size() + (int) embd_inp.size();
     std::vector<std::pair<int, kcpp_ckpt_kind>> smartcache_cuts;
-    if(ckpt_path && smartcache_len > kcpp_ckpt_tail && smartcache_len - smartcache_point > kcpp_ckpt_tail)
+    if(ckpt_path && smartcache_len > kcpp_ckpt_tail)
     {
+        if(smartcache_system > smartcache_point && smartcache_system < smartcache_len &&
+            kcpp_media_span_boundary_ok(embd_inp, smartcache_system - smartcache_point))
+        {
+            smartcache_cuts.push_back({smartcache_system, kcpp_ckpt_kind::system});
+        }
         const int cut = smartcache_len - kcpp_ckpt_tail;
-        if(kcpp_media_span_boundary_ok(embd_inp, cut - smartcache_point))
+        if(smartcache_len - smartcache_point > kcpp_ckpt_tail && cut > smartcache_system &&
+            kcpp_media_span_boundary_ok(embd_inp, cut - smartcache_point))
         {
             smartcache_cuts.push_back({cut, kcpp_ckpt_kind::tail});
         }

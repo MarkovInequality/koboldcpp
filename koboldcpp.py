@@ -424,7 +424,8 @@ class generation_inputs(ctypes.Structure):
                 ("logit_biases", ctypes.POINTER(logit_bias)),
                 ("banned_tokens_len", ctypes.c_int),
                 ("banned_tokens", ctypes.POINTER(ctypes.c_char_p)),
-                ("reasoning_budget", ctypes.c_int)]
+                ("reasoning_budget", ctypes.c_int),
+                ("system_prompt_bytes", ctypes.c_int)]
 
 class generation_outputs(ctypes.Structure):
     _fields_ = [("status", ctypes.c_int),
@@ -2467,6 +2468,7 @@ def generate(genparams, stream_flag=False):
         inputs.banned_tokens[n] = tok.encode("UTF-8")
 
     inputs.reasoning_budget = reasoning_budget
+    inputs.system_prompt_bytes = tryparseint(genparams.get('system_prompt_bytes', -1), -1)
 
     currentusergenkey = genkey
     totalgens += 1
@@ -4147,7 +4149,7 @@ def smartcache_info():
     except Exception:
         return {"slots": 0, "checkpoints": [], "slot_checkpoints": []}
 
-def format_jinja(messages_orig, tools, chat_template_kwargs=None):
+def format_jinja(messages_orig, tools, chat_template_kwargs=None, add_generation_prompt=True):
     try:
         def strftime_now(format='%Y-%m-%d %H:%M:%S'):
             return datetime.now().strftime(format)
@@ -4218,9 +4220,9 @@ def format_jinja(messages_orig, tools, chat_template_kwargs=None):
             last_assist_msg = "" if not assist_should_prefill else last_assist_msg
             messages_for_render = messages[:-1] if len(messages) > 1 and assist_should_prefill else messages
         if tools and len(tools)>0:
-            text = jinja_compiled_template.render(messages=messages_for_render, tools=tools, add_generation_prompt=True, bos_token="", eos_token="", **chat_template_kwargs)
+            text = jinja_compiled_template.render(messages=messages_for_render, tools=tools, add_generation_prompt=add_generation_prompt, bos_token="", eos_token="", **chat_template_kwargs)
         else:
-            text = jinja_compiled_template.render(messages=messages_for_render, add_generation_prompt=True, bos_token="", eos_token="", **chat_template_kwargs)
+            text = jinja_compiled_template.render(messages=messages_for_render, add_generation_prompt=add_generation_prompt, bos_token="", eos_token="", **chat_template_kwargs)
         if assist_should_prefill and text and last_assist_msg: # handle prefill continuations
             text = text + last_assist_msg
         return text if text else None
@@ -4770,6 +4772,16 @@ ws ::= | " " | "\n" [ \t]{0,20}
                 elif "reasoning_effort" in copied_jinja_kwargs and copied_jinja_kwargs["reasoning_effort"]:
                     copied_jinja_kwargs["reasoning_strength"] = copied_jinja_kwargs["reasoning_effort"]
                 jinja_output = format_jinja(messages_array,jinjatools,copied_jinja_kwargs)
+                # the system part of the prompt, for SmartCache: the leading system messages and the tools alone
+                leading_system = []
+                for m in messages_array:
+                    if m.get("role") not in ("system", "developer"):
+                        break
+                    leading_system.append(m)
+                if jinja_output and leading_system and len(leading_system) < len(messages_array):
+                    system_part = format_jinja(leading_system,jinjatools,copied_jinja_kwargs,add_generation_prompt=False)
+                    if system_part and jinja_output.startswith(system_part):
+                        genparams["system_prompt_bytes"] = len(system_part.encode("UTF-8"))
             if jinja_output:
                 messages_string = jinja_output
                 for pair in thinkformats:
@@ -4792,10 +4804,12 @@ ws ::= | " " | "\n" [ \t]{0,20}
                     exist_mem = genparams.get('memory', "")
                     genparams["memory"] = tools_string + exist_mem
 
+                leading_system = True
                 for message in messages_array:
                     message_index += 1
                     latest_turn_was_assistant = False
                     latest_turn_was_tool = False
+                    leading_system = leading_system and message['role'] == "system"
                     if message['role'] == "system":
                         messages_string += system_message_start
                     elif message['role'] == "user":
@@ -4900,6 +4914,8 @@ ws ::= | " " | "\n" [ \t]{0,20}
                         messages_string += assistant_message_end
                     elif message['role'] == "tool":
                         messages_string += tools_message_end
+                    if leading_system and message_index < len(messages_array):
+                        genparams["system_prompt_bytes"] = len(messages_string.encode("UTF-8"))
                 messages_string += assistant_message_gen
                 if (latest_turn_was_assistant and continue_assistant_turn): #allow continue a prefill, chop off end
                     messages_string = messages_string[:-(len(assistant_message_gen)+len(assistant_message_end))]
