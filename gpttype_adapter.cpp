@@ -1152,6 +1152,7 @@ static speculative_draft_result speculative_decoding_eval_chunk(llama_context * 
         {
             mtp_spec_ckpt.update_dft(draft_ctx, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         }
+        common_speculative_get_state(draft_spec, 0, mtp_spec_ckpt.data_spec);
     }
 
     kcpp_embd_batch batch = kcpp_embd_batch(real_embd, n_past, use_mrope, true);
@@ -7303,6 +7304,10 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                 {
                     mtp_spec_ckpt.load_dft(draft_ctx, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
+                if(!mtp_spec_ckpt.data_spec.empty())
+                {
+                    common_speculative_set_state(draft_spec, 0, mtp_spec_ckpt.data_spec);
+                }
 
                 if(replay_count > 0)
                 {
@@ -7623,6 +7628,7 @@ size_t gpttype_save_state_kv(int slot)
         if (!savestates[slot].current_savestate_buffer.empty()) {  //JIT free; the buffers are kept for reuse, the sizes mark them invalid
             savestates[slot].savestate_context_tokens.clear();
             savestates[slot].latest_logits.clear();
+            savestates[slot].spec_state.clear();
             savestates[slot].current_savestate_size = 0;
             savestates[slot].current_draft_savestate_size = 0;
             savestates[slot].media_signature = "";
@@ -7642,6 +7648,10 @@ size_t gpttype_save_state_kv(int slot)
             savestates[slot].media_signature = media_composite_image_signature;
             float * lgptr = (draft_is_mtp ? llama_get_logits_ith(llama_ctx_v4, -1) : llama_get_logits(llama_ctx_v4));
             savestates[slot].latest_logits.assign(lgptr,lgptr+n_vocab);
+            if(!common_speculative_get_state(draft_spec, 0, savestates[slot].spec_state))
+            {
+                savestates[slot].spec_state.clear();
+            }
             int maxedpos = llama_memory_seq_pos_max(llama_get_memory(llama_ctx_v4),0);
             //kcpp: so maxedpos appears to always be equal to ctx tokens - 2, if savestate_ctx_tokens > maxedpos + 2 then trim excess
             if(maxedpos > 0 && savestates[slot].savestate_context_tokens.size() > maxedpos + 2)
@@ -7703,6 +7713,10 @@ bool gpttype_load_state_kv(int slot)
         {
             current_context_tokens = savestates[slot].savestate_context_tokens;
             loaded_latest_logits = savestates[slot].latest_logits;
+            if(!savestates[slot].spec_state.empty())
+            {
+                common_speculative_set_state(draft_spec, 0, savestates[slot].spec_state);
+            }
             printf("\nKV Load SaveState %d: Restored KV with %zu tokens.\n", slot,current_context_tokens.size());
             touch_slot(slot);
         }
@@ -7728,6 +7742,7 @@ bool gpttype_clear_state_kv(bool shrink)
                     savestates[slot].current_savestate_buffer.shrink_to_fit();
                 }
                 savestates[slot].savestate_context_tokens.clear();
+                savestates[slot].spec_state.clear();
                 savestates[slot].current_savestate_size = 0;
                 savestates[slot].media_signature = "";
                 if(draft_ctx && savestates[slot].current_draft_savestate_size>0)

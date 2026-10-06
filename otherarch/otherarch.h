@@ -546,6 +546,7 @@ struct savestate_data
     kcpp_state_buffer current_draft_savestate_buffer;
     std::vector<gpt_vocab::id> savestate_context_tokens; //for context clones
     std::vector<float> latest_logits;
+    std::vector<uint8_t> spec_state; //the speculative decoder's state that goes with the snapshot (MTP: the pending hidden row)
     int64_t last_used = 0; //unix timestamp, updated on save or load
     std::string media_signature = "";
 };

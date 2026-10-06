@@ -1762,6 +1762,30 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
     }
+
+    // pending_h is the first draft input and the h paired with the next batch's first token: a restored target
+    // state needs the row that was pending when it was saved
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+        data.resize(sizeof(int32_t) + (size_t) n_embd * sizeof(float));
+        std::memcpy(data.data(), &n_embd, sizeof(int32_t));
+        std::memcpy(data.data() + sizeof(int32_t), pending_h[seq_id].data(), (size_t) n_embd * sizeof(float));
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || data.size() != sizeof(int32_t) + (size_t) n_embd * sizeof(float)) {
+            return;
+        }
+        int32_t width = 0;
+        std::memcpy(&width, data.data(), sizeof(int32_t));
+        if (width != n_embd) {
+            return;
+        }
+        std::memcpy(pending_h[seq_id].data(), data.data() + sizeof(int32_t), (size_t) n_embd * sizeof(float));
+    }
 };
 
 // state of self-speculation (simple implementation, not ngram-map)

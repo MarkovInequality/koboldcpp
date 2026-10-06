@@ -78,6 +78,7 @@ models-mnt
 /test-recurrent-state-rollback*
 /test-kcpp-sampler
 /test-mtp-draft-vocab*
+/test-mtp-spec-state*
 /test-fattn-mma-q
 /test-gdn-gating
 /test-cuda-fusion-alloc
