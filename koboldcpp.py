@@ -1053,6 +1053,7 @@ def init_library():
     handle.load_state_kv.argtypes = [ctypes.c_int]
     handle.load_state_kv.restype = ctypes.c_bool
     handle.clear_state_kv.restype = ctypes.c_bool
+    handle.get_smartcache_info.restype = ctypes.c_char_p
     handle.sd_load_model.argtypes = [sd_load_model_inputs]
     handle.sd_load_model.restype = ctypes.c_bool
     handle.sd_generate.argtypes = [sd_generation_inputs]
@@ -7709,7 +7710,8 @@ Change Mode<br>
                         cur_states.append({"tokens":oldtokencnt,"size":oldstate})
                     newstate = handle.calc_new_state_kv()
                     newtokencnt = handle.calc_new_state_tokencount()
-                    response_body = (json.dumps({"success": True, "old_states":cur_states, "new_state_size":newstate, "new_tokens":newtokencnt}).encode())
+                    info = json.loads(ctypes.string_at(handle.get_smartcache_info()).decode("UTF-8"))
+                    response_body = (json.dumps({"success": True, "old_states":cur_states, "new_state_size":newstate, "new_tokens":newtokencnt, "checkpoints":info["checkpoints"]}).encode())
                 else:
                     response_body = (json.dumps({"success": False, "old_states":[], "new_state_size":0, "new_tokens":0}).encode())
             elif clean_path.endswith('/api/admin/load_state'):

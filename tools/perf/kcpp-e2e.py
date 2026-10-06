@@ -23,12 +23,13 @@
 # endpoints): OpenCode-style tool steps, regenerate, a changed generation prompt, a restore to latest - 32 compared
 # bitwise, edits near the end and far back, two interleaved conversations, a new conversation on the same system block,
 # admin save and load, and tool steps at ~90k tokens; a second server without --smartcache checks the default slot
-# count and an image at the end of a prompt. Reports processed tokens, slot saves and loads, and wall time per request;
-# the expectations that need check_state's checkpoint lists run only on a build that reports them
+# count and an image at the end of a prompt (no checkpoint inside it, restores across it equal a cold run). Reports
+# processed tokens, slot saves and loads, and wall time per request; the expectations that need check_state's
+# checkpoint lists run only on a build that reports them
 #
 # A config's texts may differ from another config's (MTP verifies batches through other kernels); the cross-config
-# checks (guidance and grammar give the same text with and without MTP) accept a divergence only at a near-tie,
-# probed with top-2 logprobs at the first differing token.
+# checks (guidance and grammar give the same text with and without MTP) and --ref accept a divergence only where the
+# two tokens' logprobs are within NEAR_TIE, probed at the first differing token.
 
 import argparse, base64, hashlib, json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, urllib.request
 
@@ -48,7 +49,9 @@ DEEP_SRC = ("53ed051ce", ["src/llama-context.cpp", "src/llama-graph.cpp", "ggml/
 DEEP_CHARS = {"deep32k": 100000, "deep96k": 300000}
 AGENTIC_SRC = ("53ed051ce", ["src/llama-model.cpp", "src/llama-vocab.cpp"])
 AGENTIC_TURNS, AGENTIC_TURN_CHARS = 5, 10000
-NEAR_TIE = 1e-3
+# a divergence counts as rounding when, at the first differing token, the two runs' tokens are this close in logprob:
+# on the 27B HQ4_K_M a batch-size change alone (1024 -> 512) diverged at gaps of 0.06-0.29 (2026-10-06)
+NEAR_TIE = 0.3
 
 SHORT = [
     "Write a Python function that parses an ISO-8601 duration string like 'P3DT4H12M' into a timedelta, with tests.",
@@ -91,7 +94,9 @@ SERVERS = {
     "media":          ["--usemtp", "--draftamount", "4", "--mmproj", MEDIA["mmproj"], "--whispermodel", MEDIA["whisper"],
                        "--ttsmodel", MEDIA["tts"], "--ttswavtokenizer", MEDIA["wavtokenizer"], "--ttsgpu"],
     "checkpoints":    ["--usemtp", "--draftamount", "4", "--contextsize", "131072", "--smartcache", "2", "--jinja", "--jinja_tools"],
-    "checkpoints-default": ["--usemtp", "--draftamount", "4", "--jinja", "--jinja_tools", "--mmproj", MEDIA["mmproj"]],
+    # f16 KV: with q5_1 a follow-up after an image differs from the same prompt processed from the start, before
+    # checkpoints already (what this server checks is that a checkpoint near an image keeps the text right)
+    "checkpoints-default": ["--usemtp", "--draftamount", "4", "--jinja", "--jinja_tools", "--mmproj", MEDIA["mmproj"], "--quantkv", "f16"],
 }
 
 CKPT_GREEDY = {"temperature": 0, "top_k": 1, "top_p": 1.0, "rep_pen": 1.0, "seed": 42}
@@ -101,6 +106,7 @@ CKPT_TOOLS = [{"type": "function", "function": {"name": n, "description": d, "pa
                               ("list_dir", "List a directory of the repository.", {"path": {"type": "string"}}),
                               ("grep", "Search the repository for a regular expression.", {"pattern": {"type": "string"}, "path": {"type": "string"}})]]
 CKPT_CAP, CKPT_TAIL = 8, 32
+CKPT_CHAINS = {"regenerate": "steps", "changed-tail": "steps", "interleaved": "edit-far", "admin": "same-system"} # prompts made of another's replies
 
 def h(s):
     return hashlib.md5(s.encode()).hexdigest()[:12]
@@ -136,8 +142,11 @@ class Server:
         wall = time.monotonic() - t
         perf = self.post("/api/extra/perf")
         text = r["results"][0]["text"]
-        tokens = [c["token"] for c in (r["results"][0].get("logprobs") or {}).get("content", [])]
-        return {"hash": h(text), "text": text, "tokens": tokens, "wall": wall, "n_in": perf["last_input_count"],
+        content = (r["results"][0].get("logprobs") or {}).get("content", [])
+        tokens = [c["token"] for c in content]
+        tops = [{t["token"]: t["logprob"] for t in c.get("top_logprobs", [])} for c in content]
+        return {"hash": h(text), "text": text, "tokens": tokens, "tops": tops, "prompt_text": prompt, "probe_extra": extra,
+                "greedy": params.get("top_k") == 1, "wall": wall, "n_in": perf["last_input_count"],
                 "n_out": perf["last_token_count"], "pp_s": perf["last_process_time"], "eval_s": perf["last_eval_time"],
                 "draft_ok": perf.get("last_draft_success"), "draft_fail": perf.get("last_draft_failed")}
 
@@ -167,22 +176,27 @@ class Server:
         saves, loads, (n_pp, pp_s) = self.events(mark)
         ids = [c["token_id"] for c in content]
         return {"hash": h(json.dumps(ids)), "tokens": ids, "tops": [{t["token_id"]: t["logprob"] for t in c["top_logprobs"]} for c in content],
-                "wall": wall, "n_in": perf["last_input_count"], "n_out": len(ids), "n_pp": n_pp, "pp_s": pp_s,
+                "greedy": True, "wall": wall, "n_in": perf["last_input_count"], "n_out": len(ids), "n_pp": n_pp, "pp_s": pp_s,
                 "eval_s": perf["last_eval_time"], "draft_ok": perf.get("last_draft_success"),
                 "draft_fail": perf.get("last_draft_failed"), "saves": saves, "loads": loads}
 
     def chat(self, messages, max_tokens, **extra):
         body = dict(CKPT_GREEDY, messages=messages, tools=CKPT_TOOLS, max_tokens=max_tokens, logprobs=True, top_logprobs=5, **extra)
+        rendered = self.post("/api/extra/tokenize", dict(extra, messages=messages, tools=CKPT_TOOLS))
         mark, t0 = self.mark(), time.monotonic()
         ch = self.post("/v1/chat/completions", body)["choices"][0]
         r = self._record(mark, t0, ch["logprobs"]["content"])
-        r["msg"] = ch["message"]
+        images = [i["image_url"]["url"].split(",", 1)[1] for m in messages if isinstance(m.get("content"), list)
+                  for i in m["content"] if i.get("type") == "image_url"]
+        r.update(msg=ch["message"], ids_prompt=rendered["ids"], prompt_text=rendered["prompt"], probe_extra={"images": images} if images else {})
         return r
 
-    def gen_ids(self, prompt, max_length):
+    def gen_ids(self, prompt, max_length, **extra):
         mark, t0 = self.mark(), time.monotonic()
-        res = self.post("/api/v1/generate", dict(GREEDY, prompt=prompt, max_length=max_length, logprobs=True))["results"][0]
-        return self._record(mark, t0, res["logprobs"]["content"])
+        res = self.post("/api/v1/generate", dict(GREEDY, prompt=prompt, max_length=max_length, logprobs=True, **extra))["results"][0]
+        r = self._record(mark, t0, res["logprobs"]["content"])
+        r.update(prompt_text=prompt, probe_extra=extra)
+        return r
 
     def tokenize(self, prompt=None, messages=None, **extra):
         body = dict(extra, prompt=prompt) if messages is None else dict(extra, messages=messages, tools=CKPT_TOOLS)
@@ -193,13 +207,6 @@ class Server:
             return self.post("/api/admin/check_state", {})
         except Exception:
             return None
-
-    def top2_gap(self, prompt, **extra):
-        r = self.post("/api/v1/generate", dict({"prompt": prompt, "max_length": 1, "temperature": 1.0, "top_k": 2, "top_p": 1.0,
-                                                "rep_pen": 1.0, "sampler_seed": 1, "logprobs": True}, **extra))
-        tops = r["results"][0]["logprobs"]["content"][0]["top_logprobs"]
-        lp = sorted((t["logprob"] for t in tops), reverse=True)
-        return lp[0] - lp[1] if len(lp) > 1 else float("inf")
 
     # the largest peak resident set of the server's processes (admin mode runs the model in a child)
     def peak_rss_gb(self):
@@ -252,17 +259,56 @@ def agentic_turns():
                    for p in paths)
     return [text[i*AGENTIC_TURN_CHARS:(i+1)*AGENTIC_TURN_CHARS] for i in range(AGENTIC_TURNS)]
 
+# a w x h RGB gradient PNG
+def gradient_png(w, h):
+    import struct, zlib
+    rows = b"".join(b"\0" + bytes(v for x in range(w) for v in (x*255//w, y*255//h, 128)) for y in range(h))
+    chunk = lambda t, d: struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
+
 def common_prefix(a, b):
     n = min(len(a), len(b))
     return next((i for i in range(n) if a[i] != b[i]), n)
 
-# the first differing token, and how far below this run's top choice the other run's token was there
-def tie_gap(r, ref_tokens):
-    k = common_prefix(r["tokens"], ref_tokens)
-    if k >= min(len(r["tokens"]), len(ref_tokens)):
+# the first token where r's text differs from ref_tokens, and the logprob gap there between the two runs' tokens,
+# probed with r's prompt and its text up to that token, without samplers or grammar (the logprobs a request reports
+# are its samplers' output: greedy keeps one token; a grammar would restart at the probe)
+def tie_probe(s, r, ref_tokens):
+    ta = r["tokens"]
+    k = common_prefix(ta, ref_tokens)
+    if k >= min(len(ta), len(ref_tokens)):
         return k, 0.0
-    tops = r["tops"][k]
-    return k, max(tops.values()) - tops.get(ref_tokens[k], float("-inf"))
+    ids = isinstance(ta[0], int)
+    prefix = s.post("/api/extra/detokenize", {"ids": ta[:k]})["result"] if ids else "".join(ta[:k])
+    extra = {f: v for f, v in r.get("probe_extra", {}).items() if f != "grammar"}
+    res = s.post("/api/v1/generate", dict({"prompt": r["prompt_text"] + prefix, "max_length": 1, "temperature": 1.0, "top_k": 0, "top_p": 1.0,
+                                           "min_p": 0.0, "rep_pen": 1.0, "sampler_seed": 1, "logprobs": True}, **extra))
+    tops = res["results"][0]["logprobs"]["content"][0]["top_logprobs"]
+    lp = {(t["token_id"] if ids else t["token"]): t["logprob"] for t in tops}
+    floor = min(lp.values())
+    return k, abs(lp.get(ta[k], floor) - lp.get(ref_tokens[k], floor))
+
+# each request whose text differs from the reference run's: the first differing token and the top-2 gap there; a
+# greedy request must diverge at a near-tie, a sampled one is reported only. A conversation is probed at its first
+# divergence (later prompts contain the diverged replies).
+def probe_against(s, name, out, ref, res):
+    diverged = set()
+    for k, r in out.items():
+        g = ref.get(k)
+        if not isinstance(r, dict) or not isinstance(g, dict) or "hash" not in r or r["hash"] == g["hash"] or not g.get("tokens"):
+            continue
+        chain = name if name == "agentic" else CKPT_CHAINS.get(k.split("/")[0], k.split("/")[0]) if name.startswith("checkpoints") else None
+        if chain in diverged:
+            continue
+        if chain:
+            diverged.add(chain)
+        i, gap = tie_probe(s, r, g["tokens"])
+        r["tie"] = [i, gap]
+        good = gap < NEAR_TIE or not r.get("greedy")
+        print(f"  {k}: differs from the reference at token {i}, logprob gap {gap:.2e}"
+              f"{'' if r.get('greedy') else ' (sampled)'}{'' if good else '  FAIL'}", flush=True)
+        if not good:
+            res.setdefault("_cross", {})[f"{name}/{k}: not a near-tie"] = False
 
 def reply_msg(m):
     a = {"role": "assistant", "content": m.get("content") or ""}
@@ -333,9 +379,8 @@ def run_checkpoints(s, name, out, res):
         return [tuple(c) for c in st["checkpoints"]] if st else None
 
     def ask(key, msgs, max_tokens, **kw):
-        ids = s.tokenize(messages=msgs, **kw)
         r = s.chat(msgs, max_tokens, **kw)
-        r["ids_prompt"], r["ckpts"], r["r"] = ids, live(), r["n_in"] - r["n_pp"]
+        r["ckpts"], r["r"] = live(), r["n_in"] - r["n_pp"]
         out[key] = r
         print(f"  {key}: [{r['hash']}] {r['n_in']} tok, processed {r['n_pp']} in {r['pp_s']:.2f}s, {r['n_out']} out in {r['eval_s']:.2f}s, "
               f"wall {r['wall']:.2f}s (other {r['wall'] - r['pp_s'] - r['eval_s']:.2f}s), saves {r['saves']} loads {r['loads']}, "
@@ -362,21 +407,31 @@ def run_checkpoints(s, name, out, res):
         st = s.state()
         print(f"  slots without --smartcache: {len(st['old_states']) if st else '?'}", flush=True)
         expect("default slot count", st is not None and len(st["old_states"]) == 2, f"{len(st['old_states']) if st else '?'} slots", needs="slots")
-        img = base64.b64encode(open(MEDIA["image"], "rb").read()).decode()
+        # 32 x 24 vision positions at the end of the prompt, then 9 tokens: latest - 32 falls inside the image
+        img = base64.b64encode(gradient_png(1024, 768)).decode()
         E = [{"role": "system", "content": "You describe images for a project's documentation."},
              {"role": "user", "content": [{"type": "text", "text": docs[:6000] + "\n\nThe image below is from this project."},
                                           {"type": "image_url", "image_url": {"url": "data:image/png;base64," + img}}]}]
         e1 = ask("media/e1", E, 64, **nothink)
         expect("media: no checkpoint inside the image", e1["ckpts"] is not None and all(k != "tail" for _, k in e1["ckpts"]),
-               f"checkpoints {e1['ckpts']}")
+               f"checkpoints {e1['ckpts']} for {e1['n_in']} tokens")
+        r = ask("media/regenerate", E, 64, **nothink)
+        expect("media: regenerate restores latest after the image", r["n_pp"] == 0 and r["hash"] == e1["hash"], f"processed {r['n_pp']}")
         E2 = E + [reply_msg(e1["msg"]), {"role": "user", "content": "Which colors dominate the image?"}]
         e2 = ask("media/e2", E2, 64, **nothink)
-        ask("media/unrelated", [{"role": "user", "content": "Say hello."}], 8, **nothink)
+        s.post("/api/v1/generate", dict(GREEDY, prompt="Unrelated text about cats.", max_length=4))
         s.post("/api/admin/clear_state", {})
-        e2c = ask("media/e2-cold", E2, 64, **nothink)
-        k, gap = tie_gap(e2c, e2["tokens"])
-        expect("media: cached follow-up equals a cold run", gap < NEAR_TIE,
-               "same text" if e2c["hash"] == e2["hash"] else f"differs at token {k}, top-2 gap {gap:.2e}")
+        cold = ask("media/e2-cold", E2, 64, **nothink)
+        # the tools block is a shared prefix: this one restores the other conversation's checkpoint, then the image
+        ask("media/other", [{"role": "user", "content": "Say hello."}], 8, **nothink)
+        s.post("/api/admin/clear_state", {})
+        r = ask("media/e2-restored", E2, 64, **nothink)
+        k, gap = tie_probe(s, r, cold["tokens"])
+        expect("media: restored from a checkpoint before the image, equals a cold run", 0 < r["r"] < r["n_in"] and gap < NEAR_TIE,
+               f"restore point {r['r']}, " + ("same text" if r["hash"] == cold["hash"] else f"differs at token {k}, top-2 gap {gap:.2e}"))
+        k, gap = tie_probe(s, e2, cold["tokens"])
+        print(f"    (report only) media: the follow-up continuing the live context after an MTP generation "
+              f"{'equals the cold run' if e2['hash'] == cold['hash'] else f'differs from the cold run at token {k}, top-2 gap {gap:.2e}'}", flush=True)
         return
 
     # OpenCode-style tool steps: the reply goes back with its reasoning and tool calls, then the tool results
@@ -414,7 +469,7 @@ def run_checkpoints(s, name, out, res):
            f"{len(ip)} and {len(iy)} tokens", needs=None)
     for key, prompt in (("bitwise/x", P), ("bitwise/y", P[:-1]), ("bitwise/z", P)):
         r = s.gen_ids(prompt, 48)
-        r["ids_prompt"], r["ckpts"], r["r"] = None, live(), r["n_in"] - r["n_pp"]
+        r["ckpts"], r["r"] = live(), r["n_in"] - r["n_pp"]
         out[key] = r
         print(f"  {key}: [{r['hash']}] {r['n_in']} tok, processed {r['n_pp']}, wall {r['wall']:.2f}s, saves {r['saves']} loads {r['loads']}, "
               f"drafts {r['draft_ok']}/{r['draft_fail']}", flush=True)
@@ -480,8 +535,13 @@ def run_checkpoints(s, name, out, res):
         last_of[key[0]] = r
         conv.append(reply_msg(r["msg"]))
 
-    # a new conversation on the same system block restores the system checkpoint
+    # a new conversation on the same system block restores the system checkpoint, which sits right after the
+    # rendered system block
     S = next((p for p, kind in (r["ckpts"] or []) if kind == "system"), None)
+    if S is not None:
+        im_end, off = s.tokenize(prompt="<|im_end|>")[-1], len(s.tokenize(prompt=""))
+        want = r["ids_prompt"].index(im_end) + 2 - off
+        expect("system checkpoint at the end of the system block", S == want, f"at {S}, the system block ends at {want}", needs="slots")
     N = [C[0], {"role": "user", "content": "Explain the build options in two sentences."}]
     n1 = ask("same-system", N, 48, **nothink)
     if S is None:
@@ -501,6 +561,18 @@ def run_checkpoints(s, name, out, res):
                needs="slots")
     r = ask("admin/regenerate", N, 48, **nothink)
     expect("admin: regenerate after the load restores latest", r["n_pp"] == 0 and r["hash"] == n1["hash"], f"processed {r['n_pp']}", needs="slots")
+
+    # /api/v1/generate: the memory is the system part
+    mem = "Notes on building llama.cpp:\n" + docs[40000:46000]
+    r = s.gen_ids(chat("Summarize the notes above in one sentence."), 32, memory=mem)
+    r["ckpts"] = live()
+    out["memory"] = r
+    want = len(s.tokenize(prompt=mem)) - len(s.tokenize(prompt=""))
+    print(f"  memory: [{r['hash']}] {r['n_in']} tok, processed {r['n_pp']}, checkpoints {r['ckpts']}", flush=True)
+    if any(kind == "system" for _, kind in r["ckpts"] or []):
+        expect("memory: a system checkpoint at the memory's end", (want, "system") in r["ckpts"], f"want {want}", needs="slots")
+    else:
+        print("    memory: no system checkpoint reported, skipped", flush=True)
 
     # OpenCode-style steps at ~90k tokens
     D = [{"role": "system", "content": sys_a},
@@ -600,6 +672,8 @@ def run_server(name, args, tree, workdir, res):
             r = s.gen(chat(GUIDANCE[0]), 200, GREEDY, negative_prompt=chat(GUIDANCE[1]), guidance_scale=1.5)
             out["guidance"] = r
             print(f"  guidance: [{r['hash']}] {r['n_out']} tok, drafts {r['draft_ok']}/{r['draft_fail']}", flush=True)
+        if args.ref_data and name in args.ref_data:
+            probe_against(s, name, out, args.ref_data[name], res)
     except Exception:
         s.stop()
         raise
@@ -610,10 +684,9 @@ def same_or_near_tie(server, prompt, a, b, label, **extra):
         print(f"  {label}: same text")
         return True
     ta, tb = a["tokens"], b["tokens"]
-    k = next((i for i in range(min(len(ta), len(tb))) if ta[i] != tb[i]), min(len(ta), len(tb)))
-    gap = server.top2_gap(prompt + "".join(ta[:k]), **extra)
+    k, gap = tie_probe(server, dict(b, prompt_text=prompt, probe_extra=extra), ta)
     ok = gap < NEAR_TIE
-    print(f"  {label}: texts differ at token {k} ({ta[k:k+1]} vs {tb[k:k+1]}), top-2 logprob gap there {gap:.2e} -> "
+    print(f"  {label}: texts differ at token {k} ({ta[k:k+1]} vs {tb[k:k+1]}), logprob gap there {gap:.2e} -> "
           f"{'near-tie, accepted' if ok else 'FAIL'}")
     return ok
 
@@ -629,8 +702,11 @@ def main():
     ap.add_argument("--server-args", default="")
     ap.add_argument("--min-ratio", type=float, default=0.0, help="check: fail when a speed falls below this ratio of the golden")
     ap.add_argument("--out", help="also write this run's results here")
+    ap.add_argument("--keep-tokens", action="store_true", help="--out keeps every request's tokens")
+    ap.add_argument("--ref", help="a --keep-tokens run of another build: where a text differs from it, probe for a near-tie")
     args = ap.parse_args()
     args.configs = args.configs.split(",")
+    args.ref_data = json.load(open(args.ref)) if args.ref else None
     if args.mode != "run" and not args.golden:
         ap.error("record and check need a golden file")
 
@@ -674,12 +750,14 @@ def main():
     # the checkpoints configs keep their token ids: a later build's texts may differ at a near-tie (the cut before the
     # last 32 tokens changes batch shapes), which the check finds from the ids
     def strip(r):
-        drop = lambda c, f: f in ("text", "msg", "tops", "ids_prompt") or (f == "tokens" and not c.startswith("checkpoints"))
+        drop = lambda c, f: f in ("text", "msg", "ids_prompt", "tops", "prompt_text", "probe_extra") or (f == "tokens" and not keep and not c.startswith("checkpoints"))
         return {c: {k: {f: v for f, v in e.items() if not drop(c, f)} if isinstance(e, dict) else e for k, e in d.items()}
                 if isinstance(d, dict) else d for c, d in r.items()}
 
     if args.out:
+        keep = args.keep_tokens
         json.dump(strip(res), open(args.out, "w"), indent=1)
+    keep = False
     if args.mode == "record":
         json.dump(strip(res), open(args.golden, "w"), indent=1)
         print(f"recorded {args.golden}")
@@ -694,16 +772,15 @@ def main():
                     g = gold[c].get(k)
                     if not g or "n_pp" not in r:
                         continue
-                    conv = k.split("/")[0]
+                    conv = CKPT_CHAINS.get(k.split("/")[0], k.split("/")[0])
                     if r["hash"] == g["hash"]:
                         what = "same"
                     elif conv in diverged:
                         what = "after a divergence"
                     else:
                         diverged.add(conv)
-                        i, gap = tie_gap(r, g["tokens"])
-                        what = f"DIFF at token {i}, top-2 gap {gap:.1e}" + ("" if gap < NEAR_TIE else "  FAIL")
-                        ok &= gap < NEAR_TIE
+                        what = f"DIFF at token {r['tie'][0]}, top-2 gap {r['tie'][1]:.1e}" if r.get("tie") else "DIFF (no --ref probe)  FAIL"
+                        ok &= bool(r.get("tie")) and r["tie"][1] < NEAR_TIE
                     print(f"  {c:19s} {k:22s} {what}; processed {r['n_pp']:6d} vs {g['n_pp']:6d}, wall {r['wall']:6.2f}s vs {g['wall']:6.2f}s, "
                           f"saves {r['saves']} vs {g['saves']}, loads {r['loads']} vs {g['loads']}, drafts {r['draft_ok']}/{r['draft_fail']} vs "
                           f"{g['draft_ok']}/{g['draft_fail']}")

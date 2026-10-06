@@ -465,6 +465,12 @@ extern "C"
     {
         return gpttype_load_state_kv(slot);
     }
+    static std::string smartcache_info = "";
+    const char * get_smartcache_info()
+    {
+        smartcache_info = gpttype_smartcache_info();
+        return smartcache_info.c_str();
+    }
     bool clear_state_kv()
     {
         return gpttype_clear_state_kv(true);
