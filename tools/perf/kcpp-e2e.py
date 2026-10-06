@@ -7,7 +7,7 @@
 #
 # --build DIR    tree with koboldcpp.py and koboldcpp_cublas.so (default: this repo)
 # --lib FILE     A/B a scratch library: runs a symlinked copy of --build with FILE as koboldcpp_cublas.so
-# --configs      comma list of mtp, nomtp, guidance, grammar, media (default: all but media)
+# --configs      comma list of mtp, nomtp, guidance, grammar, media, deep, agentic, checkpoints (default: the first four)
 # --server-args  extra koboldcpp arguments for every server, e.g. "--mtpvocab 65536"
 #
 # deep: MTP generation after ~32k- and ~96k-token prompts (pinned sources), at a 131072-token context
@@ -18,6 +18,13 @@
 #
 # media: a server with MTP, the vision projector, whisper and TTS on the GPU; an image description, a TTS clip, a
 # transcription, and a TTS clip made while an MTP generation runs (both must equal their solo results)
+#
+# checkpoints: SmartCache restore points on a hybrid model (MTP, jinja chat completions with tools, 2 slots, the admin
+# endpoints): OpenCode-style tool steps, regenerate, a changed generation prompt, a restore to latest - 32 compared
+# bitwise, edits near the end and far back, two interleaved conversations, a new conversation on the same system block,
+# admin save and load, and tool steps at ~90k tokens; a second server without --smartcache checks the default slot
+# count and an image at the end of a prompt. Reports processed tokens, slot saves and loads, and wall time per request;
+# the expectations that need check_state's checkpoint lists run only on a build that reports them
 #
 # A config's texts may differ from another config's (MTP verifies batches through other kernels); the cross-config
 # checks (guidance and grammar give the same text with and without MTP) accept a divergence only at a near-tie,
@@ -83,7 +90,17 @@ SERVERS = {
     "agentic":        ["--usemtp", "--draftamount", "4", "--contextsize", "131072", "--smartcache", "2"],
     "media":          ["--usemtp", "--draftamount", "4", "--mmproj", MEDIA["mmproj"], "--whispermodel", MEDIA["whisper"],
                        "--ttsmodel", MEDIA["tts"], "--ttswavtokenizer", MEDIA["wavtokenizer"], "--ttsgpu"],
+    "checkpoints":    ["--usemtp", "--draftamount", "4", "--contextsize", "131072", "--smartcache", "2", "--jinja", "--jinja_tools"],
+    "checkpoints-default": ["--usemtp", "--draftamount", "4", "--jinja", "--jinja_tools", "--mmproj", MEDIA["mmproj"]],
 }
+
+CKPT_GREEDY = {"temperature": 0, "top_k": 1, "top_p": 1.0, "rep_pen": 1.0, "seed": 42}
+CKPT_SRC = ("53ed051ce", ["docs/build.md", "src/llama-batch.cpp", "src/llama-context.cpp", "tools/server/README.md"])
+CKPT_TOOLS = [{"type": "function", "function": {"name": n, "description": d, "parameters": {"type": "object", "properties": p, "required": list(p)}}}
+              for n, d, p in [("read_file", "Read a file of the repository.", {"path": {"type": "string", "description": "path from the repository root"}}),
+                              ("list_dir", "List a directory of the repository.", {"path": {"type": "string"}}),
+                              ("grep", "Search the repository for a regular expression.", {"pattern": {"type": "string"}, "path": {"type": "string"}})]]
+CKPT_CAP, CKPT_TAIL = 8, 32
 
 def h(s):
     return hashlib.md5(s.encode()).hexdigest()[:12]
@@ -131,6 +148,52 @@ class Server:
         m = re.search(r"Processed:(\d+) in ([\d.]+)s", lines[-1]) if lines else None
         return (int(m.group(1)), float(m.group(2))) if m else (0, 0.0)
 
+    def mark(self):
+        return os.path.getsize(self.log)
+
+    # the slots saved and loaded, and the prompt tokens processed, since mark
+    def events(self, mark):
+        with open(self.log, "rb") as f:
+            f.seek(mark)
+            t = f.read().decode(errors="replace")
+        saves = [int(m) for m in re.findall(r"KV Save State (\d+): Created SaveState", t)]
+        loads = [int(m) for m in re.findall(r"KV Load SaveState (\d+): Restored", t)]
+        pp = re.findall(r"Processed:(\d+) in ([\d.]+)s", t)
+        return saves, loads, (int(pp[-1][0]), float(pp[-1][1])) if pp else (0, 0.0)
+
+    def _record(self, mark, t0, content):
+        wall = time.monotonic() - t0
+        perf = self.post("/api/extra/perf")
+        saves, loads, (n_pp, pp_s) = self.events(mark)
+        ids = [c["token_id"] for c in content]
+        return {"hash": h(json.dumps(ids)), "tokens": ids, "tops": [{t["token_id"]: t["logprob"] for t in c["top_logprobs"]} for c in content],
+                "wall": wall, "n_in": perf["last_input_count"], "n_out": len(ids), "n_pp": n_pp, "pp_s": pp_s,
+                "eval_s": perf["last_eval_time"], "draft_ok": perf.get("last_draft_success"),
+                "draft_fail": perf.get("last_draft_failed"), "saves": saves, "loads": loads}
+
+    def chat(self, messages, max_tokens, **extra):
+        body = dict(CKPT_GREEDY, messages=messages, tools=CKPT_TOOLS, max_tokens=max_tokens, logprobs=True, top_logprobs=5, **extra)
+        mark, t0 = self.mark(), time.monotonic()
+        ch = self.post("/v1/chat/completions", body)["choices"][0]
+        r = self._record(mark, t0, ch["logprobs"]["content"])
+        r["msg"] = ch["message"]
+        return r
+
+    def gen_ids(self, prompt, max_length):
+        mark, t0 = self.mark(), time.monotonic()
+        res = self.post("/api/v1/generate", dict(GREEDY, prompt=prompt, max_length=max_length, logprobs=True))["results"][0]
+        return self._record(mark, t0, res["logprobs"]["content"])
+
+    def tokenize(self, prompt=None, messages=None, **extra):
+        body = dict(extra, prompt=prompt) if messages is None else dict(extra, messages=messages, tools=CKPT_TOOLS)
+        return self.post("/api/extra/tokenize", body)["ids"]
+
+    def state(self):
+        try:
+            return self.post("/api/admin/check_state", {})
+        except Exception:
+            return None
+
     def top2_gap(self, prompt, **extra):
         r = self.post("/api/v1/generate", dict({"prompt": prompt, "max_length": 1, "temperature": 1.0, "top_k": 2, "top_p": 1.0,
                                                 "rep_pen": 1.0, "sampler_seed": 1, "logprobs": True}, **extra))
@@ -138,7 +201,22 @@ class Server:
         lp = sorted((t["logprob"] for t in tops), reverse=True)
         return lp[0] - lp[1] if len(lp) > 1 else float("inf")
 
+    # the largest peak resident set of the server's processes (admin mode runs the model in a child)
+    def peak_rss_gb(self):
+        peak = 0
+        for pid in filter(str.isdigit, os.listdir("/proc")):
+            try:
+                if os.getpgid(int(pid)) != self.proc.pid:
+                    continue
+                for line in open(f"/proc/{pid}/status"):
+                    if line.startswith("VmHWM:"):
+                        peak = max(peak, int(line.split()[1]))
+            except (OSError, ProcessLookupError):
+                pass
+        return peak / (1 << 20)
+
     def stop(self):
+        print(f"  peak RSS {self.peak_rss_gb():.1f} GB", flush=True)
         try:
             os.killpg(self.proc.pid, signal.SIGTERM)
             self.proc.wait(timeout=60)
@@ -174,13 +252,283 @@ def agentic_turns():
                    for p in paths)
     return [text[i*AGENTIC_TURN_CHARS:(i+1)*AGENTIC_TURN_CHARS] for i in range(AGENTIC_TURNS)]
 
+def common_prefix(a, b):
+    n = min(len(a), len(b))
+    return next((i for i in range(n) if a[i] != b[i]), n)
+
+# the first differing token, and how far below this run's top choice the other run's token was there
+def tie_gap(r, ref_tokens):
+    k = common_prefix(r["tokens"], ref_tokens)
+    if k >= min(len(r["tokens"]), len(ref_tokens)):
+        return k, 0.0
+    tops = r["tops"][k]
+    return k, max(tops.values()) - tops.get(ref_tokens[k], float("-inf"))
+
+def reply_msg(m):
+    a = {"role": "assistant", "content": m.get("content") or ""}
+    if m.get("reasoning_content") is not None:
+        a["reasoning_content"] = m["reasoning_content"]
+    if m.get("tool_calls"):
+        a["tool_calls"] = m["tool_calls"]
+    return a
+
+# the checkpoint list policy (otherarch/kcpp_smartcache.h): a cut drops checkpoints past the restore point r; a
+# request adds the system position S if r < S < L, L - 32 if more than 32 tokens are new and L - 32 > S, and L; past
+# the capacity it evicts, sparing the 3 newest and the system checkpoint (or the oldest), first those before 40 % of
+# L (earliest first), else the one whose neighbors are closest (older first on ties)
+def ckpt_predict(lst, serial, r, L, S):
+    lst[:] = [c for c in lst if c[0] <= r]
+    if L <= CKPT_TAIL:
+        return serial
+    def add(pos, kind):
+        nonlocal serial
+        serial += 1
+        lst[:] = [c for c in lst if c[0] != pos] + [(pos, serial, kind)]
+        if len(lst) <= CKPT_CAP:
+            return
+        by_serial = sorted(lst, key=lambda c: c[1])
+        keep = {c[1] for c in by_serial[-3:]}
+        sysc = [c for c in lst if c[2] == "system"]
+        keep.add(sysc[0][1] if sysc else by_serial[0][1])
+        cand = [c for c in lst if c[1] not in keep]
+        below = [c for c in cand if c[0]*10 < L*4]
+        if below:
+            lst.remove(min(below))
+            return
+        byp = sorted(lst)
+        gap = lambda c: (byp[byp.index(c)+1][0] if byp.index(c)+1 < len(byp) else L) - (byp[byp.index(c)-1][0] if byp.index(c) else 0)
+        lst.remove(min(cand, key=lambda c: (gap(c), c[1])))
+    if S and r < S < L:
+        add(S, "system")
+    if L - r > CKPT_TAIL and L - CKPT_TAIL > (S or 0):
+        add(L - CKPT_TAIL, "tail")
+    if L > r:
+        add(L, "latest")
+    else:
+        lst[:] = [(p, serial + 1 if p == L else q, k) for p, q, k in lst]
+        serial += 1
+    lst.sort()
+    return serial
+
+def run_checkpoints(s, name, out, res):
+    sha, paths = CKPT_SRC
+    docs, batch_cpp, ctx_cpp, server_md = (subprocess.run(["git", "-C", REPO, "show", f"{sha}:{p}"], capture_output=True, text=True,
+                                                          check=True).stdout for p in paths)
+    # what the build reports: the live context's checkpoints, then the slots' (an expectation runs only on a build
+    # that has what it checks)
+    st = s.state()
+    have = {None} | ({"ckpt"} if st and "checkpoints" in st else set()) | ({"slots"} if st and "slots" in st else set())
+    new = "ckpt" in have
+    print(f"  check_state reports: {', '.join(sorted(h for h in have if h)) or 'no checkpoint lists'}", flush=True)
+
+    def expect(label, cond, detail="", needs="ckpt"):
+        if needs not in have:
+            return
+        print(f"    {label}: {detail}  {'ok' if cond else 'FAIL'}", flush=True)
+        if not cond:
+            res.setdefault("_cross", {})[f"{name}: {label}"] = False
+
+    def live():
+        st = s.state() if new else None
+        return [tuple(c) for c in st["checkpoints"]] if st else None
+
+    def ask(key, msgs, max_tokens, **kw):
+        ids = s.tokenize(messages=msgs, **kw)
+        r = s.chat(msgs, max_tokens, **kw)
+        r["ids_prompt"], r["ckpts"], r["r"] = ids, live(), r["n_in"] - r["n_pp"]
+        out[key] = r
+        print(f"  {key}: [{r['hash']}] {r['n_in']} tok, processed {r['n_pp']} in {r['pp_s']:.2f}s, {r['n_out']} out in {r['eval_s']:.2f}s, "
+              f"wall {r['wall']:.2f}s (other {r['wall'] - r['pp_s'] - r['eval_s']:.2f}s), saves {r['saves']} loads {r['loads']}, "
+              f"drafts {r['draft_ok']}/{r['draft_fail']}" + (f", checkpoints {[c[0] for c in r['ckpts']]}" if r["ckpts"] is not None else ""),
+              flush=True)
+        return r
+
+    # a request that continues prev's conversation: it continues the live context if the reply re-renders into the
+    # generated tokens, else it restores prev's latest checkpoint
+    def continues(label, prev, r, slot_switch=False):
+        full = prev["ids_prompt"] + prev["tokens"]
+        d = common_prefix(full, r["ids_prompt"])
+        if d >= len(full):
+            want, how = r["n_in"] - (prev["n_in"] + prev["n_out"]) + 1, "reply re-rendered as generated: continues"
+        else:
+            want, how = r["n_in"] - prev["n_in"], f"re-rendered reply differs at its token {d - len(prev['ids_prompt'])}: restores latest"
+        expect(f"{label}", r["n_pp"] == want, f"{how}, processed {r['n_pp']} (want {want})",
+               needs="slots" if slot_switch else "ckpt" if d < len(full) else None)
+        if not slot_switch:
+            expect(f"{label}: no slot saved or loaded", not r["saves"] and not r["loads"], f"saves {r['saves']} loads {r['loads']}")
+
+    nothink = {"chat_template_kwargs": {"enable_thinking": False}}
+    if name == "checkpoints-default":
+        st = s.state()
+        print(f"  slots without --smartcache: {len(st['old_states']) if st else '?'}", flush=True)
+        expect("default slot count", st is not None and len(st["old_states"]) == 2, f"{len(st['old_states']) if st else '?'} slots", needs="slots")
+        img = base64.b64encode(open(MEDIA["image"], "rb").read()).decode()
+        E = [{"role": "system", "content": "You describe images for a project's documentation."},
+             {"role": "user", "content": [{"type": "text", "text": docs[:6000] + "\n\nThe image below is from this project."},
+                                          {"type": "image_url", "image_url": {"url": "data:image/png;base64," + img}}]}]
+        e1 = ask("media/e1", E, 64, **nothink)
+        expect("media: no checkpoint inside the image", e1["ckpts"] is not None and all(k != "tail" for _, k in e1["ckpts"]),
+               f"checkpoints {e1['ckpts']}")
+        E2 = E + [reply_msg(e1["msg"]), {"role": "user", "content": "Which colors dominate the image?"}]
+        e2 = ask("media/e2", E2, 64, **nothink)
+        ask("media/unrelated", [{"role": "user", "content": "Say hello."}], 8, **nothink)
+        s.post("/api/admin/clear_state", {})
+        e2c = ask("media/e2-cold", E2, 64, **nothink)
+        k, gap = tie_gap(e2c, e2["tokens"])
+        expect("media: cached follow-up equals a cold run", gap < NEAR_TIE,
+               "same text" if e2c["hash"] == e2["hash"] else f"differs at token {k}, top-2 gap {gap:.2e}")
+        return
+
+    # OpenCode-style tool steps: the reply goes back with its reasoning and tool calls, then the tool results
+    sys_a = ("You are a coding agent in the llama.cpp repository. Inspect files with the tools before you answer, and keep "
+             "answers short.\n\n# Build notes\n" + docs[:9000])
+    A = [{"role": "system", "content": sys_a},
+         {"role": "user", "content": "How does llama_batch_allocr split a batch into ubatches? Read src/llama-batch.cpp first."}]
+    chunk = lambda i: batch_cpp[i*6000:(i+1)*6000]
+    prev = None
+    for k in range(4):
+        r = ask(f"steps/{k}", A, 300, reasoning_effort="medium")
+        if prev:
+            continues(f"steps/{k}", prev, r)
+        last, prev = list(A), r
+        A = A + [reply_msg(r["msg"])]
+        A += ([{"role": "tool", "tool_call_id": tc.get("id", ""), "content": chunk(k)} for tc in r["msg"]["tool_calls"]]
+              if r["msg"].get("tool_calls") else [{"role": "user", "content": "Here is more of it:\n" + chunk(k)}])
+
+    r = ask("regenerate", last, 300, reasoning_effort="medium")
+    expect("regenerate restores latest, nothing to decode", r["n_pp"] == 0, f"processed {r['n_pp']}")
+    expect("regenerate: no slot saved or loaded", not r["saves"] and not r["loads"], f"saves {r['saves']} loads {r['loads']}", needs="slots")
+    expect("regenerate: same text and drafts", r["hash"] == prev["hash"] and (r["draft_ok"], r["draft_fail"]) == (prev["draft_ok"], prev["draft_fail"]),
+           f"drafts {r['draft_ok']}/{r['draft_fail']} vs {prev['draft_ok']}/{prev['draft_fail']}, text {'same' if r['hash'] == prev['hash'] else 'differs'}")
+
+    L = prev["n_in"]
+    r = ask("changed-tail", last, 120, reasoning_effort="medium", **nothink)
+    d = common_prefix(prev["ids_prompt"], r["ids_prompt"]) - (len(prev["ids_prompt"]) - L)
+    expect("changed tail restores latest - 32", d >= L - CKPT_TAIL and r["r"] == L - CKPT_TAIL, f"diverges at {d} of {L}, restore point {r['r']}")
+    expect("changed tail: no slot saved or loaded", not r["saves"] and not r["loads"], f"saves {r['saves']} loads {r['loads']}", needs="slots")
+
+    # a restore to latest - 32 that decodes the same last 32 tokens as the request that made it
+    P = chat("Answer in one sentence: what does this code do?\n" + ctx_cpp[:8000])
+    ip, iy = s.tokenize(prompt=P), s.tokenize(prompt=P[:-1])
+    expect("bitwise: the second prompt differs in its last token only", len(ip) == len(iy) and ip[:-1] == iy[:-1] and ip[-1] != iy[-1],
+           f"{len(ip)} and {len(iy)} tokens", needs=None)
+    for key, prompt in (("bitwise/x", P), ("bitwise/y", P[:-1]), ("bitwise/z", P)):
+        r = s.gen_ids(prompt, 48)
+        r["ids_prompt"], r["ckpts"], r["r"] = None, live(), r["n_in"] - r["n_pp"]
+        out[key] = r
+        print(f"  {key}: [{r['hash']}] {r['n_in']} tok, processed {r['n_pp']}, wall {r['wall']:.2f}s, saves {r['saves']} loads {r['loads']}, "
+              f"drafts {r['draft_ok']}/{r['draft_fail']}", flush=True)
+    x, y, z = out["bitwise/x"], out["bitwise/y"], out["bitwise/z"]
+    expect("bitwise: both later requests restore latest - 32", y["n_pp"] == CKPT_TAIL and z["n_pp"] == CKPT_TAIL,
+           f"processed {y['n_pp']} and {z['n_pp']}")
+    expect("bitwise: logits at L equal the first request's", z["tops"][0] == x["tops"][0], f"top-5 {'equal' if z['tops'][0] == x['tops'][0] else 'differ'}")
+    expect("bitwise: same text and drafts", z["hash"] == x["hash"] and (z["draft_ok"], z["draft_fail"]) == (x["draft_ok"], x["draft_fail"]),
+           f"drafts {z['draft_ok']}/{z['draft_fail']} vs {x['draft_ok']}/{x['draft_fail']}")
+
+    # an edit near the end keeps >= 70 % of the live context: no save, the latest checkpoint before the edit
+    B = [{"role": "system", "content": "You are a helpful assistant reviewing documentation. Answer in two sentences."}]
+    for k in range(4):
+        B.append({"role": "user", "content": f"Part {k+1} of the server's README:\n{server_md[k*4000:(k+1)*4000]}\nWhat does this part describe?"})
+        r = ask(f"edit-last/{k}", B, 48, **nothink)
+        B.append(reply_msg(r["msg"]))
+    B = B[:-2] + [dict(B[-2], content=B[-2]["content"].replace("What does this part describe?", "Which options does this part list?"))]
+    before = r["ckpts"]
+    r = ask("edit-last/edit", B, 48, **nothink)
+    d = common_prefix(out["edit-last/3"]["ids_prompt"], r["ids_prompt"]) - (len(r["ids_prompt"]) - r["n_in"])
+    want = max((p for p, _ in before or [] if p <= d), default=0)
+    expect("edit-last: the latest checkpoint before the edit", r["r"] == want, f"edit at {d}, restore point {r['r']} (want {want})")
+    expect("edit-last: keeps >= 70 %, no slot saved or loaded", not r["saves"] and not r["loads"], f"saves {r['saves']} loads {r['loads']}", needs="slots")
+
+    # an edit far back keeps < 70 %: the old version is saved, then the latest checkpoint before the edit
+    C = [{"role": "system", "content": "You are a careful technical writer. Answer in two sentences.\n\n# Reference\n" + docs[9000:15000]}]
+    for k in range(8):
+        C.append({"role": "user", "content": f"Section {k+1}:\n{ctx_cpp[k*5000:(k+1)*5000]}\nSummarize this section."})
+        r = ask(f"edit-far/{k}", C, 48, **nothink)
+        C.append(reply_msg(r["msg"]))
+    if new:
+        S = next((p for p, kind in r["ckpts"] if kind == "system"), None)
+        pred, serial = [], 0
+        for k in range(8):
+            q = out[f"edit-far/{k}"]
+            serial = ckpt_predict(pred, serial, q["r"], q["n_in"], S)
+        expect("edit-far: checkpoint positions follow the eviction rule", [c[0] for c in pred] == [c[0] for c in r["ckpts"]],
+               f"{[c[0] for c in r['ckpts']]} (predicted {[c[0] for c in pred]})")
+    before = r["ckpts"]
+    C[9] = dict(C[9], content=C[9]["content"].replace("Summarize this section.", "List the functions this section defines."))
+    C.pop()
+    e = ask("edit-far/edit", C, 48, **nothink)
+    d = common_prefix(out["edit-far/7"]["ids_prompt"], e["ids_prompt"]) - (len(e["ids_prompt"]) - e["n_in"])
+    want = max((p for p, _ in before or [] if p <= d), default=0)
+    expect("edit-far: the latest checkpoint before the edit", e["r"] == want, f"edit at {d} of {r['n_in'] + r['n_out']}, restore point {e['r']} (want {want})")
+    expect("edit-far: keeps < 70 %, the old version saved", len(e["saves"]) == 1 and not e["loads"], f"saves {e['saves']} loads {e['loads']}", needs="slots")
+
+    # two interleaved conversations: each switch saves over the leaving conversation's older snapshot
+    s.post("/api/admin/clear_state", {})
+    M = C + [reply_msg(e["msg"])]
+    O = [{"role": "system", "content": "You translate English technical text into French."}, {"role": "user", "content": docs[15000:17000]}]
+    want = [("o1", [0], []), ("m2", [1], [0]), ("o2", [0], [1]), ("m3", [1], [0])]
+    last_of = {"m": e}
+    for key, saves, loads in want:
+        conv = M if key[0] == "m" else O
+        if key != "o1":
+            conv.append({"role": "user", "content": "Continue with the next part, in two sentences." if key[0] == "m" else docs[17000:18000]})
+        r = ask(f"interleaved/{key}", conv, 48, **nothink)
+        expect(f"interleaved/{key}: saves {saves}, loads {loads}", (r["saves"], r["loads"]) == (saves, loads), f"saves {r['saves']} loads {r['loads']}",
+               needs="slots")
+        if key[0] in last_of:
+            continues(f"interleaved/{key}", last_of[key[0]], r, slot_switch=True)
+        last_of[key[0]] = r
+        conv.append(reply_msg(r["msg"]))
+
+    # a new conversation on the same system block restores the system checkpoint
+    S = next((p for p, kind in (r["ckpts"] or []) if kind == "system"), None)
+    N = [C[0], {"role": "user", "content": "Explain the build options in two sentences."}]
+    n1 = ask("same-system", N, 48, **nothink)
+    if S is None:
+        print("    same-system: no system checkpoint reported, skipped", flush=True)
+    else:
+        expect("same-system: the previous conversation saved, the system checkpoint restored", n1["r"] == S and len(n1["saves"]) == 1,
+               f"restore point {n1['r']} (system at {S}), saves {n1['saves']}", needs="slots")
+
+    # admin save and load by slot number carry the checkpoints
+    s.post("/api/admin/save_state", {"slot": 1})
+    ask("admin/other", [{"role": "user", "content": "Say hello in French."}], 16, **nothink)
+    s.post("/api/admin/load_state", {"slot": 1})
+    st = s.state()
+    if "slots" in have:
+        expect("admin: a loaded slot brings its checkpoints", st["checkpoints"] == st["old_states"][1]["checkpoints"] and
+               [tuple(c) for c in st["checkpoints"]] == n1["ckpts"], f"live {st['checkpoints']}, slot 1 {st['old_states'][1]['checkpoints']}",
+               needs="slots")
+    r = ask("admin/regenerate", N, 48, **nothink)
+    expect("admin: regenerate after the load restores latest", r["n_pp"] == 0 and r["hash"] == n1["hash"], f"processed {r['n_pp']}", needs="slots")
+
+    # OpenCode-style steps at ~90k tokens
+    D = [{"role": "system", "content": sys_a},
+         {"role": "user", "content": "Here are three files of the repository.\n" + server_md + ctx_cpp + docs[:40000] +
+                                     "\n\nWhere is the KV cache cleared? Use grep to confirm."}]
+    prev = None
+    for k in range(3):
+        r = ask(f"deep-steps/{k}", D, 200, reasoning_effort="medium")
+        if prev:
+            continues(f"deep-steps/{k}", prev, r)
+        prev = r
+        D = D + [reply_msg(r["msg"])]
+        D += ([{"role": "tool", "tool_call_id": tc.get("id", ""), "content": chunk(k)} for tc in r["msg"]["tool_calls"]]
+              if r["msg"].get("tool_calls") else [{"role": "user", "content": "Now grep for seq_rm:\n" + chunk(k)}])
+
 def run_server(name, args, tree, workdir, res):
     log = os.path.join(workdir, f"{name}.log")
     print(f"== {name}: loading", flush=True)
-    s = Server(tree, args.model, SERVERS[name] + args.server_args.split(), args.port, log)
+    flags = SERVERS[name] + args.server_args.split()
+    if name.startswith("checkpoints"):
+        os.makedirs(os.path.join(workdir, "admin"), exist_ok=True)
+        flags += ["--admin", "--admindir", os.path.join(workdir, "admin")]
+    s = Server(tree, args.model, flags, args.port, log)
     try:
         out = res.setdefault(name, {})
-        if name == "deep":
+        if name.startswith("checkpoints"):
+            run_checkpoints(s, name, out, res)
+        elif name == "deep":
             for k, n in DEEP_CHARS.items():
                 r = s.gen(deep_prompt(n), 200, GREEDY)
                 out[k] = r
@@ -294,6 +642,8 @@ def main():
     if "media" in args.configs:
         names += ["media"]
     names += [n for n in ("deep", "agentic") if n in args.configs]
+    if "checkpoints" in args.configs:
+        names += ["checkpoints", "checkpoints-default"]
 
     res, ok = {}, True
     for name in names:
@@ -321,8 +671,11 @@ def main():
     ok &= all(res.get("_cross", {}).values())
     print(f"logs in {workdir}")
 
+    # the checkpoints configs keep their token ids: a later build's texts may differ at a near-tie (the cut before the
+    # last 32 tokens changes batch shapes), which the check finds from the ids
     def strip(r):
-        return {c: {k: {f: v for f, v in e.items() if f not in ("text", "tokens")} if isinstance(e, dict) else e for k, e in d.items()}
+        drop = lambda c, f: f in ("text", "msg", "tops", "ids_prompt") or (f == "tokens" and not c.startswith("checkpoints"))
+        return {c: {k: {f: v for f, v in e.items() if not drop(c, f)} if isinstance(e, dict) else e for k, e in d.items()}
                 if isinstance(d, dict) else d for c, d in r.items()}
 
     if args.out:
@@ -334,6 +687,26 @@ def main():
         gold = json.load(open(args.golden))
         for c, d in res.items():
             if c.startswith("_") or c not in gold:
+                continue
+            if c.startswith("checkpoints"):
+                diverged = set()
+                for k, r in d.items():
+                    g = gold[c].get(k)
+                    if not g or "n_pp" not in r:
+                        continue
+                    conv = k.split("/")[0]
+                    if r["hash"] == g["hash"]:
+                        what = "same"
+                    elif conv in diverged:
+                        what = "after a divergence"
+                    else:
+                        diverged.add(conv)
+                        i, gap = tie_gap(r, g["tokens"])
+                        what = f"DIFF at token {i}, top-2 gap {gap:.1e}" + ("" if gap < NEAR_TIE else "  FAIL")
+                        ok &= gap < NEAR_TIE
+                    print(f"  {c:19s} {k:22s} {what}; processed {r['n_pp']:6d} vs {g['n_pp']:6d}, wall {r['wall']:6.2f}s vs {g['wall']:6.2f}s, "
+                          f"saves {r['saves']} vs {g['saves']}, loads {r['loads']} vs {g['loads']}, drafts {r['draft_ok']}/{r['draft_fail']} vs "
+                          f"{g['draft_ok']}/{g['draft_fail']}")
                 continue
             for k, r in d.items():
                 g = gold[c].get(k)
