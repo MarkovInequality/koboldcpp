@@ -5600,7 +5600,9 @@ static void PrepareMediaEmbds(const int nctx, const std::vector<int> & media_int
 static void smartcache_add_checkpoint(kcpp_ckpt_kind kind, int ctx_len)
 {
     const int pos = n_past;
+    const auto t0 = std::chrono::steady_clock::now();
     auto c = ckpt_pool.acquire();
+    const bool fresh = c->data.tgt.capacity() == 0;
     c->pos = pos;
     c->kind = kind;
     try
@@ -5639,7 +5641,8 @@ static void smartcache_add_checkpoint(kcpp_ckpt_kind kind, int ctx_len)
     }
     if(debugmode==1 && !is_quiet)
     {
-        printf("\n[SmartCache: %s checkpoint at %d, %zu MB]\n", kcpp_ckpt_kind_name(kind), pos, (c->data.tgt.size() + c->data.dft.size())/(1024*1024));
+        printf("\n[SmartCache: %s checkpoint at %d, %zu MB%s, %.1f ms]\n", kcpp_ckpt_kind_name(kind), pos, (c->data.tgt.size() + c->data.dft.size())/(1024*1024),
+               fresh ? " (new)" : "", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     }
     live_ckpts.add(c, ctx_len);
 }

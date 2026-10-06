@@ -451,4 +451,185 @@ record".
 
 ## Implementation record
 
-(empty)
+Branch `smartcache-checkpoints`. 27B HQ4_K_M with MTP (draft 4), q5_1 K/V, FA, batch 1024 unless noted. A/Bs are
+interleaved, 3 rounds, median/max, `tools/perf/e2e-ab.py` around `kcpp-e2e.py`.
+
+### Phase 0: measurements and baselines (44c0f4a4b)
+
+- **Baseline:** the library built from 4f96f3249 (the tree's own build, newer than every object), run from a worktree
+  at 4f96f3249 (`~/Sandbox/kcpp-base`). Golden check on it: every hash the same; speeds 0.87–1.04× the golden's (a
+  slower GPU mode than when the golden was recorded).
+- **In the repo:** `kcpp-e2e.py` config `checkpoints` (two servers: `checkpoints` with `--smartcache 2`, and
+  `checkpoints-default` without it), peak RSS per server, `tools/perf/e2e-ab.py`.
+- **OpenCode capture** (1.18.34, one session through the logging proxy, isolated XDG dirs and an overlay of `$HOME`,
+  against the baseline server): 6 requests, a title request (591 tokens, no tools) and 5 steps of the session (an
+  11k-token system prompt with 10 tools). Every step continued the live context: processed = new input + 1 (1268,
+  20, 20, 857). OpenCode sends `reasoning_content` and `content: "\n\n"` back, and the re-rendered replies are
+  token-identical to the generated tokens. So for OpenCode as it behaves, a step restores nothing; the baseline still
+  wrote a full regen snapshot at every step and a lifeboat at 8192 on the first request, and the title request at a
+  session's start moved the live context to a slot. After this one session the environment's safety classifier
+  stopped further OpenCode runs (an autonomous agent), so the config's OpenCode-style steps stand in for more
+  captures; the same round trip through koboldcpp's chat completions is also token-identical.
+- **`checkpoints` on the baseline:** the steps continue the live context but each writes a full snapshot (eval time
+  at ~92k tokens varied 1.0–1.9 s with it); regenerate loads the regen slot (processed 0) and drafts 38/2 against
+  the original 37/3; the changed tail, the edit near the end and the edit far back reprocess the whole prompt (8377,
+  5772, 13570 tokens); the bitwise pair reprocesses 362 or 2410 tokens depending on which slot the timestamp-in-seconds
+  LRU picked; after `clear_state` the regen slot was used as an ordinary slot and overwritten, so returning to the main
+  conversation reprocessed 13.6k tokens; peak RSS 6.9 GB.
+- **Media:** a follow-up that continues the live context after an MTP generation with an image in it differs from
+  the same prompt processed cold (logprob gap 0.11 at the first differing token with f16 K/V; also with q5_1 without
+  MTP); text-only follow-ups are identical. On the old build too, and within the model's batch-shape floor (below),
+  so read as rounding, not pursued. koboldcpp counts an M-RoPE image's placeholder tokens by its positions
+  (`mtmd_input_chunk_get_n_pos`), so token indices are KV positions throughout.
+
+### Step 1: MTP draft state (41383d4c4)
+
+- `get_state`/`set_state` for the MTP driver (`pending_h` with its width); full snapshots and `mtp_spec_ckpt`
+  carry it.
+- **Test:** `test-mtp-spec-state-cuda`: drafts (tokens and the last step's logits) after a partial-state restore equal
+  those before it bitwise, the target's logits for the next token too, and a cut before loading fails. Without the fix
+  the drafts differ (FAIL); a restore without the speculative state must give other draft logits.
+- **A/B vs baseline** (`agentic`, `checkpoints`): snapshot time unchanged (20 KB more per snapshot); regenerate drafts
+  37/3 in all three runs, as the original request (baseline 38/2).
+
+### Step 2: policy header (404ca5548)
+
+- `otherarch/kcpp_smartcache.h` and `test-kcpp-smartcache`. The simulated agentic session gives the plan's positions
+  exactly (40 turns: 2000, 84168, 96800, 118850, 144050, 147200, 150318, 150350); the harness's Python port of the
+  policy matches it at 10, 40 and 100 turns.
+
+### Step 3: live-context checkpoints (4621f5e84)
+
+- **Tests:** `kcpp-e2e.py checkpoints` (the expectations that need the live context's checkpoint list): 23 pass. The
+  agent steps continue the live context with no slot activity; regenerate restores latest with nothing to decode,
+  same text and drafts; the changed tail restores latest − 32 (34 tokens processed, 8377 before); the bitwise pair
+  restores latest − 32 and the logits at L equal the first request's; the edit near the end restores latest − 32
+  (33 tokens, 5772 before); the edit far back restores the latest checkpoint before the edit (5841, 13570 before);
+  the live checkpoint positions after 8 turns equal the policy's prediction; an image at the end of a prompt gets no
+  checkpoint inside it, and a request restored from a checkpoint before an image equals a cold run.
+- **Texts:** every request of a hybrid model now cuts before its last 32 tokens, with MTP too, and also when the
+  last batch is 48 tokens or fewer (the old code snapshotted before such a batch without splitting it). Texts change
+  where batch shapes do. `kcpp-e2e.py --ref` probes each first divergence from the baseline: the two tokens' logprob
+  gap there, without samplers or grammar. Greedy divergences: 0.011–0.14; a batch-size change alone on the baseline
+  (1024 → 512, probed the same way) diverges at 0.06–0.29. The plan's 1e-3 is below this model's floor; the harness's
+  NEAR_TIE is now 0.3. The probe also fixes the harness's earlier one, which restarted a grammar mid-output and read
+  the samplers' logprobs (greedy keeps one token).
+- **A/B vs baseline:**
+
+  | request | baseline | step 3 |
+  |---|---|---|
+  | agentic turns 1–5 (wall, median) | 1.94 / 2.35 / 2.40 / 2.20 / 2.57 s | 1.74 / 2.07 / 2.30 / 2.14 / 2.40 s |
+  | changed tail | 2.69 s, 8377 tokens | 0.58 s, 34 |
+  | edit near the end | 2.07 s, 5772 | 0.51 s, 33 |
+  | edit far back | 4.35 s, 10498–13570 | 2.37 s, 5841 |
+  | back to the main conversation | 4.51 s, 13641 | 0.50 s, 24 |
+  | bitwise pair (y, z) | 0.60 / 0.62 s, 362 | 0.50 / 0.49 s, 32 |
+  | deep MTP generation (golden check, ~32k / ~96k prompt) | 84.9 / 24.8 t/s | 104.8 / 104.1 t/s |
+  | peak RSS, `checkpoints` server | 5.7 GB | 4.5 GB |
+
+  The short agent steps generate other texts after the first divergence, so their wall times don't compare; the part
+  outside prompt processing and generation is the same (~0.075 s). The deep generation rates include the old regen
+  snapshot of a ~96k context, taken inside the timed generation.
+- **Deviations:**
+  - The MTP context's memory is a plain KV of the MTP layer; its partial save writes that whole KV (~1.5 KB per
+    token), not ~0. Checkpoints cut it back with `seq_rm` and save a draft partial state only for draft contexts with
+    recurrent state.
+  - Checkpoint buffers are `kcpp_state_buffer`s (no zero-fill, THP, prefault before the copy) rather than
+    `common_prompt_checkpoint`'s vectors.
+  - The media check uses f16 K/V and a 1024×768 image (latest − 32 inside it), and compares a restore across the
+    image with a cold run; a plain continuation after an image is reported, not checked (Phase 0).
+  - `check_state` reports the live context's checkpoints from this step on, so the harness can check it.
+
+### Step 4: slots carry checkpoints (238e69b55)
+
+- **Tests:** `kcpp-e2e.py checkpoints`, now with the slot expectations: every expectation passes. Regenerate, the
+  changed tail and the edit near the end save nothing; the edit far back saves the old version once; the interleaved
+  conversations save over the leaving conversation's older snapshot at each switch (slots 0, 1, 0, 1) and continue
+  from the slot loaded, once from a slot's checkpoint (a truncated reply re-rendered differently: 255 tokens
+  processed, 997 before); a slot loaded through the admin endpoint brings its checkpoints and regenerate after it
+  processes nothing; without `--smartcache`, 2 slots. A transformer model (Qwen3-0.6B, `--smartcache 2`, two
+  interleaved conversations) gives the baseline's texts and processed counts; only the slot numbers differ.
+- **A/B vs step 3:**
+
+  | request | step 3 | step 4 |
+  |---|---|---|
+  | regenerate | 0.73 s (0.28 s outside processing and generation) | 0.54 s (0.09 s) |
+  | regenerate after an admin load | 1.03 s, 1893 tokens | 0.46 s, 0 |
+  | back to a conversation whose reply re-renders differently | 0.66 s, 997 | 0.52 s, 255 |
+  | regenerate after an image | 0.77 s | 0.54 s |
+  | peak RSS, `checkpoints` server | 4.5 GB | 6.0 GB |
+
+- **Memory:** slots now keep their checkpoints, so until the objects in use reach their working set (at most
+  (N + 1) × 8), a new checkpoint is fresh memory: ~60 ms of page faults on WSL2 for 157 MB, seen as +0.1 s on the
+  four requests after the first slot save (one in prompt processing, one at the switch to sampling). Recycled
+  checkpoints cost nothing extra. At these short contexts the retained checkpoints outweigh the full snapshots,
+  hence the higher peak RSS; at 100k tokens a full snapshot is ~2.5 GB against 157 MB per checkpoint.
+
+### Step 5: the system-prompt position (b974d660c)
+
+- **Tests:** `kcpp-e2e.py checkpoints`: the system checkpoint sits at the end of the rendered system block (1872:
+  after the first `<|im_end|>\n` of the prompt), a new conversation on the same system block saves the previous one
+  and restores it (21 tokens processed, 1893 before), and `/api/v1/generate` with `memory` gets one at the memory's
+  end (552); with it the eviction prediction keeps matching (the system checkpoint replaces the oldest as the
+  protected one). Checked by hand without `--jinja` (the ChatML adapter): the system checkpoint lands after the
+  system message's `<|im_end|>\n`.
+- **A/B vs step 4:** new conversation on the same system block 1.09 → 0.56 s; the edit far back restores closer
+  (5841 → 4413 tokens, 2.43 → 2.04 s). Requests whose texts changed with the extra cut (the agent steps, interleaved
+  turns) differ in reply length, so their wall times don't compare; the part outside processing and generation is
+  unchanged.
+- **Format adjustments:** GLM-4's moves a prefix of the prompt into memory, so the byte offset is reduced by what was
+  moved; Gemma 4's prepends to the memory, which the system position includes. The token check rejects anything
+  else.
+
+### Step 6: pinned checkpoint buffers (1d8a3efc1, not adopted)
+
+- `test-mtp-spec-state --bench`: the 149 MB partial state through a checkpoint buffer, pageable (THP) save 12.3–13.2
+  ms, load 11.4–12.2 ms; registered writable with CUDA save 7.2–7.9 ms, load 7.9–8.5 ms; registering the buffer once
+  ~25 ms. About 10 ms per request (two saves), below the end-to-end noise, and it needs a writable registration in
+  ggml-cuda (`ggml_backend_cuda_register_host_buffer` registers read-only, behind `GGML_CUDA_REGISTER_HOST`, and a
+  device-to-host copy into it fails) plus re-registration when a buffer grows with `mremap`. Not adopted.
+
+### Step 6: full A/B and golden
+
+- **Final build vs baseline** (`agentic`, `checkpoints`; wall time, medians of 3 interleaved rounds):
+
+  | request | baseline | final | tokens processed |
+  |---|---|---|---|
+  | agentic turns 1–5 | 1.92 / 2.31 / 2.40 / 2.29 / 2.49 s | 1.76 / 2.09 / 2.30 / 2.17 / 2.40 s | same |
+  | agent step at ~92k tokens (two steps) | 3.85 / 2.72 s | 3.18 / 2.59 s | same |
+  | regenerate | 0.56 s | 0.33 s | 0 / 0 |
+  | changed tail (thinking off) | 2.94 s | 0.33 s | 8377 → 34 |
+  | edit near the end | 2.14 s | 0.53 s | 5772 → 33 |
+  | edit far back | 4.47 s | 2.12 s | 13570 → 4413 |
+  | back to the main conversation | 4.57 s | 0.62 s | 13641 → 25 |
+  | new conversation on the same system block | 1.01 s | 0.55 s | 1893 → 21 |
+  | regenerate after an admin load | 0.98 s | 0.46 s | 1893 → 0 |
+  | peak RSS, `checkpoints` / `agentic` server | 5.8 / 3.5 GB | 6.0 / 3.7 GB | |
+
+- **Costs:** a checkpoint takes 14.6 ms when its object is recycled and 61 ms when it needs fresh memory (debug log,
+  64 checkpoints of the scenario, 27 fresh); the pool stops growing at its working set (at most (N + 1) × 8). Early in
+  a server's life, short requests with the same texts take 0.1–0.2 s longer (one fresh checkpoint in prompt
+  processing, one at the switch to sampling, and the extra 32-token batch).
+- **Golden** (`tools/perf/golden/kcpp-e2e-27b.json`, re-recorded on the final build with every config, now with
+  `checkpoints`): texts changed for the cut before the last 32 tokens (step 3) and at the system position (step 5).
+  Each first divergence from the baseline, probed with `--ref`: greedy 0.006–0.08 (`short2`, `grammar_long`, agentic
+  turn 1, the checkpoints conversations), sampled requests reported only; MTP vs no MTP for `grammar_long` now
+  diverges at 0.072 (same text before); guidance, grammar and TTS-during-generation cross-checks pass. One probe
+  exceeds 0.3: the image request's first token (1.0). The final build's text there is the baseline's own text at
+  batch size 512 (the floor run, hash 35e3339cde36), so it is one of the baseline's batch-shape outcomes at a
+  sensitive first token; accepted.
+
+- **Standing suite** (`tools/perf/standing-suite.sh`, now with `test-kcpp-smartcache`, `test-mtp-spec-state-cuda`
+  and the `checkpoints` config): every step passes, the e2e check against the new golden included.
+- The debug log times each checkpoint and marks the ones that needed fresh memory.
+
+### Open after this plan
+
+- The batch-deep checkpoint (end − 4 − n_ubatch) and a checkpoint at the end of reasoning (from "Not in this plan");
+  OpenCode didn't need either (its replies re-render exactly).
+- A checkpoint's fresh memory costs ~60 ms on WSL2 before the pool reaches its working set; the objects could be
+  pre-faulted off the request path.
+- Writable pinned checkpoint buffers: ~10 ms per request (step 6).
+- A plain continuation after an image and an MTP generation differs from a cold run (gap 0.11 with f16 K/V);
+  within the floor but text-only continuations are identical, so worth a closer look with the vision kernels.
+- `NEAR_TIE` (0.3) is the 27B HQ4_K_M's floor; another model needs its own batch-size probe.
