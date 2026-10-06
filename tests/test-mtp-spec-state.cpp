@@ -6,14 +6,23 @@
 // Also checks the restore order: cutting the target back before loading the partial state fails once the cut is
 // outside the rollback window, and loading first makes it succeed.
 //
-// usage: test-mtp-spec-state MODEL   (a hybrid model with MTP layers)
+// usage: test-mtp-spec-state MODEL [--bench]   (a hybrid model with MTP layers)
+//   --bench: also times saving and loading the partial state into a SmartCache checkpoint buffer, pageable and
+//            registered with CUDA (pinned)
 
 #include "llama.h"
 #include "llama-model.h"
 #include "common.h"
 #include "speculative.h"
+#include "kcpp_state_buffer.h"
+#ifdef GGML_USE_CUDA
+#include <cuda_runtime.h>
+#endif
 
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -69,6 +78,31 @@ static draft_out draft(common_speculative * spec, llama_context * dft, int32_t n
 
 static bool same(const std::vector<float> & a, const std::vector<float> & b) {
     return a.size() == b.size() && memcmp(a.data(), b.data(), a.size()*sizeof(float)) == 0;
+}
+
+// median milliseconds of saving and of loading the partial state through buf
+static void bench_state(llama_context * ctx, kcpp_state_buffer & buf, const char * what) {
+    const size_t n = llama_state_seq_get_size_ext(ctx, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    std::vector<double> save, load;
+    for (int it = 0; it < 23; ++it) {
+        auto t0 = std::chrono::steady_clock::now();
+        const bool ok_s = llama_state_seq_get_data_ext(ctx, buf.data(), n, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == n;
+        auto t1 = std::chrono::steady_clock::now();
+        const bool ok_l = llama_state_seq_set_data_ext(ctx, buf.data(), n, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == n;
+        auto t2 = std::chrono::steady_clock::now();
+        if (!ok_s || !ok_l) {
+            printf("  %s: state copy failed\n", what);
+            return;
+        }
+        if (it >= 3) {
+            save.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+            load.push_back(std::chrono::duration<double, std::milli>(t2 - t1).count());
+        }
+    }
+    std::sort(save.begin(), save.end());
+    std::sort(load.begin(), load.end());
+    printf("  %-26s save %6.2f ms (%5.1f GB/s), load %6.2f ms (%5.1f GB/s), medians of 20\n", what, save[save.size()/2],
+           n/save[save.size()/2]/1e6, load[load.size()/2], n/load[load.size()/2]/1e6);
 }
 
 int main(int argc, char ** argv) {
@@ -199,6 +233,25 @@ int main(int argc, char ** argv) {
     printf("draft after a restore without the speculative state: %s  %s\n", d_differs ? "logits differ" : "logits equal",
            d_differs ? "ok" : "FAIL (the check can't see a stale draft input)");
     fails += !d_differs;
+
+    if (argc > 2 && std::string(argv[2]) == "--bench") {
+        printf("checkpoint copies of the %zu MB partial state:\n", n_tgt >> 20);
+        kcpp_state_buffer buf;
+        buf.fit(n_tgt);
+        bench_state(tgt, buf, "pageable (THP)");
+#ifdef GGML_USE_CUDA
+        // writable: a checkpoint save copies into it (ggml_backend_cuda_register_host_buffer registers read-only)
+        auto t0 = std::chrono::steady_clock::now();
+        const bool reg = cudaHostRegister(buf.data(), buf.capacity(), cudaHostRegisterPortable) == cudaSuccess;
+        auto t1 = std::chrono::steady_clock::now();
+        printf("  registering %zu MB: %s, %.1f ms\n", buf.capacity() >> 20, reg ? "ok" : "failed",
+               std::chrono::duration<double, std::milli>(t1 - t0).count());
+        if (reg) {
+            bench_state(tgt, buf, "registered with CUDA");
+            cudaHostUnregister(buf.data());
+        }
+#endif
+    }
 
     common_speculative_free(spec);
     llama_free(dft);

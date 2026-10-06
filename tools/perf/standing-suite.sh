@@ -31,6 +31,7 @@ step() {
 make LLAMA_CUBLAS=1 -j8 test-backend-ops test-hadamard-archs-cuda test-hadamard-archs-cuda-novmm \
     test-save-load-state-cuda test-recurrent-state-rollback-cuda test-recurrent-state-rollback test-kcpp-sampler \
     test-fattn-mma-q test-gdn-gating test-cuda-fusion-alloc test-kv-mask test-kcpp-state-buffer test-mtp-draft-vocab-cuda \
+    test-kcpp-smartcache test-mtp-spec-state-cuda \
     koboldcpp_cublas \
     > "$log/build.log" 2>&1 || { echo "build failed, see $log/build.log"; exit 1; }
 
@@ -45,7 +46,9 @@ step "test-gdn-gating"            ./test-gdn-gating
 step "test-cuda-fusion-alloc"     ./test-cuda-fusion-alloc
 step "test-kv-mask"               ./test-kv-mask
 step "test-kcpp-state-buffer"     ./test-kcpp-state-buffer
+step "test-kcpp-smartcache"       ./test-kcpp-smartcache
 step "test-mtp-draft-vocab-cuda"  ./test-mtp-draft-vocab-cuda "$model"
+step "test-mtp-spec-state-cuda"   ./test-mtp-spec-state-cuda "$model"
 step "test-hadamard-archs-cuda"   ./test-hadamard-archs-cuda -d CUDA0
 step "test-hadamard-archs-cuda -g" ./test-hadamard-archs-cuda -g
 step "-g, sync uploads"           env GGML_SCHED_SYNC_UPLOADS=1 ./test-hadamard-archs-cuda -g
@@ -58,7 +61,7 @@ if [ $quick = 1 ]; then
     step "rollback suite (CUDA)"  ./test-recurrent-state-rollback-cuda -m "$model" -ngl 99 -c 4096 -p "The quick brown fox jumps over the lazy dog. Once upon a time in a land far away there lived"
 else
     step "rollback suite (CUDA, no fusion, CPU)" tests/test-recurrent-state-rollback.sh "$model"
-    step "kcpp-e2e check"         venv/bin/python tools/perf/kcpp-e2e.py check "$golden" --configs mtp,nomtp,guidance,grammar,media,deep,agentic
+    step "kcpp-e2e check"         venv/bin/python tools/perf/kcpp-e2e.py check "$golden" --configs mtp,nomtp,guidance,grammar,media,deep,agentic,checkpoints
 fi
 
 echo
