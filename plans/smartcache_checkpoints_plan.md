@@ -18,7 +18,7 @@ builds its context checkpoints on it, and koboldcpp uses it for one MTP rollback
 
 | # | change | effect |
 |---|---|---|
-| 1 | **Partial checkpoints per context** (the live context and each SmartCache slot): up to 8; checkpoints in the first 40 % of the context are evicted first, then by min-gap; the 3 newest and the system-prompt checkpoint are never evicted | cheap restore points, concentrated in the later part of a conversation |
+| 1 | **Partial checkpoints per context** (the live context and each SmartCache slot): up to 8; checkpoints in the first 50 % of the context are evicted first, then by min-gap; the 3 newest and the system-prompt checkpoint are never evicted | cheap restore points, concentrated in the later part of a conversation |
 | 2 | **Per request: "latest"** (end of the prompt) **and "latest − 32"**; once per conversation, a checkpoint at the end of the system prompt | regenerate, re-rendered replies, changed prompt tails and new conversations that share a system prompt restore in ~10 ms |
 | 3 | **Remove the regen slot, the lifeboat and the before-the-last-32 full snapshot** on these models | per-request snapshot cost falls from up to three full copies to two ~155 MB copies |
 | 4 | **Save the live context to a slot only when the new prompt keeps less than 70 % of it;** matching across the live context and all slots, with checkpoints traveling with the snapshots | no full-copy save on re-rendered steps or edits near the end; conversations brought back from a slot can still rewind |
@@ -141,22 +141,29 @@ latest − k serves prompts whose last tokens change: a re-rendered generation p
 
 The setup: an agentic session with a system prompt ending at 2k, a 27.5k first prompt, then turns of ~150 reply tokens
 plus 3k of input, two checkpoints per request. The metric is the extra tokens reprocessed for an edit at a position,
-beyond everything after the edit, as mean / worst by where in the conversation the edit falls:
+beyond everything after the edit, as mean / worst by where in the conversation the edit falls. The line is the
+position before which checkpoints are evicted first:
 
 | 8 checkpoints | 10 turns (56k) | 40 turns (150k) | 100 turns (339k) |
 |---|---|---|---|
-| this plan's rule, edits at 0–40 % | 9.3k / 20k | 28.1k / 58k | 65.9k / 134k |
-| this plan's rule, edits at 40–70 % | 9.0k / 25k | 39.9k / 82k | 74.0k / 177k |
-| this plan's rule, edits at 70–100 % | 3.0k / 6k | 11.9k / 25k | 25.8k / 60k |
-| min-gap only, edits at 70–100 % | 3.0k / 6k | 18.6k / 38k | 47.1k / 98k |
+| line at 50 % (this plan), edits at 0–50 % | 12.1k / 26k | 35.6k / 73k | 82.9k / 168k |
+| line at 40 %, edits at 0–50 % | 11.7k / 25k | 35.6k / 73k | 82.9k / 168k |
+| line at 50 %, edits at 50–70 % | 16.4k / 32k | 13.1k / 76k | 56.2k / 183k |
+| line at 40 %, edits at 50–70 % | 3.0k / 6k | 27.1k / 82k | 35.7k / 177k |
+| line at 50 %, edits at 70–100 % | 2.4k / 6k | 12.8k / 25k | 20.3k / 47k |
+| line at 40 %, edits at 70–100 % | 3.0k / 6k | 11.9k / 25k | 25.7k / 60k |
+| min-gap only, edits at 70–100 % | 3.0k / 6k | 18.7k / 38k | 47.1k / 98k |
 
-- **The rule concentrates checkpoints in the last 60 %.** Edits that keep at least 70 % of the conversation, the ones
+- **The rule concentrates checkpoints in the last half.** Edits that keep at least 70 % of the conversation, the ones
   that don't trigger a save, are covered best.
-- **The band just above the 40 % line is thin.** Checkpoints are evicted as the growing context pushes them below the
-  line, so the first surviving one can sit well above it: at 40 turns the positions are 2k, 84k, 97k, 119k, 144k,
-  147k and 150k twice, with the line at 60k.
-- Keeping the checkpoint nearest the line would trade some of the back-part gain for the 40–70 % band (16.1k mean at
-  40 turns). That isn't part of this plan.
+- **Against a line at 40 %:** edits in the last 30 % reprocess less at 10 and 100 turns and slightly more at 40; the
+  50–70 % band does worse at 10 and 100 turns and better at 40. Before 50 % only the system checkpoint survives
+  under either line, except the 40 % line's checkpoint at 27k at 10 turns.
+- **The band just above the line is thin.** Checkpoints are evicted as the growing context pushes them below the
+  line, so the first surviving one can sit well above it: at 40 turns the positions are 2k, 78k, 94k, 119k, 144k,
+  147k and 150k twice, with the line at 75k.
+- Keeping the checkpoint nearest the line would trade some of the back-part gain for the band above it (16.1k mean
+  for edits at 40–70 % at 40 turns, simulated with the line at 40 %). That isn't part of this plan.
 
 ## Design
 
@@ -228,7 +235,7 @@ system-prompt position, if known.
 - **Never evicted:** the 3 newest by creation serial, and the system-prompt checkpoint (or the oldest checkpoint,
   when the context has none).
 - **Eviction order** when a 9th is added:
-  1. evictable checkpoints positioned before 40 % of the context's current length, earliest first;
+  1. evictable checkpoints positioned before 50 % of the context's current length, earliest first;
   2. if there are none, the evictable checkpoint whose neighbors are closest together. The first one's left neighbor
      is position 0, and the newest's right neighbor is the context's end. Ties go to the older one.
 - **Invalidation (not eviction):**
@@ -377,7 +384,7 @@ record".
 ### Regression
 
 1. **`tests/test-kcpp-smartcache.cpp`** (make target `test-kcpp-smartcache`; CPU, no model):
-   - **Eviction:** capacity 8; checkpoints before 40 % of the context length go first, earliest first, then min-gap
+   - **Eviction:** capacity 8; checkpoints before 50 % of the context length go first, earliest first, then min-gap
      (neighbor rules and ties as specified); the 3 newest and the system checkpoint (or the oldest) never evicted; a
      duplicate position replaces.
    - **Lookup and invalidation:** the latest checkpoint at or before a position; truncation drops later ones.
@@ -440,7 +447,7 @@ record".
   re-rendered replies diverge after the reasoning, it limits a step's reprocessing to content and the tool call.
 - **Round-trip fidelity:** making koboldcpp's reply re-render through the template into the generated tokens, so that
   steps never restore. Also decided by Phase 0.
-- **Keeping the checkpoint nearest the 40 % line:** see "Eviction, simulated".
+- **Keeping the checkpoint nearest the 50 % line:** see "Eviction, simulated".
 - **Incremental full snapshots** that copy only new KV on a switch.
 - **Asynchronous checkpoint copies:** llama's state API is synchronous.
 - **`ON_DEVICE` states:** only one per sequence, so they can't hold a checkpoint list.
@@ -622,6 +629,18 @@ interleaved, 3 rounds, median/max, `tools/perf/e2e-ab.py` around `kcpp-e2e.py`.
 - **Standing suite** (`tools/perf/standing-suite.sh`, now with `test-kcpp-smartcache`, `test-mtp-spec-state-cuda`
   and the `checkpoints` config): every step passes, the e2e check against the new golden included.
 - The debug log times each checkpoint and marks the ones that needed fresh memory.
+
+### After the plan: the eviction line at 50 %
+
+- Checkpoints before 50 % of the context's length now go first, not those before 40 % (`kcpp_ckpt_list::evict_index`;
+  `ckpt_predict` in `kcpp-e2e.py` follows it).
+- **Test:** `test-kcpp-smartcache`: a checkpoint at 4900 of 10000 goes before the smallest gap (FAIL with the 40 %
+  line), one at exactly 5000 doesn't; the equal-gaps case moved above the line. The simulated session's positions
+  (40 turns: 2000, 77868, 93650, 118850, 144018, 147200, 150318, 150350) match a separate Python simulation and the
+  harness's port at 10, 40 and 100 turns.
+- **Simulated effect:** "Eviction, simulated", recomputed for both lines with the same setup; the 40 % rows reproduce
+  the earlier table except for 0.1k of rounding in two cells.
+- **End-to-end:** `kcpp-e2e.py checkpoints` not run yet (the GPU was in use).
 
 ### Open after this plan
 

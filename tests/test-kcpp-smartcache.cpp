@@ -53,7 +53,16 @@ static void check_eviction() {
             add(l, p, 10000);
         }
         expect(positions(l) == std::vector<int>({1000, 3000, 4000, 5000, 6000, 7000, 8000, 9000}),
-               "capacity 8; the earliest before 40 % of the context goes first: " + str(positions(l)));
+               "capacity 8; the earliest before 50 % of the context goes first: " + str(positions(l)));
+    }
+    {
+        ckpt_list l;
+        add(l, 100, 10000, kcpp_ckpt_kind::system);
+        for (int p : {4900, 5100, 6000, 7000, 8000, 9000, 9500, 9900}) {
+            add(l, p, 10000);
+        }
+        expect(positions(l) == std::vector<int>({100, 5100, 6000, 7000, 8000, 9000, 9500, 9900}),
+               "4900 of 10000 is before 50 %: it goes, not the smallest gap: " + str(positions(l)));
     }
     {
         ckpt_list l;
@@ -62,15 +71,15 @@ static void check_eviction() {
             add(l, p, 10000);
         }
         expect(positions(l) == std::vector<int>({100, 5000, 6000, 7000, 8000, 9000, 9500, 9900}),
-               "none before 40 %: the one whose neighbors are closest goes: " + str(positions(l)));
+               "none before 50 % (5000 of 10000 isn't): the one whose neighbors are closest goes: " + str(positions(l)));
     }
     {
         ckpt_list l;
-        add(l, 1000, 13000, kcpp_ckpt_kind::system);
-        for (int p : {5300, 7300, 6300, 8300, 10300, 12000, 12500, 13000}) {
-            add(l, p, 13000);
+        add(l, 1000, 16000, kcpp_ckpt_kind::system);
+        for (int p : {8300, 10300, 9300, 11300, 13300, 15000, 15500, 16000}) {
+            add(l, p, 16000);
         }
-        expect(positions(l) == std::vector<int>({1000, 5300, 6300, 8300, 10300, 12000, 12500, 13000}),
+        expect(positions(l) == std::vector<int>({1000, 8300, 9300, 11300, 13300, 15000, 15500, 16000}),
                "equal gaps: the older one goes: " + str(positions(l)));
     }
     {
@@ -80,7 +89,7 @@ static void check_eviction() {
             add(l, p, 100000);
         }
         expect(positions(l) == std::vector<int>({1000, 2000, 3000, 30000, 50000, 70000, 80000, 90000}),
-               "the 3 newest and the system checkpoint stay, even before 40 %: " + str(positions(l)));
+               "the 3 newest and the system checkpoint stay, even before 50 %: " + str(positions(l)));
     }
     {
         ckpt_list l;
@@ -238,9 +247,9 @@ static std::vector<int> simulate(int turns) {
 static void check_placement() {
     printf("placement in a simulated agentic session\n");
     const std::vector<std::pair<int, std::vector<int>>> want = {
-        {10,  {2000, 27468, 33768, 40100, 46400, 52700, 55818, 55850}},
-        {40,  {2000, 84168, 96800, 118850, 144050, 147200, 150318, 150350}},
-        {100, {2000, 178700, 207050, 266868, 292100, 336200, 339318, 339350}},
+        {10,  {2000, 33768, 40100, 46400, 49550, 52700, 55818, 55850}},
+        {40,  {2000, 77868, 93650, 118850, 144018, 147200, 150318, 150350}},
+        {100, {2000, 184968, 232250, 279500, 295250, 336200, 339318, 339350}},
     };
     for (const auto & w : want) {
         const std::vector<int> got = simulate(w.first);

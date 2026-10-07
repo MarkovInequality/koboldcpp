@@ -138,7 +138,7 @@ struct kcpp_ckpt_list {
     }
 
     // Never evicted: the newest by creation, and the system checkpoint (or the oldest, when there is none). First go
-    // the checkpoints before 40 % of the context (earliest first), so the rest gather in the later part of a
+    // the checkpoints before 50 % of the context (earliest first), so the rest gather in the later part of a
     // conversation, where edits that don't save the context fall; then the one whose neighbors are closest together
     // (position 0 left of the first, the context's end right of the last; the older one on ties).
     int evict_index(int ctx_len) const {
@@ -161,7 +161,7 @@ struct kcpp_ckpt_list {
         kept[sys >= 0 ? sys : by_serial[0]] = true;
 
         for (size_t i = 0; i < items.size(); ++i) {
-            if (!kept[i] && (int64_t) items[i]->pos*10 < (int64_t) ctx_len*4) {
+            if (!kept[i] && (int64_t) items[i]->pos*2 < ctx_len) {
                 return (int) i;
             }
         }

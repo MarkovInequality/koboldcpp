@@ -320,7 +320,7 @@ def reply_msg(m):
 
 # the checkpoint list policy (otherarch/kcpp_smartcache.h): a cut drops checkpoints past the restore point r; a
 # request adds the system position S if r < S < L, L - 32 if more than 32 tokens are new and L - 32 > S, and L; past
-# the capacity it evicts, sparing the 3 newest and the system checkpoint (or the oldest), first those before 40 % of
+# the capacity it evicts, sparing the 3 newest and the system checkpoint (or the oldest), first those before 50 % of
 # L (earliest first), else the one whose neighbors are closest (older first on ties)
 def ckpt_predict(lst, serial, r, L, S):
     lst[:] = [c for c in lst if c[0] <= r]
@@ -337,7 +337,7 @@ def ckpt_predict(lst, serial, r, L, S):
         sysc = [c for c in lst if c[2] == "system"]
         keep.add(sysc[0][1] if sysc else by_serial[0][1])
         cand = [c for c in lst if c[1] not in keep]
-        below = [c for c in cand if c[0]*10 < L*4]
+        below = [c for c in cand if c[0]*2 < L]
         if below:
             lst.remove(min(below))
             return
