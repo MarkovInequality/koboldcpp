@@ -9041,6 +9041,7 @@ def show_gui():
     draftgpulayers_var = ctk.StringVar(value=str(999))
     draftgpusplit_str_vars = ctk.StringVar(value="")
     usemtp_var = ctk.IntVar(value=0)
+    mtpvocab_var = ctk.StringVar(value="0")
     nomodel = ctk.IntVar(value=0)
     download_dir_var = ctk.StringVar()
 
@@ -9097,6 +9098,7 @@ def show_gui():
     gen_defaults_overwrite_var = ctk.IntVar(value=0)
 
     whisper_model_var = ctk.StringVar()
+    whispercpu_var = ctk.IntVar(value=0)
     tts_model_var = ctk.StringVar()
     wavtokenizer_var = ctk.StringVar()
     ttsgpu_var = ctk.IntVar(value=0)
@@ -9569,6 +9571,14 @@ def show_gui():
             noqkvlabel.grid_remove()
         changed_gpulayers_estimate()
 
+    def togglemtp(a,b,c):
+        if usemtp_var.get()==1:
+            mtpvocab_entry.grid()
+            mtpvocab_label.grid()
+        else:
+            mtpvocab_entry.grid_remove()
+            mtpvocab_label.grid_remove()
+
     def guibench():
         args.benchmark = "stdout"
         launchbrowser.set(0)
@@ -9917,7 +9927,8 @@ def show_gui():
     makelabelentry(model_tab, "Draft Amount: ", draftamount_var, 13, 40,padx=(100),singleline=True,tooltip="How many tokens to draft per chunk before verifying results")
     makelabelentry(model_tab, "Splits: ", draftgpusplit_str_vars, 13, 50,padx=(190),singleline=True,tooltip="Distribution of draft model layers. Leave blank to follow main model's gpu split. Only works if multi-gpu (All) selected in main model.", labelpadx=(150))
     makelabelentry(model_tab, "Layers: ", draftgpulayers_var, 13, 40,padx=(300),singleline=True,tooltip="How many layers to GPU offload for the draft model", labelpadx=(254))
-    makecheckbox(model_tab, "Use MTP", usemtp_var, 13, 0,padx=(364),tooltiptxt="Allows using MTP layers for drafting in MTP models.")
+    makecheckbox(model_tab, "Use MTP", usemtp_var, 13, 0,padx=(364),command=togglemtp,tooltiptxt="Allows using MTP layers for drafting in MTP models.")
+    mtpvocab_entry, mtpvocab_label = makelabelentry(model_tab, "MTP Vocab:", mtpvocab_var, 14, 45, padx=(100), singleline=True, tooltip="MTP drafts only from the first N vocabulary tokens (plus the special tokens after them), which makes each draft step cheaper. 0 = the full vocabulary.", labelpadx=(40))
     makefileentry(model_tab, "Embeds Model:", "Select Embeddings Model File", embeddings_model_var, 15, width=130,singlerow=True, filetypes=[("*.gguf","*.gguf")], tooltiptxt="Select an embeddings GGUF model that can be used to generate embedding vectors.")
     makelabelentry(model_tab, "ECtx: ", embeddings_ctx_var, 15, 50,padx=(335),singleline=True,tooltip="If set above 0, limits max context for embedding model to save memory.", labelpadx=(302))
     makecheckbox(model_tab, "GPU", embeddings_gpu_var, 15, 0,padx=(390),tooltiptxt="Uses the GPU for Embeddings.")
@@ -10132,6 +10143,7 @@ def show_gui():
     audio_tab = tabcontent["Audio"]
     makefileentry(audio_tab, "Whisper Model (Speech-To-Text):", "Select Whisper .bin Model File", whisper_model_var, 1, width=280, filetypes=[("*.bin","*.bin")], tooltiptxt="Select a Whisper .bin model file on disk to be loaded for Voice Recognition.")
     whisper_model_var.trace_add("write", gui_changed_modelfile)
+    makecheckbox(audio_tab, "Whisper CPU", whispercpu_var, 2, 0, padx=360, tooltiptxt="Force Whisper transcription to always run on CPU.")
     makefileentry(audio_tab, "TTS Model (Text-To-Speech):", "Select TTS GGUF Model File", tts_model_var, 3, width=280, filetypes=[("*.gguf","*.gguf")], tooltiptxt="Select a TTS GGUF model file on disk to be loaded for Narration.")
     tts_model_var.trace_add("write", gui_changed_modelfile)
     makelabelentry(audio_tab, "TTS Threads:" , tts_threads_var, 5, 50,padx=100,singleline=True,tooltip="How many threads to use during TTS generation.\nIf left blank, uses same value as threads.")
@@ -10264,6 +10276,7 @@ def show_gui():
     toggleflashattn(1,1,1)
     togglectxshift(1,1,1)
     togglesmartcache(1,1,1)
+    togglemtp(1,1,1)
     togglehorde(1,1,1)
     toggletaesd(1,1,1)
     togglesdlora(1,1,1)
@@ -10438,6 +10451,7 @@ def show_gui():
         args.draftamount = int(draftamount_var.get()) if draftamount_var.get()!="" else default_draft_amount
         args.draftgpulayers = int(draftgpulayers_var.get()) if draftgpulayers_var.get()!="" else 999
         args.usemtp = usemtp_var.get() == 1
+        args.mtpvocab = int(mtpvocab_var.get()) if mtpvocab_var.get()!="" else 0
 
         args.ssl = None if (ssl_cert_var.get() == "" or ssl_key_var.get() == "") else ([ssl_cert_var.get(), ssl_key_var.get()])
         args.password = None if (password_var.get() == "") else (password_var.get())
@@ -10502,6 +10516,7 @@ def show_gui():
         args.gendefaults = gen_defaults_var.get()  if gen_defaults_var.get() != "" else ""
         args.gendefaultsoverwrite = (gen_defaults_overwrite_var.get()==1)
         args.whispermodel = whisper_model_var.get() if whisper_model_var.get() != "" else ""
+        args.whispercpu = whispercpu_var.get()==1
         args.embeddingsmodel = embeddings_model_var.get()  if embeddings_model_var.get() != "" else ""
         args.embeddingsmaxctx = (0 if embeddings_ctx_var.get()=="" else int(embeddings_ctx_var.get()))
         args.embeddingsgpu = (embeddings_gpu_var.get()==1)
@@ -10741,6 +10756,7 @@ def show_gui():
         if "draftgpulayers" in mydict:
             draftgpulayers_var.set(mydict["draftgpulayers"])
         usemtp_var.set(1 if "usemtp" in mydict and mydict["usemtp"] else 0)
+        mtpvocab_var.set(str(mydict["mtpvocab"]) if ("mtpvocab" in mydict) else "0")
 
         ssl_cert_var.set("")
         ssl_key_var.set("")
@@ -10820,6 +10836,7 @@ def show_gui():
         gen_defaults_overwrite_var.set(1 if "gendefaultsoverwrite" in mydict and mydict["gendefaultsoverwrite"] else 0)
 
         whisper_model_var.set(mydict["whispermodel"] if ("whispermodel" in mydict and mydict["whispermodel"]) else "")
+        whispercpu_var.set(1 if ("whispercpu" in mydict and mydict["whispercpu"]) else 0)
 
         tts_threads_var.set(str(mydict["ttsthreads"]) if ("ttsthreads" in mydict and mydict["ttsthreads"]) else str(default_threads))
         tts_model_var.set(mydict["ttsmodel"] if ("ttsmodel" in mydict and mydict["ttsmodel"]) else "")
