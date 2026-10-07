@@ -7,6 +7,7 @@
 #include <list>
 #include <mutex>
 #include <set>
+#include <tuple>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
@@ -80,6 +81,7 @@ const char* model_version_to_str[] = {
     "LingBot Video",
     "Qwen Image",
     "Qwen Image Layered",
+    "Qwen Image 2.1",
     "Hunyuan Video",
     "Anima",
     "Flux.2",
@@ -873,7 +875,7 @@ bool StableDiffusionGGML::init_model_loader(ModelLoader& model_loader, ModelConf
             {
                 to_replace = "taesd_f2.embd";
             }
-            else if(sd_version_uses_wan_vae(tempver))
+            else if(sd_version_uses_wan_vae(tempver) && tempver != VERSION_QWEN_IMAGE_2_1) // qwen 2.1 + tae crashing as of master-917
             {
                 to_replace = "taesd_w21.embd";
             }
@@ -2159,6 +2161,8 @@ void StableDiffusionGGML::preview_image(int step,
         int patch_sz                     = 1;
         const float(*latent_rgb_proj)[3] = nullptr;
         float* latent_rgb_bias           = nullptr;
+        const float* latent_alpha_proj   = nullptr;
+        float latent_alpha_bias          = 1.f;
 
         if (channels == 128) {
             if (sd_version_uses_flux2_vae(version)) {
@@ -2168,6 +2172,16 @@ void StableDiffusionGGML::preview_image(int step,
             } else if (version == VERSION_LTXAV) {
                 latent_rgb_proj = ltxav_latent_rgb_proj;
                 latent_rgb_bias = ltxav_latent_rgb_bias;
+            } else {
+                LOG_WARN("No latent to RGB projection known for this model");
+                return;
+            }
+        } else if (channels == 64) {
+            if (version == VERSION_QWEN_IMAGE_2_1) {
+                latent_rgb_proj   = qwen21_latent_rgb_proj;
+                latent_rgb_bias   = qwen21_latent_rgb_bias;
+                latent_alpha_proj = qwen21_latent_alpha_proj;
+                latent_alpha_bias = qwen21_latent_alpha_bias;
             } else {
                 LOG_WARN("No latent to RGB projection known for this model");
                 return;
@@ -2222,13 +2236,14 @@ void StableDiffusionGGML::preview_image(int step,
         uint32_t img_width  = static_cast<uint32_t>(_latents.shape()[0]) * patch_sz;
         uint32_t img_height = static_cast<uint32_t>(_latents.shape()[1]) * patch_sz;
 
-        uint8_t* data = (uint8_t*)malloc(frames * img_width * img_height * 3 * sizeof(uint8_t));
+        uint32_t img_channels = latent_alpha_proj != nullptr ? 4 : 3;
+        uint8_t* data         = (uint8_t*)malloc(frames * img_width * img_height * img_channels * sizeof(uint8_t));
         GGML_ASSERT(data != nullptr);
-        preview_latent_video(data, _latents, latent_rgb_proj, latent_rgb_bias, patch_sz);
+        preview_latent_video(data, _latents, latent_rgb_proj, latent_rgb_bias, patch_sz, latent_alpha_proj, latent_alpha_bias);
         sd_image_t* images = (sd_image_t*)malloc(frames * sizeof(sd_image_t));
         GGML_ASSERT(images != nullptr);
         for (uint32_t i = 0; i < frames; i++) {
-            images[i] = {img_width, img_height, 3, data + i * img_width * img_height * 3};
+            images[i] = {img_width, img_height, img_channels, data + i * img_width * img_height * img_channels};
         }
         step_callback(step, frames, images, is_noisy, step_callback_data);
         free(data);
@@ -2402,6 +2417,15 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
         }
     };
     RunnerEndOnExit sample_diffusion_runner_end{work_diffusion_model.get()};
+
+    // These inputs are immutable for this sampling run. Extensions may replace or
+    // modify them per step, so those paths need an explicit stability contract first.
+    const bool cache_qwen_prefix = version == VERSION_QWEN_IMAGE_2_1 &&
+                                   std::none_of(generation_extensions.begin(), generation_extensions.end(),
+                                                [](const auto& extension) { return extension->is_enabled(); });
+    using QwenPrefixInputs = std::tuple<const sd::Tensor<float>*, const sd::Tensor<int32_t>*,
+                                        const std::vector<sd::Tensor<float>>*>;
+    std::vector<QwenPrefixInputs> qwen_prefix_inputs;
 
     RunnerEndOnExit sample_control_runner_end{!control_image.empty() && control_net != nullptr ? control_net.get() : nullptr};
 
@@ -2608,6 +2632,8 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
             } else if (sd_version_is_flux(version) || sd_version_is_flux2(version) || sd_version_is_longcat(version) || sd_version_is_sefi_image(version)) {
                 diffusion_params.extra = FluxDiffusionExtra{&guidance_tensor,
                                                             local_skip_layers};
+            } else if (version == VERSION_QWEN_IMAGE_2_1) {
+                diffusion_params.extra = QwenImage21DiffusionExtra{&condition.c_token_types};
             } else if (sd_version_is_anima(version)) {
                 diffusion_params.extra = AnimaDiffusionExtra{condition.c_t5_ids.empty() ? nullptr : &condition.c_t5_ids,
                                                              condition.c_t5_weights.empty() ? nullptr : &condition.c_t5_weights};
@@ -2663,6 +2689,18 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
                 extension->before_diffusion(diffusion_params, step);
             }
 
+            if (cache_qwen_prefix) {
+                auto* extra = std::get_if<QwenImage21DiffusionExtra>(&diffusion_params.extra);
+                if (extra != nullptr) {
+                    auto key         = std::make_tuple(diffusion_params.context, extra->image_slots,
+                                               diffusion_params.ref_image_params.pass_to_dit ? diffusion_params.ref_latents : nullptr);
+                    auto entry       = std::find(qwen_prefix_inputs.begin(), qwen_prefix_inputs.end(), key);
+                    extra->prefix_id = static_cast<uint64_t>(entry - qwen_prefix_inputs.begin()) + 1;
+                    if (entry == qwen_prefix_inputs.end()) {
+                        qwen_prefix_inputs.push_back(key);
+                    }
+                }
+            }
             auto output_opt = work_diffusion_model->compute(n_threads, diffusion_params);
             if (output_opt.empty()) {
                 LOG_ERROR("diffusion model compute failed");
@@ -2808,7 +2846,7 @@ int StableDiffusionGGML::get_diffusion_model_down_factor() {
     if (sd_version_is_dit(version)) {
         if (sd_version_is_sensenova_u1(version)) {
             down_factor = 32;
-        } else if (sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_minimax_h3(version)) {
+        } else if (version == VERSION_QWEN_IMAGE_2_1 || sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_minimax_h3(version)) {
             down_factor = 2;
         } else {
             down_factor = 1;
@@ -2824,6 +2862,8 @@ int StableDiffusionGGML::get_latent_channel() {
             latent_channel = 128;
         } else if (sd_version_is_minimax_h3(version)) {
             latent_channel = 24;
+        } else if (version == VERSION_QWEN_IMAGE_2_1) {
+            latent_channel = 64;
         } else if (version == VERSION_WAN2_2_TI2V) {
             latent_channel = 48;
         } else if (sd_version_is_hunyuan_video(version)) {
@@ -2852,7 +2892,7 @@ int StableDiffusionGGML::get_latent_channel() {
 }
 
 int StableDiffusionGGML::get_image_channels() const {
-    return version == VERSION_QWEN_IMAGE_LAYERED ? 4 : 3;
+    return version == VERSION_QWEN_IMAGE_LAYERED || version == VERSION_QWEN_IMAGE_2_1 ? 4 : 3;
 }
 
 int StableDiffusionGGML::get_image_seq_len(int h, int w) {
@@ -2942,7 +2982,8 @@ sd::Tensor<float> StableDiffusionGGML::decode_first_stage(const sd::Tensor<float
     auto decoded                      = first_stage_model->decode(n_threads, latents, vae_tiling_params, decode_video, circular_x, circular_y);
     const bool prefer_temporal_tiling = decode_video && first_stage_model->can_temporal_tile_decode();
     while (decoded.empty() &&
-           sd::backend_fit::prepare_vae_decode_retry_tiling(vae_tiling_params, prefer_temporal_tiling)) {
+           sd::backend_fit::prepare_vae_decode_retry_tiling(vae_tiling_params, prefer_temporal_tiling,
+                                                            first_stage_model->last_compute_status())) {
         decoded = first_stage_model->decode(n_threads, latents, vae_tiling_params, decode_video, circular_x, circular_y);
     }
     return decoded;

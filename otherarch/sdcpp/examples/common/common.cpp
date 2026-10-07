@@ -513,7 +513,8 @@ ArgOptions SDContextParams::get_options() {
         {"",
          "--model-args",
          "extra model args, key=value list. Supports chroma_use_dit_mask, chroma_use_t5_mask, "
-         "chroma_t5_mask_pad, qwen_image_zero_cond_t",
+         "chroma_t5_mask_pad, qwen_image_zero_cond_t, qwen_image_2_1_prefix_cache, "
+         "qwen_image_2_1_prefix_cache_type (auto or a type name from --type)",
          (int)',',
          &model_args},
         {"",
@@ -1741,7 +1742,7 @@ ArgOptions SDGenerationParams::get_options() {
          on_scm_policy_arg},
         {"",
          "--vae-tile-size",
-         "tile size for vae tiling, format [X]x[Y] (default: 32x32)",
+         "tile size for vae tiling in latent units, not image pixels, format [X]x[Y] (default: 32x32)",
          on_tile_size_arg},
         {"",
          "--vae-relative-tile-size",
@@ -1835,20 +1836,22 @@ bool decode_base64_image(const std::string& encoded_input,
         return false;
     }
 
-    int decoded_width  = 0;
-    int decoded_height = 0;
-    uint8_t* raw_data  = load_image_from_memory(reinterpret_cast<const char*>(image_bytes.data()),
-                                                static_cast<int>(image_bytes.size()),
-                                                decoded_width,
-                                                decoded_height,
-                                                expected_width,
-                                                expected_height,
-                                                target_channels);
+    int decoded_width    = 0;
+    int decoded_height   = 0;
+    int resolved_channel = target_channels;
+    uint8_t* raw_data    = load_image_from_memory(reinterpret_cast<const char*>(image_bytes.data()),
+                                                  static_cast<int>(image_bytes.size()),
+                                                  decoded_width,
+                                                  decoded_height,
+                                                  resolved_channel,
+                                                  expected_width,
+                                                  expected_height,
+                                                  target_channels);
     if (raw_data == nullptr) {
         return false;
     }
 
-    out_image.reset({(uint32_t)decoded_width, (uint32_t)decoded_height, (uint32_t)target_channels, raw_data});
+    out_image.reset({(uint32_t)decoded_width, (uint32_t)decoded_height, (uint32_t)resolved_channel, raw_data});
     return true;
 }
 
@@ -2202,7 +2205,7 @@ bool SDGenerationParams::from_json_str(
         LOG_ERROR("invalid lora");
         return false;
     }
-    if (!parse_image_json_field(j, "init_image", 3, width, height, init_image)) {
+    if (!parse_image_json_field(j, "init_image", 0, width, height, init_image)) {
         LOG_ERROR("invalid init_image");
         return false;
     }
@@ -2210,7 +2213,7 @@ bool SDGenerationParams::from_json_str(
         LOG_ERROR("invalid end_image");
         return false;
     }
-    if (!parse_image_array_json_field(j, "ref_images", 3, width, height, ref_images)) {
+    if (!parse_image_array_json_field(j, "ref_images", 0, width, height, ref_images)) {
         LOG_ERROR("invalid ref_images");
         return false;
     }

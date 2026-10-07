@@ -1,0 +1,57 @@
+{
+ "qwen21": {
+  "t2i": {
+   "hash": "dd0e353eec85c044",
+   "wall": 3.76,
+   "bytes": 690276,
+   "w": 512,
+   "h": 512,
+   "ch": 4,
+   "ok": true
+  },
+  "t2i-again": {
+   "hash": "dd0e353eec85c044",
+   "wall": 3.43,
+   "bytes": 690276,
+   "w": 512,
+   "h": 512,
+   "ch": 4,
+   "ok": true
+  },
+  "rgba": {
+   "hash": "53dafae50a441fa5",
+   "wall": 3.44,
+   "bytes": 385109,
+   "w": 512,
+   "h": 512,
+   "ch": 4,
+   "ok": true
+  },
+  "edit": {
+   "hash": "b03d4b89bd0ca1ae",
+   "wall": 4.4,
+   "bytes": 760783,
+   "w": 512,
+   "h": 512,
+   "ch": 4,
+   "ok": true
+  }
+ },
+ "wan": {
+  "t2i": {
+   "hash": "5eb4099edde65853",
+   "wall": 0.75,
+   "bytes": 80526,
+   "w": 320,
+   "h": 192,
+   "ch": 3,
+   "ok": true
+  },
+  "t2v": {
+   "hash": "a5ac0eaff86298b0",
+   "wall": 1.34,
+   "bytes": 227550,
+   "ok": true
+  }
+ }
+}

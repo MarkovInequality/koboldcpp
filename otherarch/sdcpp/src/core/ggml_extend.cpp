@@ -454,7 +454,11 @@ ggml_tensor* ggml_ext_conv_3d(ggml_context* ctx,
                               int d0,
                               int d1,
                               int d2,
-                              bool force_prec_f32) {
+                              bool force_prec_f32,
+                              float scale) {
+    if (scale != 1.f) {
+        x = ggml_ext_scale(ctx, x, scale);
+    }
     if (force_prec_f32) {
         ggml_tensor* im2col = ggml_im2col_3d(ctx, w, x, IC, s0, s1, s2, p0, p1, p2, d0, d1, d2, w->type);
 
@@ -487,6 +491,9 @@ ggml_tensor* ggml_ext_conv_3d(ggml_context* ctx,
         }
     }
 
+    if (scale != 1.f) {
+        x = ggml_ext_scale(ctx, x, 1.f / scale);
+    }
     if (b != nullptr) {
         b = ggml_reshape_4d(ctx, b, 1, 1, 1, b->ne[0]);  // [OC, 1, 1, 1]
         x = ggml_add_inplace(ctx, x, b);
@@ -607,7 +614,11 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                     ggml_tensor* mask,
                                     bool skip_reshape,
                                     bool flash_attn,
-                                    float kv_scale) {  // avoid overflow
+                                    float kv_scale,
+                                    bool* used_flash_attn) {  // avoid overflow
+    if (used_flash_attn != nullptr) {
+        *used_flash_attn = false;
+    }
     int64_t L_q;
     int64_t L_k;
     int64_t C;
@@ -695,6 +706,9 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         if (can_use_flash_attn) {
             kqv = build_kqv(q, k, v, mask);
             if (kqv != nullptr) {
+                if (used_flash_attn != nullptr) {
+                    *used_flash_attn = true;
+                }
                 kqv = ggml_view_4d(ctx,
                                    kqv,
                                    d_head,
