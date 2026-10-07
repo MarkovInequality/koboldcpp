@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# End-to-end image generation check: fixed-seed generations through a real koboldcpp server, recording pixel hashes and
-# wall times.
+# End-to-end image generation check through a real koboldcpp server, without downloaded weights: fixed-seed
+# generations with synthetic models, recording pixel hashes and wall times.
 #
 #   sd-e2e.py record GOLDEN.json [options]   run and write the golden file
 #   sd-e2e.py check  GOLDEN.json [options]   run and compare: hashes must match, times are reported against it
@@ -9,40 +9,24 @@
 #
 # --build DIR    tree with koboldcpp.py and koboldcpp_cublas.so (default: this repo)
 # --lib FILE     run a symlinked copy of --build with FILE as koboldcpp_cublas.so
-# --configs      comma list of qwen21, wan (default: qwen21)
 # --save DIR     also write every output there
 #
-# Both configs use flash attention and keep every model on the GPU.
-#
-# qwen21: Qwen Image 2.1 (Q4_K diffusion, Qwen3-VL-8B Q4_K_M text encoder with its vision mmproj, the 2.1 VAE): a
-# text-to-image twice (the repeat must be bitwise equal), an RGBA image whose alpha must hold both transparent and opaque
-# regions, and an edit of the first image through the vision encoder
-#
-# wan: Wan 2.1 T2V 1.3B with the Wan 2.1 VAE, a single frame and a 9-frame clip: guards the shared Wan VAE code
-# (causal 3D convolutions with the temporal feature cache)
+# qwen21: Qwen Image 2.1 with the synthetic models of test-sd-qwen21 --write-models (a tiny diffusion model, a tiny
+# Qwen3-VL encoder with its vision tower in the same file, the published 2.1 VAE layout with deterministic values), flash
+# attention, every model on the GPU: a text-to-image twice (the repeat must be bitwise equal, the output RGBA) and an edit
+# of it through the vision encoder. Build the generator first: make test-sd-qwen21.
 
 import argparse, base64, hashlib, json, math, os, shutil, signal, struct, subprocess, sys, tempfile, time, urllib.request, zlib
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
-Q21 = os.path.expanduser("~/AI/qwen-image-2.1")
-WAN = os.path.expanduser("~/AI/wan2.1-1.3b")
-SERVERS = {
-    "qwen21": ["--sdmodel", f"{Q21}/qwen_image_2.1-Q4_K.gguf", "--sdvae", f"{Q21}/qwen_image_2.1_vae_bf16.safetensors",
-               "--sdllm", f"{Q21}/Qwen3VL-8B-Instruct-Q4_K_M.gguf", "--sdclip1", f"{Q21}/mmproj-Qwen3VL-8B-Instruct-F16.gguf",
-               "--sdflashattention", "--sdclipdevice", "main"],
-    "wan":    ["--sdmodel", f"{WAN}/wan2.1_t2v_1.3B_fp16.safetensors", "--sdvae", f"{WAN}/wan_2.1_vae.safetensors",
-               "--sdllm", f"{WAN}/umt5-xxl-encoder-Q4_K_M.gguf", "--sdflashattention", "--sdclipdevice", "main"],
-}
-BASE = {"seed": 42, "sampler_name": "euler", "negative_prompt": ""}
-Q21_T2I = dict(BASE, prompt="A red fox sitting in a snowy pine forest at dawn, a wooden sign in front of it that says 'kcpp'.",
-               width=512, height=512, steps=12, cfg_scale=4.0)
-Q21_RGBA = dict(BASE, prompt="This is an RGBA image with transparency. A single green apple with a leaf. "
-                             "The image has alpha channel and the background is transparent.",
-                width=512, height=512, steps=12, cfg_scale=4.0)
-Q21_EDIT = dict(BASE, prompt="Make the fox's fur bright blue and change the sign to say 'qwen'.", width=512, height=512, steps=12,
-                cfg_scale=4.0)
-WAN_T2I = dict(BASE, prompt="A paper boat floating on a calm pond, soft morning light.", width=320, height=192, steps=8, cfg_scale=5.0)
-WAN_T2V = dict(WAN_T2I, frames=9)
+GENERATOR = os.path.join(REPO, "test-sd-qwen21")
+BASE = {"seed": 42, "sampler_name": "euler", "negative_prompt": "", "width": 128, "height": 128, "steps": 4, "cfg_scale": 4.0}
+Q21_T2I = dict(BASE, prompt="A red fox sitting in a snowy pine forest at dawn.")
+Q21_EDIT = dict(BASE, prompt="Make the fox's fur bright blue.")
+
+def servers(models):
+    return {"qwen21": ["--sdmodel", f"{models}/dit.safetensors", "--sdvae", f"{models}/vae.safetensors",
+                       "--sdllm", f"{models}/llm.safetensors", "--sdflashattention", "--sdclipdevice", "main"]}
 
 class Server:
     def __init__(self, tree, flags, port, log):
@@ -62,11 +46,11 @@ class Server:
     def gen(self, body):
         req = urllib.request.Request(f"http://127.0.0.1:{self.port}/sdapi/v1/txt2img", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
-        t0 = time.time()
+        t0 = time.perf_counter()
         r = json.loads(urllib.request.urlopen(req, timeout=3600).read())
-        wall = time.time() - t0
+        wall = time.perf_counter() - t0
         data = base64.b64decode(r["images"][0]) if r.get("images") and r["images"][0] else b""
-        return data, wall, bool(r.get("animated"))
+        return data, wall
 
     def stop(self):
         try:
@@ -141,30 +125,13 @@ def record(res, key, data, wall, save, checks=()):
         open(os.path.join(save, key + (".png" if px else ".bin")), "wb").write(data)
     return px
 
-def alpha_mixed(px):
-    if not px or px[2] != 4:
-        return False
-    alpha = px[3][3::4]
-    clear = sum(1 for a in alpha if a < 32) / len(alpha)
-    solid = sum(1 for a in alpha if a > 224) / len(alpha)
-    return clear > 0.05 and solid > 0.05
-
 def run_qwen21(s, res, save):
-    data, wall, _ = s.gen(Q21_T2I)
-    px = record(res, "t2i", data, wall, save, [("512x512", lambda p: p and p[:2] == (512, 512))])
-    data2, wall, _ = s.gen(Q21_T2I)
+    data, wall = s.gen(Q21_T2I)
+    px = record(res, "t2i", data, wall, save, [("128x128 RGBA", lambda p: p and p[:3] == (128, 128, 4))])
+    data2, wall = s.gen(Q21_T2I)
     record(res, "t2i-again", data2, wall, save, [("equal to t2i", lambda p: p and px and p[3] == px[3])])
-    data, wall, _ = s.gen(Q21_RGBA)
-    record(res, "rgba", data, wall, save, [("alpha mixed", alpha_mixed)])
-    edit = dict(Q21_EDIT, extra_images=[base64.b64encode(data2).decode()])
-    data, wall, _ = s.gen(edit)
+    data, wall = s.gen(dict(Q21_EDIT, extra_images=[base64.b64encode(data2).decode()]))
     record(res, "edit", data, wall, save, [("differs from source", lambda p: p and px and p[3] != px[3])])
-
-def run_wan(s, res, save):
-    data, wall, _ = s.gen(WAN_T2I)
-    record(res, "t2i", data, wall, save, [("320x192", lambda p: p and p[:2] == (320, 192))])
-    data, wall, animated = s.gen(WAN_T2V)
-    record(res, "t2v", data, wall, save, [("animated", lambda p: animated)])
 
 def compare(a, b):
     ok = True
@@ -200,7 +167,6 @@ def main():
     ap.add_argument("other", nargs="?")
     ap.add_argument("--build", default=REPO)
     ap.add_argument("--lib")
-    ap.add_argument("--configs", default="qwen21")
     ap.add_argument("--port", type=int, default=5099)
     ap.add_argument("--save")
     args = ap.parse_args()
@@ -209,24 +175,29 @@ def main():
         return 0 if ok else 1
     if args.mode != "run" and not args.golden:
         ap.error("record and check need a golden file")
+    if not os.path.exists(GENERATOR):
+        sys.exit(f"{GENERATOR} not found; make test-sd-qwen21")
     if args.save:
         os.makedirs(args.save, exist_ok=True)
 
     workdir = tempfile.mkdtemp(prefix="sd-e2e-")
+    models = os.path.join(workdir, "models")
+    subprocess.run([GENERATOR, "--write-models", models], cwd=REPO, check=True)
     tree = farm(os.path.realpath(args.build), args.lib, workdir) if args.lib else os.path.realpath(args.build)
     res, ok = {}, True
-    for name in args.configs.split(","):
+    for name, flags in servers(models).items():
         print(f"{name}:", flush=True)
         save = os.path.join(args.save, name) if args.save else None
         if save:
             os.makedirs(save, exist_ok=True)
-        s = Server(tree, SERVERS[name], args.port, os.path.join(workdir, f"{name}.log"))
+        s = Server(tree, flags, args.port, os.path.join(workdir, f"{name}.log"))
         try:
             res[name] = {}
-            {"qwen21": run_qwen21, "wan": run_wan}[name](s, res[name], save)
+            run_qwen21(s, res[name], save)
         finally:
             s.stop()
         ok &= all(e["ok"] for e in res[name].values())
+    shutil.rmtree(models)
     print(f"logs in {workdir}")
 
     if args.mode == "record":

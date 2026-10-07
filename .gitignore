@@ -85,6 +85,8 @@ models-mnt
 /test-kv-mask
 /test-kcpp-state-buffer
 /test-kcpp-smartcache
+/test-sd-qwen21
+/test-sd-wan-vae
 /bench-rht
 /ggml/src/ggml-cuda/**/*.d
 /ggml/src/ggml-cuda/.flags

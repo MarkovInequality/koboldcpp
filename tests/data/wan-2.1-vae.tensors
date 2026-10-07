@@ -1,0 +1,195 @@
+# tensor layout of wan_2.1_vae.safetensors (Comfy-Org/Wan_2.1_ComfyUI_repackaged): name dtype shape
+conv1.bias BF16 32
+conv1.weight BF16 32 32 1 1 1
+conv2.bias BF16 16
+conv2.weight BF16 16 16 1 1 1
+decoder.conv1.bias BF16 384
+decoder.conv1.weight BF16 384 16 3 3 3
+decoder.head.0.gamma BF16 96 1 1 1
+decoder.head.2.bias BF16 3
+decoder.head.2.weight BF16 3 96 3 3 3
+decoder.middle.0.residual.0.gamma BF16 384 1 1 1
+decoder.middle.0.residual.2.bias BF16 384
+decoder.middle.0.residual.2.weight BF16 384 384 3 3 3
+decoder.middle.0.residual.3.gamma BF16 384 1 1 1
+decoder.middle.0.residual.6.bias BF16 384
+decoder.middle.0.residual.6.weight BF16 384 384 3 3 3
+decoder.middle.1.norm.gamma BF16 384 1 1
+decoder.middle.1.proj.bias BF16 384
+decoder.middle.1.proj.weight BF16 384 384 1 1
+decoder.middle.1.to_qkv.bias BF16 1152
+decoder.middle.1.to_qkv.weight BF16 1152 384 1 1
+decoder.middle.2.residual.0.gamma BF16 384 1 1 1
+decoder.middle.2.residual.2.bias BF16 384
+decoder.middle.2.residual.2.weight BF16 384 384 3 3 3
+decoder.middle.2.residual.3.gamma BF16 384 1 1 1
+decoder.middle.2.residual.6.bias BF16 384
+decoder.middle.2.residual.6.weight BF16 384 384 3 3 3
+decoder.upsamples.0.residual.0.gamma BF16 384 1 1 1
+decoder.upsamples.0.residual.2.bias BF16 384
+decoder.upsamples.0.residual.2.weight BF16 384 384 3 3 3
+decoder.upsamples.0.residual.3.gamma BF16 384 1 1 1
+decoder.upsamples.0.residual.6.bias BF16 384
+decoder.upsamples.0.residual.6.weight BF16 384 384 3 3 3
+decoder.upsamples.1.residual.0.gamma BF16 384 1 1 1
+decoder.upsamples.1.residual.2.bias BF16 384
+decoder.upsamples.1.residual.2.weight BF16 384 384 3 3 3
+decoder.upsamples.1.residual.3.gamma BF16 384 1 1 1
+decoder.upsamples.1.residual.6.bias BF16 384
+decoder.upsamples.1.residual.6.weight BF16 384 384 3 3 3
+decoder.upsamples.10.residual.0.gamma BF16 192 1 1 1
+decoder.upsamples.10.residual.2.bias BF16 192
+decoder.upsamples.10.residual.2.weight BF16 192 192 3 3 3
+decoder.upsamples.10.residual.3.gamma BF16 192 1 1 1
+decoder.upsamples.10.residual.6.bias BF16 192
+decoder.upsamples.10.residual.6.weight BF16 192 192 3 3 3
+decoder.upsamples.11.resample.1.bias BF16 96
+decoder.upsamples.11.resample.1.weight BF16 96 192 3 3
+decoder.upsamples.12.residual.0.gamma BF16 96 1 1 1
+decoder.upsamples.12.residual.2.bias BF16 96
+decoder.upsamples.12.residual.2.weight BF16 96 96 3 3 3
+decoder.upsamples.12.residual.3.gamma BF16 96 1 1 1
+decoder.upsamples.12.residual.6.bias BF16 96
+decoder.upsamples.12.residual.6.weight BF16 96 96 3 3 3
+decoder.upsamples.13.residual.0.gamma BF16 96 1 1 1
+decoder.upsamples.13.residual.2.bias BF16 96
+decoder.upsamples.13.residual.2.weight BF16 96 96 3 3 3
+decoder.upsamples.13.residual.3.gamma BF16 96 1 1 1
+decoder.upsamples.13.residual.6.bias BF16 96
+decoder.upsamples.13.residual.6.weight BF16 96 96 3 3 3
+decoder.upsamples.14.residual.0.gamma BF16 96 1 1 1
+decoder.upsamples.14.residual.2.bias BF16 96
+decoder.upsamples.14.residual.2.weight BF16 96 96 3 3 3
+decoder.upsamples.14.residual.3.gamma BF16 96 1 1 1
+decoder.upsamples.14.residual.6.bias BF16 96
+decoder.upsamples.14.residual.6.weight BF16 96 96 3 3 3
+decoder.upsamples.2.residual.0.gamma BF16 384 1 1 1
+decoder.upsamples.2.residual.2.bias BF16 384
+decoder.upsamples.2.residual.2.weight BF16 384 384 3 3 3
+decoder.upsamples.2.residual.3.gamma BF16 384 1 1 1
+decoder.upsamples.2.residual.6.bias BF16 384
+decoder.upsamples.2.residual.6.weight BF16 384 384 3 3 3
+decoder.upsamples.3.resample.1.bias BF16 192
+decoder.upsamples.3.resample.1.weight BF16 192 384 3 3
+decoder.upsamples.3.time_conv.bias BF16 768
+decoder.upsamples.3.time_conv.weight BF16 768 384 3 1 1
+decoder.upsamples.4.residual.0.gamma BF16 192 1 1 1
+decoder.upsamples.4.residual.2.bias BF16 384
+decoder.upsamples.4.residual.2.weight BF16 384 192 3 3 3
+decoder.upsamples.4.residual.3.gamma BF16 384 1 1 1
+decoder.upsamples.4.residual.6.bias BF16 384
+decoder.upsamples.4.residual.6.weight BF16 384 384 3 3 3
+decoder.upsamples.4.shortcut.bias BF16 384
+decoder.upsamples.4.shortcut.weight BF16 384 192 1 1 1
+decoder.upsamples.5.residual.0.gamma BF16 384 1 1 1
+decoder.upsamples.5.residual.2.bias BF16 384
+decoder.upsamples.5.residual.2.weight BF16 384 384 3 3 3
+decoder.upsamples.5.residual.3.gamma BF16 384 1 1 1
+decoder.upsamples.5.residual.6.bias BF16 384
+decoder.upsamples.5.residual.6.weight BF16 384 384 3 3 3
+decoder.upsamples.6.residual.0.gamma BF16 384 1 1 1
+decoder.upsamples.6.residual.2.bias BF16 384
+decoder.upsamples.6.residual.2.weight BF16 384 384 3 3 3
+decoder.upsamples.6.residual.3.gamma BF16 384 1 1 1
+decoder.upsamples.6.residual.6.bias BF16 384
+decoder.upsamples.6.residual.6.weight BF16 384 384 3 3 3
+decoder.upsamples.7.resample.1.bias BF16 192
+decoder.upsamples.7.resample.1.weight BF16 192 384 3 3
+decoder.upsamples.7.time_conv.bias BF16 768
+decoder.upsamples.7.time_conv.weight BF16 768 384 3 1 1
+decoder.upsamples.8.residual.0.gamma BF16 192 1 1 1
+decoder.upsamples.8.residual.2.bias BF16 192
+decoder.upsamples.8.residual.2.weight BF16 192 192 3 3 3
+decoder.upsamples.8.residual.3.gamma BF16 192 1 1 1
+decoder.upsamples.8.residual.6.bias BF16 192
+decoder.upsamples.8.residual.6.weight BF16 192 192 3 3 3
+decoder.upsamples.9.residual.0.gamma BF16 192 1 1 1
+decoder.upsamples.9.residual.2.bias BF16 192
+decoder.upsamples.9.residual.2.weight BF16 192 192 3 3 3
+decoder.upsamples.9.residual.3.gamma BF16 192 1 1 1
+decoder.upsamples.9.residual.6.bias BF16 192
+decoder.upsamples.9.residual.6.weight BF16 192 192 3 3 3
+encoder.conv1.bias BF16 96
+encoder.conv1.weight BF16 96 3 3 3 3
+encoder.downsamples.0.residual.0.gamma BF16 96 1 1 1
+encoder.downsamples.0.residual.2.bias BF16 96
+encoder.downsamples.0.residual.2.weight BF16 96 96 3 3 3
+encoder.downsamples.0.residual.3.gamma BF16 96 1 1 1
+encoder.downsamples.0.residual.6.bias BF16 96
+encoder.downsamples.0.residual.6.weight BF16 96 96 3 3 3
+encoder.downsamples.1.residual.0.gamma BF16 96 1 1 1
+encoder.downsamples.1.residual.2.bias BF16 96
+encoder.downsamples.1.residual.2.weight BF16 96 96 3 3 3
+encoder.downsamples.1.residual.3.gamma BF16 96 1 1 1
+encoder.downsamples.1.residual.6.bias BF16 96
+encoder.downsamples.1.residual.6.weight BF16 96 96 3 3 3
+encoder.downsamples.10.residual.0.gamma BF16 384 1 1 1
+encoder.downsamples.10.residual.2.bias BF16 384
+encoder.downsamples.10.residual.2.weight BF16 384 384 3 3 3
+encoder.downsamples.10.residual.3.gamma BF16 384 1 1 1
+encoder.downsamples.10.residual.6.bias BF16 384
+encoder.downsamples.10.residual.6.weight BF16 384 384 3 3 3
+encoder.downsamples.2.resample.1.bias BF16 96
+encoder.downsamples.2.resample.1.weight BF16 96 96 3 3
+encoder.downsamples.3.residual.0.gamma BF16 96 1 1 1
+encoder.downsamples.3.residual.2.bias BF16 192
+encoder.downsamples.3.residual.2.weight BF16 192 96 3 3 3
+encoder.downsamples.3.residual.3.gamma BF16 192 1 1 1
+encoder.downsamples.3.residual.6.bias BF16 192
+encoder.downsamples.3.residual.6.weight BF16 192 192 3 3 3
+encoder.downsamples.3.shortcut.bias BF16 192
+encoder.downsamples.3.shortcut.weight BF16 192 96 1 1 1
+encoder.downsamples.4.residual.0.gamma BF16 192 1 1 1
+encoder.downsamples.4.residual.2.bias BF16 192
+encoder.downsamples.4.residual.2.weight BF16 192 192 3 3 3
+encoder.downsamples.4.residual.3.gamma BF16 192 1 1 1
+encoder.downsamples.4.residual.6.bias BF16 192
+encoder.downsamples.4.residual.6.weight BF16 192 192 3 3 3
+encoder.downsamples.5.resample.1.bias BF16 192
+encoder.downsamples.5.resample.1.weight BF16 192 192 3 3
+encoder.downsamples.5.time_conv.bias BF16 192
+encoder.downsamples.5.time_conv.weight BF16 192 192 3 1 1
+encoder.downsamples.6.residual.0.gamma BF16 192 1 1 1
+encoder.downsamples.6.residual.2.bias BF16 384
+encoder.downsamples.6.residual.2.weight BF16 384 192 3 3 3
+encoder.downsamples.6.residual.3.gamma BF16 384 1 1 1
+encoder.downsamples.6.residual.6.bias BF16 384
+encoder.downsamples.6.residual.6.weight BF16 384 384 3 3 3
+encoder.downsamples.6.shortcut.bias BF16 384
+encoder.downsamples.6.shortcut.weight BF16 384 192 1 1 1
+encoder.downsamples.7.residual.0.gamma BF16 384 1 1 1
+encoder.downsamples.7.residual.2.bias BF16 384
+encoder.downsamples.7.residual.2.weight BF16 384 384 3 3 3
+encoder.downsamples.7.residual.3.gamma BF16 384 1 1 1
+encoder.downsamples.7.residual.6.bias BF16 384
+encoder.downsamples.7.residual.6.weight BF16 384 384 3 3 3
+encoder.downsamples.8.resample.1.bias BF16 384
+encoder.downsamples.8.resample.1.weight BF16 384 384 3 3
+encoder.downsamples.8.time_conv.bias BF16 384
+encoder.downsamples.8.time_conv.weight BF16 384 384 3 1 1
+encoder.downsamples.9.residual.0.gamma BF16 384 1 1 1
+encoder.downsamples.9.residual.2.bias BF16 384
+encoder.downsamples.9.residual.2.weight BF16 384 384 3 3 3
+encoder.downsamples.9.residual.3.gamma BF16 384 1 1 1
+encoder.downsamples.9.residual.6.bias BF16 384
+encoder.downsamples.9.residual.6.weight BF16 384 384 3 3 3
+encoder.head.0.gamma BF16 384 1 1 1
+encoder.head.2.bias BF16 32
+encoder.head.2.weight BF16 32 384 3 3 3
+encoder.middle.0.residual.0.gamma BF16 384 1 1 1
+encoder.middle.0.residual.2.bias BF16 384
+encoder.middle.0.residual.2.weight BF16 384 384 3 3 3
+encoder.middle.0.residual.3.gamma BF16 384 1 1 1
+encoder.middle.0.residual.6.bias BF16 384
+encoder.middle.0.residual.6.weight BF16 384 384 3 3 3
+encoder.middle.1.norm.gamma BF16 384 1 1
+encoder.middle.1.proj.bias BF16 384
+encoder.middle.1.proj.weight BF16 384 384 1 1
+encoder.middle.1.to_qkv.bias BF16 1152
+encoder.middle.1.to_qkv.weight BF16 1152 384 1 1
+encoder.middle.2.residual.0.gamma BF16 384 1 1 1
+encoder.middle.2.residual.2.bias BF16 384
+encoder.middle.2.residual.2.weight BF16 384 384 3 3 3
+encoder.middle.2.residual.3.gamma BF16 384 1 1 1
+encoder.middle.2.residual.6.bias BF16 384
+encoder.middle.2.residual.6.weight BF16 384 384 3 3 3

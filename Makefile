@@ -1120,6 +1120,12 @@ test-kcpp-state-buffer: tests/test-kcpp-state-buffer.cpp otherarch/kcpp_state_bu
 test-kcpp-smartcache: tests/test-kcpp-smartcache.cpp otherarch/kcpp_smartcache.h
 	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@ $(LDFLAGS)
 
+SD_TEST_OBJS = $(OBJS_SDCOMMON) otherarch/sdcpp/src/tokenizers/vocab/vocab.o $(HADAMARD_TEST_OBJS)
+test-sd-qwen21: tests/test-sd-qwen21.cpp tests/sd-synthetic.h $(SD_TEST_OBJS)
+	$(CXX) -I./otherarch/sdcpp/include -I./otherarch/sdcpp/src -I./otherarch/sdcpp/src/core -I./vendor/nlohmann $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
+test-sd-wan-vae: tests/test-sd-wan-vae.cpp tests/sd-synthetic.h $(SD_TEST_OBJS)
+	$(CXX) -I./otherarch/sdcpp/include -I./otherarch/sdcpp/src -I./otherarch/sdcpp/src/core -I./vendor/nlohmann $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
+
 test-cuda-fusion-alloc: tests/test-cuda-fusion-alloc.cpp $(filter-out ggml.o ggml-backend-reg_default.o,$(HADAMARD_TEST_OBJS)) ggml_v4_cublas.o ggml-backend-reg_cublas.o $(CUBLAS_OBJS_V4)
 	$(CXX) $(CXXFLAGS) $(CUBLAS_FLAGS) $(filter-out %.h,$^) -o $@ $(CUBLASLD_FLAGS) $(LDFLAGS)
 
